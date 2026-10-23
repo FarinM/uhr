@@ -1,5 +1,5 @@
 use std::io::{self, IsTerminal, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::{Context, Result};
@@ -8,6 +8,7 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::LevelFilter;
 use uhr_core::doctor::{self, Report, Status};
 use uhr_core::perf::{self, RecordOptions};
+use uhr_core::symbols;
 
 #[derive(Parser)]
 #[command(
@@ -35,10 +36,15 @@ enum Command {
         /// Samples per second
         #[arg(short = 'F', long, default_value_t = 999, value_parser = clap::value_parser!(u64).range(1..))]
         frequency: u64,
+        /// Skip resolving function names. Run `uhr symbolize` later
+        #[arg(long)]
+        no_symbolize: bool,
         /// Command to profile, after `--`
         #[arg(required = true, last = true)]
         command: Vec<String>,
     },
+    /// Resolve function names in a recording against the files on this machine
+    Symbolize { recording: PathBuf },
 }
 
 fn main() -> ExitCode {
@@ -49,8 +55,10 @@ fn main() -> ExitCode {
         Command::Record {
             output,
             frequency,
+            no_symbolize,
             command,
-        } => run_record(output, frequency, command),
+        } => run_record(output, frequency, no_symbolize, command),
+        Command::Symbolize { recording } => run_symbolize(&recording),
     };
     result.unwrap_or_else(|error| {
         tracing::error!("{error:#}");
@@ -118,11 +126,24 @@ fn write_report(out: &mut impl Write, report: &Report) -> io::Result<()> {
     Ok(())
 }
 
-fn run_record(output: PathBuf, frequency_hz: u64, command: Vec<String>) -> Result<ExitCode> {
+fn run_record(
+    output: PathBuf,
+    frequency_hz: u64,
+    no_symbolize: bool,
+    command: Vec<String>,
+) -> Result<ExitCode> {
     let options = RecordOptions {
         command,
         frequency_hz,
     };
     perf::record(&options, &output)?;
+    if no_symbolize {
+        return Ok(ExitCode::SUCCESS);
+    }
+    run_symbolize(&output)
+}
+
+fn run_symbolize(recording: &Path) -> Result<ExitCode> {
+    symbols::symbolize(recording)?;
     Ok(ExitCode::SUCCESS)
 }

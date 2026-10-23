@@ -16,10 +16,15 @@ arrow-schema = "60"
 arrow-select = "60"
 clap = { version = "4.6", features = ["derive"] }
 linux-perf-data = "0.13"
+memmap2 = "0.9"
+lzma-rs = "0.3"
+crc32fast = "1"
 parquet = { version = "60", default-features = false, features = ["arrow", "zstd"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 signal-hook = "0.4"
 tempfile = "3"
+tokio = { version = "1", features = ["rt"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+wholesym = "0.8"

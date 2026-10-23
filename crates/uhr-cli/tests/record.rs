@@ -167,6 +167,7 @@ int main(int argc, char **argv) {
             .arg("record")
             .arg("-o")
             .arg(&recording)
+            .arg("--no-symbolize")
             .arg("--")
             .arg(&program)
             .arg(&ready)
@@ -208,7 +209,11 @@ fn preserves_the_targets_numeric_exit_code() {
     let dir = common::scratch("preserves_target_exit_code");
     for code in [0, 23] {
         let recording = dir.join(format!("rec-{code}"));
-        let output = record(&recording, &[], &["sh", "-c", &format!("exit {code}")]);
+        let output = record(
+            &recording,
+            &["--no-symbolize"],
+            &["sh", "-c", &format!("exit {code}")],
+        );
         assert!(
             output.status.success(),
             "{}",

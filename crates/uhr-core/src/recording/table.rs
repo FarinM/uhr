@@ -15,7 +15,7 @@ use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::WriterProperties;
 
-pub(super) struct Column {
+pub(crate) struct Column {
     name: &'static str,
     array: ArrayRef,
     nullable: bool,
@@ -67,7 +67,7 @@ impl Column {
     }
 }
 
-pub(super) fn write(path: &Path, columns: Vec<Column>) -> Result<()> {
+pub(crate) fn write(path: &Path, columns: Vec<Column>) -> Result<()> {
     let fields: Vec<Field> = columns
         .iter()
         .map(|c| Field::new(c.name, c.array.data_type().clone(), c.nullable))
@@ -88,7 +88,7 @@ pub(super) fn write(path: &Path, columns: Vec<Column>) -> Result<()> {
 
 /// A table read back from disk. Getters fail on missing columns, wrong
 /// types and unexpected nulls, so callers get plain values.
-pub(super) struct Table {
+pub(crate) struct Table {
     name: String,
     batch: RecordBatch,
 }

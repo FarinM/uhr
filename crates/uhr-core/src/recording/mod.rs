@@ -1,5 +1,5 @@
 mod manifest;
-mod table;
+pub(crate) mod table;
 
 use std::fs;
 use std::io::ErrorKind;

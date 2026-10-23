@@ -75,4 +75,5 @@ fn record_finishes_when_stderr_is_closed() {
             .unwrap()
             > 0
     );
+    assert!(recording.join("symbols.parquet").exists());
 }

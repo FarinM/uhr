@@ -15,8 +15,12 @@ A recording is a directory:
 | `frames.parquet` | Unique frames, before symbol resolution |
 | `stacks.parquet` | Unique stacks as lists of frames |
 | `samples.parquet` | CPU samples |
+| `symbols.parquet` | Function name per frame, after symbol resolution |
+| `symbol_sources.parquet` | Files the names came from, and why some frames have none |
 
-A directory without `manifest.json` is a recording that did not finish.
+A directory without `manifest.json` is a recording that did not finish. The
+two symbol files are the only ones that change: resolving symbols again
+replaces them.
 
 ## Conventions
 
@@ -114,3 +118,49 @@ Each stream has:
 | `mode` | string | `user`, `kernel` or `unknown` (hypervisor, guest) |
 | `stack_id` | uint32 | |
 | `cpu_ns` | uint64 | CPU time this sample stands for |
+
+## Symbols
+
+Written by `uhr symbolize`, which `uhr record` runs unless told not to. Names
+are matched to files by build-id, and come from the binary or from a separate
+debug file found by build-id or debug link.
+
+Each file is copied to a private temporary snapshot before reading its identity
+or symbols. Subsequent reads use that snapshot while debug-file lookup retains
+the original path. Snapshots are released after resolving each binary. This
+uses temporary disk space and copy I/O proportional to that binary and its debug
+files, without requiring their entire contents to stay in RAM. An in-place
+write detected during copying fails resolution for that file.
+
+`symbols`:
+
+| Column | Type | Meaning |
+|---|---|---|
+| `frame_id` | uint32 | One row per frame |
+| `function_address` | uint32, nullable | Function start relative to the binary's image base, including functions with placeholder labels. Null when no function boundary was resolved |
+| `function` | string, nullable | Null if no name was found. The frame's source says why |
+| `placeholder` | string, nullable | A label wholesym made up from the address when the code has no symbol, such as `fun_1200` in a stripped binary. It tells functions apart, but is not a name. Null when `function` is set |
+
+Real names are identified from DWARF or the symbol tables of the binary and
+verified debug artifacts, including MiniDebugInfo. A genuine name that resembles
+a placeholder still counts as named; rejected debug candidates supply no names.
+
+`symbol_sources`, one row per file. A frame's source is the row whose `path`
+and `build_id` match the frame's mapping. Kernel frames share one row with
+path `[kernel]`.
+
+| Column | Type | Meaning |
+|---|---|---|
+| `path` | string | |
+| `build_id` | string, nullable | As recorded. Null if the kernel could not read it |
+| `status` | string | See below |
+| `detail` | string, nullable | For example how many frames got a name, or the error |
+
+| Status | Meaning |
+|---|---|
+| `resolved` | The file's build-id matches the recording |
+| `unverified` | Resolved, but there was no recorded build-id to check |
+| `missing_file` | The file is gone |
+| `build_id_mismatch` | The file changed since recording. No names are taken from it |
+| `unsupported` | Kernel, `[vdso]` and other code that is not read from a file |
+| `failed` | Reading the file failed |
