@@ -15,8 +15,11 @@ arrow-buffer = "60"
 arrow-schema = "60"
 arrow-select = "60"
 clap = { version = "4.6", features = ["derive"] }
+linux-perf-data = "0.13"
 parquet = { version = "60", default-features = false, features = ["arrow", "zstd"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+signal-hook = "0.4"
+tempfile = "3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

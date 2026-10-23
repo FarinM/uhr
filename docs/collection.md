@@ -52,6 +52,30 @@ Platform depth will differ:
 
 The coverage matrix must state this per signal instead of promising parity.
 
+### On-CPU sampling on Linux
+
+The first collector runs the `perf` CLI and reads its perf.data file with
+`linux-perf-data`, which keeps raw addresses and mappings for resolving
+symbols later. Calling `perf_event_open` directly is the alternative. The CLI
+keeps the first collector small, at a cost: perf must be installed, and on
+Debian and Ubuntu its package must match the running kernel.
+
+- `cpu-clock` at 999 Hz. Its sample period is in nanoseconds, so a sample's
+  weight is CPU time.
+- `--clockid=CLOCK_MONOTONIC` puts samples on the shared clock.
+- `--buildid-mmap` has the kernel record each mapping's build-id, so symbols
+  are matched to the exact file that ran.
+- Frame-pointer call graphs only.
+- perf and the target share uhr's stderr. When that is a pipe or socket, uhr
+  gives perf a pipe instead and copies it through, so a reader that stops
+  early, as `head` does, can't kill perf with SIGPIPE. Terminals and files are
+  passed straight through.
+- Terminal Ctrl-C reaches the whole process group and lets perf finish its
+  recording. PID-directed cancellation of uhr is not yet supported reliably:
+  SIGINT is not forwarded and SIGTERM can leave perf and the target running.
+  The installed SIGINT handler also remains ineffective after perf exits.
+  Fixing this requires a supervisor that preserves terminal job control.
+
 ## Cost control
 
 - Aggregate in the kernel by default: counts, total time and latency
@@ -91,6 +115,9 @@ Most bad profiles come from here, not from the sampler.
 - Frame pointers are fast but often missing in release builds. DWARF unwinding
   works without them at a higher cost. `doctor` must tell the user the exact
   build flags to fix this for each language.
+- GCC 13 leaves frame setup out of leaf functions that don't use the stack,
+  even with `-fno-omit-frame-pointer -mno-omit-leaf-frame-pointer`, so
+  frame-pointer stacks skip the caller of such a function. Clang 18 keeps it.
 - Inlined frames must be shown, or time gets blamed on the caller.
 - In containers, binaries can have different paths inside the target's mount
   namespace. Resolve by build-id.
@@ -110,6 +137,10 @@ is not decided.
   debug info and frame pointers.
 - `doctor` must report exactly what is missing for the requested signals on
   this target and host, and how to fix it.
+- The current `doctor` tests the selected perf executable by recording `true`
+  at 1 Hz with the collector's flags, then reads the event attributes to learn
+  whether kernel sampling was excluded. It does not infer permission from
+  uhr's UID or capabilities: the perf executable can have different credentials.
 - The agent-facing server must not run as root. Privileged work (eBPF, perf)
   goes through a narrow helper with a fixed set of operations. Its shape is
   not decided.

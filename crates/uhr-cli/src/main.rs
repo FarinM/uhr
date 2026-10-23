@@ -1,4 +1,5 @@
 use std::io::{self, IsTerminal, Write};
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use anyhow::{Context, Result};
@@ -6,6 +7,7 @@ use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::LevelFilter;
 use uhr_core::doctor::{self, Report, Status};
+use uhr_core::perf::{self, RecordOptions};
 
 #[derive(Parser)]
 #[command(
@@ -25,6 +27,18 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Run a command under perf and write a recording
+    Record {
+        /// Directory for the recording. Must not exist
+        #[arg(short, long)]
+        output: PathBuf,
+        /// Samples per second
+        #[arg(short = 'F', long, default_value_t = 999, value_parser = clap::value_parser!(u64).range(1..))]
+        frequency: u64,
+        /// Command to profile, after `--`
+        #[arg(required = true, last = true)]
+        command: Vec<String>,
+    },
 }
 
 fn main() -> ExitCode {
@@ -32,6 +46,11 @@ fn main() -> ExitCode {
     init_logging();
     let result = match cli.command {
         Command::Doctor { json } => run_doctor(json),
+        Command::Record {
+            output,
+            frequency,
+            command,
+        } => run_record(output, frequency, command),
     };
     result.unwrap_or_else(|error| {
         tracing::error!("{error:#}");
@@ -97,4 +116,13 @@ fn write_report(out: &mut impl Write, report: &Report) -> io::Result<()> {
         writeln!(out, "{:<8} {note}", "note")?;
     }
     Ok(())
+}
+
+fn run_record(output: PathBuf, frequency_hz: u64, command: Vec<String>) -> Result<ExitCode> {
+    let options = RecordOptions {
+        command,
+        frequency_hz,
+    };
+    perf::record(&options, &output)?;
+    Ok(ExitCode::SUCCESS)
 }
