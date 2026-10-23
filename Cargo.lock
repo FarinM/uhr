@@ -868,7 +868,9 @@ checksum = "86a801b3cea342a06d468c8710662aa29e5e05e4f5c0d62f00bbb7f2ad7941c2"
 name = "uhr-cli"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "clap",
+ "serde_json",
  "tracing",
  "tracing-subscriber",
  "uhr-core",
