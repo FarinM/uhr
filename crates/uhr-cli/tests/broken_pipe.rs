@@ -77,3 +77,48 @@ fn record_finishes_when_stderr_is_closed() {
     );
     assert!(recording.join("symbols.parquet").exists());
 }
+
+#[test]
+fn query_succeeds_when_stdout_is_closed() {
+    let dir = common::scratch("query_with_closed_stdout");
+    let program = dir.join("cpu_bound");
+    common::compile(&program, "-O2");
+    let recording = dir.join("rec");
+    let recording = recording.to_str().unwrap();
+    let record = uhr(
+        &[
+            "record",
+            "-o",
+            recording,
+            "--",
+            program.to_str().unwrap(),
+            "20",
+        ],
+        Stdio::null(),
+        Stdio::null(),
+    );
+    assert!(record.status.success());
+
+    for json in [false, true] {
+        let mut args = vec!["query", recording, "--group-by", "function"];
+        if json {
+            args.push("--json");
+        }
+        let output = uhr(&args, closed_pipe(), Stdio::piped());
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
+fn errors_exit_cleanly_when_stderr_is_closed() {
+    let output = uhr(
+        &["query", "/nonexistent", "--group-by", "function"],
+        Stdio::null(),
+        closed_pipe(),
+    );
+    assert_eq!(output.status.code(), Some(1));
+}

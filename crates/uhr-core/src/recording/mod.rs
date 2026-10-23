@@ -6,7 +6,7 @@ use std::io::ErrorKind;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 pub use manifest::*;
 use table::{Column, Table};
@@ -84,7 +84,8 @@ pub struct Frame {
 
 /// Where the code lives, decided from the mappings at record time. Whether
 /// a frame got a name is a separate question, answered by symbolization.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Origin {
     Binary,
     Kernel,

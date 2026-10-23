@@ -3,11 +3,12 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::LevelFilter;
 use uhr_core::doctor::{self, Report, Status};
 use uhr_core::perf::{self, RecordOptions};
+use uhr_core::query::{self, GroupBy, Query, QueryResult, Row};
 use uhr_core::symbols;
 
 #[derive(Parser)]
@@ -45,6 +46,22 @@ enum Command {
     },
     /// Resolve function names in a recording against the files on this machine
     Symbolize { recording: PathBuf },
+    /// Group a recording's CPU time and print the top rows, with coverage
+    Query {
+        recording: PathBuf,
+        #[arg(long, value_enum)]
+        group_by: GroupByArg,
+        /// Rows to print
+        #[arg(long, default_value_t = 20)]
+        top: usize,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum GroupByArg {
+    Function,
 }
 
 fn main() -> ExitCode {
@@ -59,6 +76,12 @@ fn main() -> ExitCode {
             command,
         } => run_record(output, frequency, no_symbolize, command),
         Command::Symbolize { recording } => run_symbolize(&recording),
+        Command::Query {
+            recording,
+            group_by,
+            top,
+            json,
+        } => run_query(&recording, group_by, top, json),
     };
     result.unwrap_or_else(|error| {
         tracing::error!("{error:#}");
@@ -146,4 +169,107 @@ fn run_record(
 fn run_symbolize(recording: &Path) -> Result<ExitCode> {
     symbols::symbolize(recording)?;
     Ok(ExitCode::SUCCESS)
+}
+
+fn run_query(recording: &Path, group_by: GroupByArg, top: usize, json: bool) -> Result<ExitCode> {
+    let query = Query {
+        group_by: match group_by {
+            GroupByArg::Function => GroupBy::Function,
+        },
+        top,
+    };
+    let result = query::query(recording, &query)?;
+    if json {
+        let text = serde_json::to_string_pretty(&result)?;
+        write_output(|out| writeln!(out, "{text}"))?;
+    } else {
+        write_output(|out| write_query(out, &result))?;
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn write_query(out: &mut impl Write, result: &QueryResult) -> io::Result<()> {
+    writeln!(
+        out,
+        "{} samples, {:.2} s of CPU time, by function\n",
+        result.samples,
+        result.cpu_ns as f64 / 1e9
+    )?;
+    writeln!(out, "{:>7} {:>7}  function", "self", "total")?;
+    for row in &result.rows {
+        writeln!(
+            out,
+            "{:>6.1}% {:>6.1}%  {}  {}",
+            row.self_share * 100.0,
+            row.total_share * 100.0,
+            function_name(row),
+            module_name(row),
+        )?;
+    }
+    if result.rows_omitted > 0 {
+        writeln!(
+            out,
+            "({} more rows, raise --top to see them)",
+            result.rows_omitted
+        )?;
+    }
+
+    let coverage = &result.coverage;
+    writeln!(out, "\ncoverage")?;
+    match coverage.named_share {
+        Some(share) => writeln!(out, "  self time in named functions: {:.1}%", share * 100.0),
+        None => writeln!(out, "  self time in named functions: unknown, no samples"),
+    }?;
+    for (origin, share) in &coverage.unnamed_by_origin {
+        writeln!(out, "  unnamed {}: {:.1}%", origin.as_str(), share * 100.0)?;
+    }
+    if !coverage.symbolized {
+        writeln!(out, "  not symbolized: run `uhr symbolize`")?;
+    }
+    for source in &coverage.symbol_problems {
+        let detail = source.detail.as_deref().map(|d| format!(": {d}"));
+        writeln!(
+            out,
+            "  symbols {} {}{}",
+            source.status.as_str(),
+            source.path,
+            detail.unwrap_or_default()
+        )?;
+    }
+    writeln!(out, "  lost events: {}", coverage.lost_events)?;
+    writeln!(out, "  throttle events: {}", coverage.throttle_events)?;
+    writeln!(
+        out,
+        "  samples with stacks at the depth limit: {}",
+        coverage.samples_at_stack_limit
+    )?;
+    for missing in &coverage.missing_signals {
+        writeln!(out, "  missing {:?}: {}", missing.signal, missing.reason)?;
+    }
+    for unknown in &coverage.unknown {
+        writeln!(out, "  unknown: {unknown}")?;
+    }
+    for bias in &coverage.known_biases {
+        writeln!(out, "  bias: {bias}")?;
+    }
+    Ok(())
+}
+
+fn function_name(row: &Row) -> String {
+    let name = match (&row.function, &row.placeholder) {
+        (Some(function), _) => function.clone(),
+        (None, Some(placeholder)) => format!("{placeholder} (no symbol)"),
+        (None, None) => "<unnamed>".into(),
+    };
+    match row.function_address {
+        Some(address) => format!("{name} @0x{address:x}"),
+        None => name,
+    }
+}
+
+fn module_name(row: &Row) -> &str {
+    match &row.module {
+        Some(path) => path.rsplit('/').next().unwrap_or(path),
+        None => row.origin.as_str(),
+    }
 }
