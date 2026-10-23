@@ -11,3 +11,5 @@ path = "src/main.rs"
 [dependencies]
 uhr-core.workspace = true
 clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
