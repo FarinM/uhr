@@ -10,9 +10,9 @@ and exposes questions over that model through MCP and a CLI.
 
 ## Status
 
-Design stage. Nothing is implemented. The docs describe intent, the
-abstractions the design depends on, and candidate approaches. The core will be
-written in Rust.
+Early implementation. The first milestone is in progress, and the code covers
+only part of the design. The docs describe intent, the abstractions the design
+depends on, and candidate approaches. The core is written in Rust.
 
 The first milestone targets Linux, where perf_event and eBPF give the full
 depth: per-thread user and kernel time; perf sampling with kernel and user
@@ -24,6 +24,7 @@ CPU-bound and one syscall-heavy test program.
 - [Vision](docs/vision.md): problem, goals, non-goals.
 - [Model](docs/model.md): core abstractions -- recordings, observations,
   dimensions, levels, coverage, storage.
+- [Format](docs/format.md): the on-disk schema of a recording.
 - [Collection](docs/collection.md): collectors, code origin resolution,
   platforms, privileges.
 - [Agent interface](docs/agent-interface.md): tools, result behavior,

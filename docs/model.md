@@ -70,11 +70,12 @@ A frame must record its **origin**, not only a name:
 | bpf_prog | JIT-compiled eBPF program |
 | jit | JIT-compiled code, with runtime and tier (baseline, optimized) when known |
 | interpreted | interpreter-level frame (Python, Ruby, bytecode VMs) |
-| unresolved | an address that could not be named, with the region it falls in |
+| unresolved | code of unknown kind, such as anonymous executable memory without a JIT map, kept with the region it falls in |
 
 Each frame also has the address, function, module, file:line when known, and
-whether it was inlined. Unresolved frames must be kept, never dropped, so
-coverage can be computed.
+whether it was inlined. A frame of known origin can still lack a name, for
+example in a stripped binary. Unresolved and unnamed frames must be kept,
+never dropped, so coverage can be computed.
 
 A mixed stack is one stack: kernel, native and runtime frames in call order.
 How runtime frames get merged with native ones depends on the collector. See
@@ -155,7 +156,8 @@ computed must say so.
 
 A recording is a directory of Parquet files in our own schema, plus a JSON
 manifest that records the schema version. It is written once and never
-changed. Symbols resolved later are added as extra files.
+changed. Symbols resolved later are added as extra files. The schema is in
+[format](format.md).
 
 The tools read recordings through our own query code in Rust, with no database
 engine. Agents use the tools, which take plain arguments such as group by,

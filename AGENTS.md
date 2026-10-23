@@ -16,13 +16,15 @@ and lets an agent ask questions over that model through MCP and a CLI.
 
 ## Where things stand
 
-Design stage. Nothing is implemented.
+Early implementation. The first milestone (see `README.md`) is in progress,
+and the code covers only part of the design.
 
 - Start with `docs/vision.md` (the goals), then `docs/model.md` (the core
   abstractions). `README.md` maps the rest.
 - The docs deliberately do not fix the implementation. **Must** marks a
   requirement the design depends on, **candidate** marks one possible
-  approach, and tool and field names are sketches.
+  approach, and tool and field names are sketches. `docs/format.md` is the
+  exception: it documents the recording format as built.
 - Choices the docs leave open are decided by the maintainers. Bring options
   and trade-offs, and prototype if it helps, but don't settle one silently.
   When a decision is made, update the docs it affects.
