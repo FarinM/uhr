@@ -32,6 +32,19 @@ and the code covers only part of the design.
   ways to read the data, such as direct SQL. If a choice would block one, say
   so before making it.
 
+## Building and testing
+
+- `cargo build`, `cargo fmt --check`, `cargo clippy --all-targets` and
+  `cargo test`.
+- The end-to-end tests in `crates/uhr-cli/tests` run perf and a C compiler on
+  the host. `uhr doctor` shows what is missing.
+- `uhr-core` holds the model, collectors, symbol resolution and queries.
+  `uhr-cli` is the `uhr` binary. Put new tools in the core, so the CLI and a
+  later MCP server share them.
+- Diagnostics go through `tracing` to stderr. Command results go to stdout
+  through `write_output`, never `println!`, which panics when a reader such
+  as `head` stops early.
+
 ## Working agreements
 
 - If a change makes a doc wrong, fix the doc in the same commit.

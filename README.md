@@ -19,6 +19,19 @@ depth: per-thread user and kernel time; perf sampling with kernel and user
 stacks; native symbol resolution; `overview`, `query` and `call_paths`; one
 CPU-bound and one syscall-heavy test program.
 
+## Try it
+
+Linux only for now, with perf installed. Build with `cargo build`, then:
+
+```sh
+uhr doctor                                 # what this host is missing, and the fix
+uhr record -o rec -- ./my-program args     # record CPU samples and resolve names
+uhr query rec --group-by function          # top functions, with coverage
+uhr query rec --group-by function --json   # the same, for agents
+```
+
+Full stacks need frame pointers. `uhr doctor` lists the build flags.
+
 ## Docs
 
 - [Vision](docs/vision.md): problem, goals, non-goals.
