@@ -1,0 +1,13 @@
+[package]
+name = "uhr-cli"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "uhr"
+path = "src/main.rs"
+
+[dependencies]
+uhr-core.workspace = true
+clap.workspace = true
