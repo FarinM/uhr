@@ -122,6 +122,10 @@ struct FilterArgs {
     /// Only samples in this CPU mode
     #[arg(long = "mode", value_name = "MODE", value_enum)]
     modes: Vec<ModeArg>,
+    /// Only samples whose stack contains this function, by id or by a name
+    /// only one function has
+    #[arg(long = "under", value_name = "FUNCTION")]
+    under: Vec<String>,
     /// Only samples from this offset into the recording on, such as 1.5s or
     /// 200ms
     #[arg(long, value_name = "OFFSET", value_parser = parse_offset)]
@@ -158,6 +162,7 @@ impl FilterArgs {
                     ModeArg::Unknown => Mode::Unknown,
                 })
                 .collect(),
+            under: self.under,
             from_ns: self.from,
             to_ns: self.to,
         })
@@ -667,6 +672,12 @@ fn describe_filter(filter: &Filter) -> String {
             .modes
             .iter()
             .map(|mode| format!("mode {}", mode.as_str())),
+    );
+    parts.extend(
+        filter
+            .under
+            .iter()
+            .map(|function| format!("under {function}")),
     );
     if let Some(from) = filter.from_ns {
         parts.push(format!("from {}", seconds(from)));

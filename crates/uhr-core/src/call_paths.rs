@@ -112,7 +112,7 @@ pub fn run(
 
     let mut stack_cpu_ns = vec![0u64; recording.stacks.len()];
     let mut samples = 0;
-    for sample in query.filter.samples(recording) {
+    for sample in query.filter.samples(recording, &functions)? {
         stack_cpu_ns[sample.stack as usize] += sample.cpu_ns;
         samples += 1;
     }

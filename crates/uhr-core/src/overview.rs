@@ -5,7 +5,9 @@ use serde::Serialize;
 
 use crate::coverage::Coverage;
 use crate::filter::Filter;
+use crate::functions::{self, Functions};
 use crate::recording::{self, Collector, Exit, Mode, Recording, Sample, Signal, Thread};
+use crate::symbols::Symbols;
 use crate::threads::ThreadNames;
 
 /// Time level 0: how much CPU time each process and thread used, in which
@@ -103,11 +105,28 @@ pub struct ThreadRow {
     pub on_cpu_share: Option<f64>,
 }
 
-pub fn overview(dir: &Path, filter: &Filter, top: usize) -> Result<Overview, recording::Error> {
-    Ok(run(&Recording::read(dir)?, filter, top))
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error(transparent)]
+    Recording(#[from] recording::Error),
+    /// The filter names a function that is not there, or not only once.
+    #[error(transparent)]
+    Function(#[from] functions::Error),
 }
 
-pub fn run(recording: &Recording, filter: &Filter, top: usize) -> Overview {
+pub fn overview(dir: &Path, filter: &Filter, top: usize) -> Result<Overview, Error> {
+    let recording = Recording::read(dir)?;
+    let symbols = Symbols::read(dir, &recording)?;
+    run(&recording, symbols.as_ref(), filter, top)
+}
+
+/// `symbols` are only needed to pick out the functions of `filter.under`.
+pub fn run(
+    recording: &Recording,
+    symbols: Option<&Symbols>,
+    filter: &Filter,
+    top: usize,
+) -> Result<Overview, Error> {
     let manifest = &recording.manifest;
     let start = manifest.start_ns;
     let duration = start
@@ -178,7 +197,8 @@ pub fn run(recording: &Recording, filter: &Filter, top: usize) -> Overview {
     }
 
     let mut cpu = empty.clone();
-    for sample in filter.samples(recording) {
+    let functions = Functions::new(recording, symbols);
+    for sample in filter.samples(recording, &functions)? {
         cpu.add(sample);
         let id = lifetimes.of(sample);
         // Inserts the lifetime if the sample lies outside it, so the
@@ -231,7 +251,7 @@ pub fn run(recording: &Recording, filter: &Filter, top: usize) -> Overview {
         ));
     }
 
-    Overview {
+    Ok(Overview {
         command: manifest.target.command.clone(),
         exit: manifest.target.exit.clone(),
         filter: filter.clone(),
@@ -245,7 +265,7 @@ pub fn run(recording: &Recording, filter: &Filter, top: usize) -> Overview {
         threads,
         threads_omitted,
         coverage,
-    }
+    })
 }
 
 impl CPUTime {

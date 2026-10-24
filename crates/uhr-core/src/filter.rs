@@ -1,7 +1,8 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde::Serialize;
 
+use crate::functions::{self, Functions};
 use crate::recording::{Mode, Recording, Sample};
 use crate::threads::ThreadNames;
 
@@ -16,6 +17,9 @@ pub struct Filter {
     /// matches any run of characters and `?` one character.
     pub thread_names: Vec<String>,
     pub modes: Vec<Mode>,
+    /// Functions, by id or by a name only one function has. A sample passes
+    /// if its stack contains one of them.
+    pub under: Vec<String>,
     /// Offset from the recording start, inclusive.
     pub from_ns: Option<u64>,
     /// Offset from the recording start, exclusive.
@@ -27,21 +31,56 @@ impl Filter {
         *self == Self::default()
     }
 
+    /// Fails if `under` names a function that is not in the samples, or a
+    /// name several functions share.
     pub(crate) fn samples<'a>(
         &'a self,
         recording: &'a Recording,
-    ) -> impl Iterator<Item = &'a Sample> + 'a {
+        functions: &Functions,
+    ) -> Result<impl Iterator<Item = &'a Sample> + 'a, functions::Error> {
+        let under = self.stacks_under(recording, functions)?;
         let mut names = (!self.thread_names.is_empty()).then(|| NameMatcher::new(recording));
         let start_ns = recording.manifest.start_ns;
-        recording.samples.iter().filter(move |sample| {
+        Ok(recording.samples.iter().filter(move |sample| {
             (self.pids.is_empty() || self.pids.contains(&sample.pid))
                 && (self.tids.is_empty() || self.tids.contains(&sample.tid))
                 && (self.modes.is_empty() || self.modes.contains(&sample.mode))
                 && self.in_time_range(sample.time_ns, start_ns)
+                && under
+                    .as_ref()
+                    .is_none_or(|under| under[sample.stack as usize])
                 && names
                     .as_mut()
                     .is_none_or(|names| names.matches(self, sample))
-        })
+        }))
+    }
+
+    /// Whether each stack contains a function of `under`. `None` without
+    /// `under`.
+    fn stacks_under(
+        &self,
+        recording: &Recording,
+        functions: &Functions,
+    ) -> Result<Option<Vec<bool>>, functions::Error> {
+        if self.under.is_empty() {
+            return Ok(None);
+        }
+        let wanted = self
+            .under
+            .iter()
+            .map(|wanted| functions.select(wanted))
+            .collect::<Result<HashSet<u32>, _>>()?;
+        Ok(Some(
+            recording
+                .stacks
+                .iter()
+                .map(|stack| {
+                    stack
+                        .iter()
+                        .any(|&frame| wanted.contains(&functions.of_frame[frame as usize]))
+                })
+                .collect(),
+        ))
     }
 
     /// Whether a thread with these ids, and these names over its life, can

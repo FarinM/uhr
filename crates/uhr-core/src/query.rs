@@ -5,7 +5,7 @@ use serde::Serialize;
 
 use crate::coverage::{Coverage, SymbolCoverage};
 use crate::filter::Filter;
-use crate::functions::{Function, Functions};
+use crate::functions::{self, Function, Functions};
 use crate::recording::{self, Origin, Recording};
 use crate::symbols::Symbols;
 
@@ -62,23 +62,40 @@ pub struct QueryCoverage {
     pub recording: Coverage,
 }
 
-pub fn query(dir: &Path, query: &Query) -> Result<QueryResult, recording::Error> {
-    let recording = Recording::read(dir)?;
-    let symbols = Symbols::read(dir, &recording)?;
-    Ok(run(&recording, symbols.as_ref(), query))
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error(transparent)]
+    Recording(#[from] recording::Error),
+    /// The filter names a function that is not there, or not only once.
+    #[error(transparent)]
+    Function(#[from] functions::Error),
 }
 
-pub fn run(recording: &Recording, symbols: Option<&Symbols>, query: &Query) -> QueryResult {
+pub fn query(dir: &Path, query: &Query) -> Result<QueryResult, Error> {
+    let recording = Recording::read(dir)?;
+    let symbols = Symbols::read(dir, &recording)?;
+    run(&recording, symbols.as_ref(), query)
+}
+
+pub fn run(
+    recording: &Recording,
+    symbols: Option<&Symbols>,
+    query: &Query,
+) -> Result<QueryResult, Error> {
     match query.group_by {
         GroupBy::Function => by_function(recording, symbols, query),
     }
 }
 
-fn by_function(recording: &Recording, symbols: Option<&Symbols>, query: &Query) -> QueryResult {
+fn by_function(
+    recording: &Recording,
+    symbols: Option<&Symbols>,
+    query: &Query,
+) -> Result<QueryResult, Error> {
     let functions = Functions::new(recording, symbols);
     let mut stack_cpu_ns = vec![0u64; recording.stacks.len()];
     let mut samples = 0;
-    for sample in query.filter.samples(recording) {
+    for sample in query.filter.samples(recording, &functions)? {
         stack_cpu_ns[sample.stack as usize] += sample.cpu_ns;
         samples += 1;
     }
@@ -156,7 +173,7 @@ fn by_function(recording: &Recording, symbols: Option<&Symbols>, query: &Query) 
         recording,
     };
 
-    QueryResult {
+    Ok(QueryResult {
         group_by: GroupBy::Function,
         filter: query.filter.clone(),
         samples,
@@ -164,5 +181,5 @@ fn by_function(recording: &Recording, symbols: Option<&Symbols>, query: &Query) 
         rows,
         rows_omitted,
         coverage,
-    }
+    })
 }

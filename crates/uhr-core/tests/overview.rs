@@ -121,7 +121,7 @@ fn recording() -> Recording {
 }
 
 fn overview(recording: &Recording, filter: Filter) -> Overview {
-    run(recording, &filter, 10)
+    run(recording, None, &filter, 10).unwrap()
 }
 
 fn find(overview: &Overview, tid: u32, start_ns: Option<u64>) -> &ThreadRow {
@@ -448,7 +448,7 @@ fn kernel_time_is_unknown_when_the_kernel_was_not_sampled() {
 
 #[test]
 fn reports_cut_rows() {
-    let result = run(&recording(), &Filter::default(), 2);
+    let result = run(&recording(), None, &Filter::default(), 2).unwrap();
     assert_eq!(result.threads.len(), 2);
     assert_eq!(result.threads_omitted, 3);
     assert_eq!(result.processes.len(), 2);

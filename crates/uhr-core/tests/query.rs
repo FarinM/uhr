@@ -1,5 +1,6 @@
 use uhr_core::filter::Filter;
-use uhr_core::query::{GroupBy, Query, run};
+use uhr_core::functions;
+use uhr_core::query::{Error, GroupBy, Query, run};
 use uhr_core::recording::*;
 use uhr_core::symbols::{FrameName, Source, SourceStatus, Symbols};
 
@@ -107,7 +108,7 @@ fn query(top: usize) -> Query {
 
 #[test]
 fn shares_self_and_total_time() {
-    let result = run(&recording(), Some(&symbols()), &query(10));
+    let result = run(&recording(), Some(&symbols()), &query(10)).unwrap();
     assert_eq!(result.cpu_ns, 10);
     let row = |name: Option<&str>, origin: Origin| {
         result
@@ -148,7 +149,7 @@ fn shares_self_and_total_time() {
 
 #[test]
 fn reports_named_share_and_symbol_problems() {
-    let result = run(&recording(), Some(&symbols()), &query(10));
+    let result = run(&recording(), Some(&symbols()), &query(10)).unwrap();
     let coverage = &result.coverage;
     assert_eq!(coverage.named_share, Some(0.8));
     assert_eq!(coverage.unnamed_by_origin[&Origin::Binary], 0.1);
@@ -159,14 +160,14 @@ fn reports_named_share_and_symbol_problems() {
 
 #[test]
 fn reports_cut_rows() {
-    let result = run(&recording(), Some(&symbols()), &query(2));
+    let result = run(&recording(), Some(&symbols()), &query(2)).unwrap();
     assert_eq!(result.rows.len(), 2);
     assert_eq!(result.rows_omitted, 3);
 }
 
 #[test]
 fn works_without_symbols() {
-    let result = run(&recording(), None, &query(10));
+    let result = run(&recording(), None, &query(10)).unwrap();
     assert!(!result.coverage.symbols.symbolized);
     assert_eq!(result.coverage.named_share, Some(0.0));
     assert!(result.rows.iter().all(|r| r.function.name.is_none()));
@@ -177,7 +178,7 @@ fn works_without_symbols() {
 fn has_no_named_share_without_samples() {
     let mut recording = recording();
     recording.samples.clear();
-    let result = run(&recording, Some(&symbols()), &query(10));
+    let result = run(&recording, Some(&symbols()), &query(10)).unwrap();
     assert!(result.rows.is_empty());
     assert_eq!(result.coverage.named_share, None);
 }
@@ -210,7 +211,7 @@ fn perf_stream() -> Stream {
 fn reports_throttling() {
     let mut recording = recording();
     recording.manifest.streams.push(perf_stream());
-    let result = run(&recording, Some(&symbols()), &query(10));
+    let result = run(&recording, Some(&symbols()), &query(10)).unwrap();
     assert_eq!(result.coverage.recording.throttle_events, 3);
 }
 
@@ -223,7 +224,7 @@ fn says_kernel_time_is_left_out_when_it_was_not_sampled() {
         reason: "excluded".into(),
     });
     recording.manifest.streams.push(stream);
-    let result = run(&recording, Some(&symbols()), &query(10));
+    let result = run(&recording, Some(&symbols()), &query(10)).unwrap();
     assert!(
         result
             .coverage
@@ -236,7 +237,7 @@ fn says_kernel_time_is_left_out_when_it_was_not_sampled() {
     );
 
     recording.manifest.streams = vec![perf_stream()];
-    let result = run(&recording, Some(&symbols()), &query(10));
+    let result = run(&recording, Some(&symbols()), &query(10)).unwrap();
     assert!(
         !result
             .coverage
@@ -259,7 +260,7 @@ fn separates_distinct_functions_with_the_same_name() {
         sources: Vec::new(),
     };
 
-    let result = run(&recording, Some(&symbols), &query(10));
+    let result = run(&recording, Some(&symbols), &query(10)).unwrap();
     assert_eq!(result.rows.len(), 2);
     assert_eq!(result.rows[0].function.name.as_deref(), Some("worker"));
     assert_eq!(result.rows[1].function.name.as_deref(), Some("worker"));
@@ -295,7 +296,7 @@ fn merges_the_same_function_across_mappings_and_counts_recursion_once() {
         sources: Vec::new(),
     };
 
-    let result = run(&recording, Some(&symbols), &query(10));
+    let result = run(&recording, Some(&symbols), &query(10)).unwrap();
     assert_eq!(result.rows.len(), 1);
     let row = &result.rows[0];
     assert_eq!((row.self_cpu_ns, row.total_cpu_ns), (10, 10));
@@ -321,7 +322,7 @@ fn separates_builds_at_the_same_path_and_function_address() {
         sources: Vec::new(),
     };
 
-    let result = run(&recording, Some(&symbols), &query(10));
+    let result = run(&recording, Some(&symbols), &query(10)).unwrap();
     assert_eq!(result.rows.len(), 2);
     assert_eq!(result.rows[0].function.build_id.as_deref(), Some("abcd"));
     assert_eq!(result.rows[1].function.build_id.as_deref(), Some("ef01"));
@@ -354,7 +355,7 @@ fn combines_copies_of_one_binary_at_different_paths() {
         sources: Vec::new(),
     };
 
-    let result = run(&recording, Some(&symbols), &query(10));
+    let result = run(&recording, Some(&symbols), &query(10)).unwrap();
     assert_eq!(result.rows.len(), 1, "one function, one id");
     let row = &result.rows[0];
     assert_eq!(row.function.id.as_deref(), Some("abcd+0x10"));
@@ -377,7 +378,7 @@ fn the_entry_point_range_of_a_stripped_binary_has_no_id() {
         sources: Vec::new(),
     };
 
-    let result = run(&recording, Some(&symbols), &query(10));
+    let result = run(&recording, Some(&symbols), &query(10)).unwrap();
     let id = |placeholder: &str| {
         let row = result
             .rows
@@ -388,4 +389,41 @@ fn the_entry_point_range_of_a_stripped_binary_has_no_id() {
     };
     assert_eq!(id("EntryPoint"), None, "the range is not one function");
     assert_eq!(id("fun_40").as_deref(), Some("/bin/app+0x40"));
+}
+
+fn under(functions: &[&str]) -> Query {
+    let mut query = query(10);
+    query.filter.under = functions.iter().map(|f| f.to_string()).collect();
+    query
+}
+
+#[test]
+fn keeps_only_samples_under_a_function() {
+    let cpu_ns = |functions: &[&str]| {
+        run(&recording(), Some(&symbols()), &under(functions))
+            .unwrap()
+            .cpu_ns
+    };
+    assert_eq!(cpu_ns(&["main"]), 10);
+    assert_eq!(cpu_ns(&["recurse"]), 8);
+    // The placeholder has no name to pick it by, only its id.
+    assert_eq!(cpu_ns(&["leaf", "/bin/app+0x40"]), 9);
+
+    let result = run(&recording(), Some(&symbols()), &under(&["recurse"])).unwrap();
+    assert_eq!(result.rows[0].function.name.as_deref(), Some("leaf"));
+    assert_eq!(result.rows[0].self_share, 1.0);
+}
+
+#[test]
+fn a_function_that_is_not_there_is_an_error() {
+    let missing = run(&recording(), Some(&symbols()), &under(&["missing"]));
+    assert!(matches!(
+        missing,
+        Err(Error::Function(functions::Error::NotFound(_)))
+    ));
+    let unsymbolized = run(&recording(), None, &under(&["leaf"]));
+    assert!(matches!(
+        unsymbolized,
+        Err(Error::Function(functions::Error::NotSymbolized))
+    ));
 }

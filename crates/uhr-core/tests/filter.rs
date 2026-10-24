@@ -70,7 +70,7 @@ fn cpu_ns(recording: &Recording, filter: Filter) -> u64 {
         top: 10,
         filter,
     };
-    let result = run(recording, None, &query);
+    let result = run(recording, None, &query).unwrap();
     let rows: u64 = result.rows.iter().map(|r| r.self_cpu_ns).sum();
     assert_eq!(rows, result.cpu_ns);
     result.cpu_ns
