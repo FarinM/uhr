@@ -88,6 +88,7 @@ fn recording() -> Recording {
             start_ns: Some(1_000),
             end_ns: Some(11_000),
             streams: vec![stream(true)],
+            kernel_symbols: KernelSymbols::Saved,
         },
         threads: vec![
             thread(1, None, Some(11_000)),
@@ -120,6 +121,7 @@ fn recording() -> Recording {
             sample(1, 3, 9_000, Mode::User, 2_000),
             sample(7, 7, 10_000, Mode::Unknown, 100),
         ],
+        kernel_symbols: Vec::new(),
     }
 }
 

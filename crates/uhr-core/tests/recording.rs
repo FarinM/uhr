@@ -50,6 +50,7 @@ fn example() -> Recording {
                     known_biases: vec!["example bias".into()],
                 },
             }],
+            kernel_symbols: KernelSymbols::Saved,
         },
         threads: vec![
             Thread {
@@ -121,6 +122,20 @@ fn example() -> Recording {
                 cpu_ns: 1_001_001,
             },
         ],
+        kernel_symbols: vec![
+            KernelSymbol {
+                start: 0xffffffff81001010,
+                end: 0xffffffff81001400,
+                name: "vfs_read".into(),
+                module: None,
+            },
+            KernelSymbol {
+                start: 0xffffffffc0001100,
+                end: 0xffffffffc0001180,
+                name: "ext4_write".into(),
+                module: Some("ext4".into()),
+            },
+        ],
     }
 }
 
@@ -162,6 +177,19 @@ fn rejects_dangling_references() {
         Error::Invalid { path, reason } => {
             assert_eq!(path, dir);
             assert!(reason.contains("stack 0 refers to frame 1"), "{reason}");
+        }
+        error => panic!("{error}"),
+    }
+}
+
+#[test]
+fn rejects_overlapping_kernel_symbols() {
+    let dir = scratch("overlapping_kernel_symbols");
+    let mut recording = example();
+    recording.kernel_symbols[0].end = 0xffffffffc0001101;
+    match recording.write(&dir).unwrap_err() {
+        Error::Invalid { reason, .. } => {
+            assert!(reason.contains("kernel symbol 1 starts before"), "{reason}");
         }
         error => panic!("{error}"),
     }

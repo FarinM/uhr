@@ -19,6 +19,7 @@ use std::time::Duration;
 use tracing::{debug, info, warn};
 
 use crate::doctor;
+use crate::kallsyms::Kallsyms;
 use crate::recording::{self, Collector, Exit, Recording};
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -151,6 +152,8 @@ pub fn record(options: &RecordOptions, out: &Path) -> Result<Recording> {
     let args = perf_args(&perf_data, options);
     debug!(command = %format!("perf {}", join_args(&args)), "running perf");
     let (status, interrupted_ns) = run_perf(&args)?;
+    // While the boot and the loaded modules are still the ones recorded.
+    let kallsyms = Kallsyms::read();
 
     let recording = convert::convert(convert::Input {
         perf_data: &perf_data,
@@ -160,6 +163,7 @@ pub fn record(options: &RecordOptions, out: &Path) -> Result<Recording> {
         perf_version,
         requested_frequency_hz: options.frequency_hz,
         max_stack_depth,
+        kallsyms: kallsyms.as_ref(),
     });
     let recording = match recording {
         Ok(recording) => recording,

@@ -13,6 +13,18 @@ pub struct Manifest {
     pub start_ns: Option<u64>,
     pub end_ns: Option<u64>,
     pub streams: Vec<Stream>,
+    pub kernel_symbols: KernelSymbols,
+}
+
+/// Whether the names of kernel code were saved while recording, the only
+/// time they can be read.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum KernelSymbols {
+    /// The ones kernel frames fall in, in the recording's kernel symbols.
+    Saved,
+    /// Kernel frames have no names, for this reason.
+    Unavailable { reason: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

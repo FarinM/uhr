@@ -15,6 +15,7 @@ A recording is a directory:
 | `frames.parquet` | Unique frames, before symbol resolution |
 | `stacks.parquet` | Unique stacks as lists of frames |
 | `samples.parquet` | CPU samples |
+| `kernel_symbols.parquet` | The kernel functions kernel frames fall in, read while recording |
 | `symbols.parquet` | Function name per frame, after symbol resolution |
 | `symbol_sources.parquet` | Files the names came from, and why some frames have none |
 | `inline_frames.parquet` | Inlined calls and source lines per frame, from debug info |
@@ -42,6 +43,7 @@ replaces them.
 | `clock` | `CLOCK_MONOTONIC` |
 | `start_ns`, `end_ns` | When the capture started and stopped: the first and last event, or the interrupt that stopped the recording if that came later. Null if nothing was recorded |
 | `streams` | One per collector that ran |
+| `kernel_symbols` | `{"status": "saved"}` if the kernel's symbols were read while recording, or `{"status": "unavailable", "reason": ...}` if not, and then kernel frames have no names |
 
 Each stream has:
 
@@ -121,6 +123,23 @@ Each stream has:
 | `mode` | string | `user`, `kernel` or `unknown` (hypervisor, guest) |
 | `stack_id` | uint32 | |
 | `cpu_ns` | uint64 | CPU time this sample stands for |
+
+`kernel_symbols`, sorted by `start`, with ranges that don't overlap. The
+kernel moves to a random address on every boot, and modules come and go, so
+`/proc/kallsyms` is read right after recording and the functions kernel
+frames fall in are kept. A module can list stale names at addresses another
+module now holds, so a frame in a mapping takes its function from the
+mapping's module only. A frame outside every mapping, such as in a BPF
+program, takes it from the modules without a mapping. Of a module's names at
+one address, the one perf shows is kept, and the markers that ARM and RISC-V
+put between code and data are skipped, as the kernel's own lookups skip
+them.
+
+| Column | Type | Meaning |
+|---|---|---|
+| `start`, `end` | uint64 | Address range, end exclusive. A function ends where the next one of its module starts, or where its mapping ends. Outside every mapping, it ends where the next such function or the next mapping starts |
+| `name` | string | |
+| `module` | string, nullable | The module, as in `ext4`, or `bpf` for a BPF program. Null for the kernel itself |
 
 ## Symbols
 

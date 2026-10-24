@@ -56,7 +56,7 @@ impl<'a> ThreadNames<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::recording::{Clock, FORMAT_VERSION, Manifest, Target, ThreadName};
+    use crate::recording::{Clock, FORMAT_VERSION, KernelSymbols, Manifest, Target, ThreadName};
 
     fn recording(names: Vec<ThreadName>) -> Recording {
         Recording {
@@ -71,6 +71,7 @@ mod tests {
                 start_ns: None,
                 end_ns: None,
                 streams: Vec::new(),
+                kernel_symbols: KernelSymbols::Saved,
             },
             threads: Vec::new(),
             thread_names: names,
@@ -78,6 +79,7 @@ mod tests {
             frames: Vec::new(),
             stacks: Vec::new(),
             samples: Vec::new(),
+            kernel_symbols: Vec::new(),
         }
     }
 

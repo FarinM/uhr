@@ -15,10 +15,11 @@ use linux_perf_data::{PerfFileReader, PerfFileRecord};
 
 use super::unwind::Unwinding as UserUnwinding;
 use super::{Error, Result, io_error};
+use crate::kallsyms::{self, Kallsyms};
 use crate::recording::{
-    Clock, Collector, Exit, FORMAT_VERSION, Frame, KERNEL, Manifest, Mapping, MissingSignal, Mode,
-    Origin, Recording, Sample, Signal, Stream, StreamCoverage, Target, Thread, ThreadName,
-    Unwinding,
+    Clock, Collector, Exit, FORMAT_VERSION, Frame, KERNEL, KernelSymbols, Manifest, Mapping,
+    MissingSignal, Mode, Origin, Recording, Sample, Signal, Stream, StreamCoverage, Target, Thread,
+    ThreadName, Unwinding,
 };
 
 pub(super) struct Input<'a> {
@@ -30,6 +31,7 @@ pub(super) struct Input<'a> {
     pub perf_version: String,
     pub requested_frequency_hz: u64,
     pub max_stack_depth: u32,
+    pub kallsyms: Result<&'a Kallsyms, &'a kallsyms::Error>,
 }
 
 const TIMER_BIAS: &str = "cpu-clock samples come from a timer interrupt, so code that runs \
@@ -204,6 +206,18 @@ pub(super) fn convert(input: Input) -> Result<Recording> {
         },
     };
 
+    let (kernel_symbols, saved) = match input.kallsyms {
+        Ok(kallsyms) => (
+            kallsyms.covering(&state.frames, &state.mappings),
+            KernelSymbols::Saved,
+        ),
+        Err(error) => (
+            Vec::new(),
+            KernelSymbols::Unavailable {
+                reason: error.to_string(),
+            },
+        ),
+    };
     Ok(Recording {
         manifest: Manifest {
             format_version: FORMAT_VERSION,
@@ -216,6 +230,7 @@ pub(super) fn convert(input: Input) -> Result<Recording> {
             start_ns: state.start_ns,
             end_ns: state.end_ns,
             streams: vec![stream],
+            kernel_symbols: saved,
         },
         threads: state.take_threads(),
         thread_names: state.thread_names,
@@ -223,6 +238,7 @@ pub(super) fn convert(input: Input) -> Result<Recording> {
         frames: state.frames,
         stacks: state.stacks,
         samples: state.samples,
+        kernel_symbols,
     })
 }
 

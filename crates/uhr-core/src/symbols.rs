@@ -951,7 +951,7 @@ mod tests {
     }
 
     fn recording(frames: usize) -> Recording {
-        use crate::recording::{Clock, FORMAT_VERSION, Frame, Manifest, Target};
+        use crate::recording::{Clock, FORMAT_VERSION, Frame, KernelSymbols, Manifest, Target};
         Recording {
             manifest: Manifest {
                 format_version: FORMAT_VERSION,
@@ -964,6 +964,7 @@ mod tests {
                 start_ns: None,
                 end_ns: None,
                 streams: Vec::new(),
+                kernel_symbols: KernelSymbols::Saved,
             },
             threads: Vec::new(),
             thread_names: Vec::new(),
@@ -980,6 +981,7 @@ mod tests {
             ],
             stacks: Vec::new(),
             samples: Vec::new(),
+            kernel_symbols: Vec::new(),
         }
     }
 

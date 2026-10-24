@@ -3,6 +3,7 @@ pub mod coverage;
 pub mod doctor;
 pub mod filter;
 pub mod functions;
+pub mod kallsyms;
 pub mod overview;
 pub mod perf;
 pub mod query;

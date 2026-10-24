@@ -19,6 +19,7 @@ const MAPPINGS: &str = "mappings.parquet";
 const FRAMES: &str = "frames.parquet";
 const STACKS: &str = "stacks.parquet";
 const SAMPLES: &str = "samples.parquet";
+const KERNEL_SYMBOLS: &str = "kernel_symbols.parquet";
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -117,6 +118,8 @@ pub struct Recording {
     /// Frame ids, leaf first.
     pub stacks: Vec<Vec<u32>>,
     pub samples: Vec<Sample>,
+    /// Sorted by start, and not overlapping.
+    pub kernel_symbols: Vec<KernelSymbol>,
 }
 
 /// One lifetime of a thread. The kernel reuses ids, so `(pid, tid)` can
@@ -201,6 +204,19 @@ impl Origin {
     }
 }
 
+/// A kernel function or BPF program, as the kernel listed it while
+/// recording. Only the ones kernel frames fall in are kept: the kernel
+/// moves on every boot, so its symbols cannot be read again later.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KernelSymbol {
+    pub start: u64,
+    /// Exclusive: where the next function starts, or the mapping ends.
+    pub end: u64,
+    pub name: String,
+    /// `None` for the kernel itself, as in `ext4` for a module, or `bpf`.
+    pub module: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Sample {
     pub time_ns: u64,
@@ -270,6 +286,7 @@ impl Recording {
             frames: read_frames(dir)?,
             stacks: read_stacks(dir)?,
             samples: read_samples(dir)?,
+            kernel_symbols: read_kernel_symbols(dir)?,
         };
         recording
             .check_references()
@@ -365,6 +382,20 @@ impl Recording {
                 Column::u32("stack_id", samples.iter().map(|s| s.stack).collect()),
                 Column::u64("cpu_ns", samples.iter().map(|s| s.cpu_ns).collect()),
             ],
+        )?;
+
+        let symbols = &self.kernel_symbols;
+        table::write(
+            &dir.join(KERNEL_SYMBOLS),
+            vec![
+                Column::u64("start", symbols.iter().map(|s| s.start).collect()),
+                Column::u64("end", symbols.iter().map(|s| s.end).collect()),
+                Column::string("name", symbols.iter().map(|s| s.name.as_str()).collect()),
+                Column::optional_string(
+                    "module",
+                    symbols.iter().map(|s| s.module.as_deref()).collect(),
+                ),
+            ],
         )
     }
 
@@ -389,6 +420,16 @@ impl Recording {
         }
         for (index, sample) in self.samples.iter().enumerate() {
             check_id("sample", index, "stack", sample.stack, self.stacks.len())?;
+        }
+        for (index, symbol) in self.kernel_symbols.iter().enumerate() {
+            if symbol.start >= symbol.end {
+                return Err(format!("kernel symbol {index} has start >= end"));
+            }
+            if index > 0 && self.kernel_symbols[index - 1].end > symbol.start {
+                return Err(format!(
+                    "kernel symbol {index} starts before the one before it ends"
+                ));
+            }
         }
         Ok(())
     }
@@ -527,6 +568,22 @@ fn read_samples(dir: &Path) -> Result<Vec<Sample>> {
             })
         })
         .collect()
+}
+
+fn read_kernel_symbols(dir: &Path) -> Result<Vec<KernelSymbol>> {
+    let table = Table::read(&dir.join(KERNEL_SYMBOLS))?;
+    let start = table.u64("start")?;
+    let end = table.u64("end")?;
+    let mut name = table.string("name")?;
+    let mut module = table.optional_string("module")?;
+    Ok((0..table.len())
+        .map(|i| KernelSymbol {
+            start: start[i],
+            end: end[i],
+            name: std::mem::take(&mut name[i]),
+            module: module[i].take(),
+        })
+        .collect())
 }
 
 fn ids(len: usize) -> Vec<u32> {

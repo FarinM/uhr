@@ -85,6 +85,7 @@ fn recording() -> Recording {
             start_ns: Some(0),
             end_ns: Some(10),
             streams: Vec::new(),
+            kernel_symbols: KernelSymbols::Saved,
         },
         threads: Vec::new(),
         thread_names: Vec::new(),
@@ -100,6 +101,7 @@ fn recording() -> Recording {
         frames,
         stacks: stacks.into_iter().map(|(stack, _)| stack).collect(),
         samples,
+        kernel_symbols: Vec::new(),
     }
 }
 
