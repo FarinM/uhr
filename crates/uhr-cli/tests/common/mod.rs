@@ -37,15 +37,34 @@ pub fn compile_with_debug_info(program: &str, output: &Path, optimization: &str)
     build(program, output, &[optimization, "-g"]);
 }
 
+/// Builds `test-programs/<program>.c` the way release builds often are.
+pub fn compile_without_frame_pointers(program: &str, output: &Path, optimization: &str) {
+    build(program, output, &[optimization, "-fomit-frame-pointer"]);
+}
+
+/// Builds `test-programs/<program>.c` with extra compiler flags.
+pub fn compile_with_flags(program: &str, output: &Path, flags: &[&str]) {
+    build(program, output, flags);
+}
+
+/// Builds `test-programs/<program>.rs` as rustc does by default: without
+/// frame pointers, and on x86-64 Linux linked with lld.
+pub fn compile_rust(program: &str, output: &Path) {
+    let status = Command::new("rustc")
+        .args(["-O", "-o"])
+        .arg(output)
+        .arg(format!("{PROGRAMS}/{program}.rs"))
+        .status()
+        .expect("running rustc");
+    assert!(status.success(), "rustc failed");
+}
+
+/// `flags` come last, so they win over the defaults.
 fn build(program: &str, output: &Path, flags: &[&str]) {
     let status = Command::new("cc")
+        .args(["-pthread", "-fno-omit-frame-pointer", "-Wl,--build-id"])
         .args(flags)
-        .args([
-            "-pthread",
-            "-fno-omit-frame-pointer",
-            "-Wl,--build-id",
-            "-o",
-        ])
+        .arg("-o")
         .arg(output)
         .arg(format!("{PROGRAMS}/{program}.c"))
         .status()
