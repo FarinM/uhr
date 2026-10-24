@@ -118,6 +118,7 @@ fn shares_self_and_total_time() {
     };
 
     let leaf = row(Some("leaf"), Origin::Binary);
+    assert_eq!(leaf.function.id.as_deref(), Some("/bin/app+0x10"));
     assert_eq!((leaf.self_cpu_ns, leaf.total_cpu_ns), (8, 8));
     assert_eq!(leaf.self_share, 0.8);
 
@@ -137,6 +138,12 @@ fn shares_self_and_total_time() {
     assert_eq!(placeholder.self_cpu_ns, 1);
 
     assert_eq!(result.rows[0].function.name.as_deref(), Some("leaf"));
+
+    let kernel = row(None, Origin::Kernel);
+    assert_eq!(
+        kernel.function.id, None,
+        "no function address to name it by"
+    );
 }
 
 #[test]
@@ -163,6 +170,7 @@ fn works_without_symbols() {
     assert!(!result.coverage.symbolized);
     assert_eq!(result.coverage.named_share, Some(0.0));
     assert!(result.rows.iter().all(|r| r.function.name.is_none()));
+    assert!(result.rows.iter().all(|r| r.function.id.is_none()));
 }
 
 #[test]
@@ -293,6 +301,7 @@ fn merges_the_same_function_across_mappings_and_counts_recursion_once() {
     assert_eq!((row.self_cpu_ns, row.total_cpu_ns), (10, 10));
     assert_eq!(row.function.function_address, Some(0x10));
     assert_eq!(row.function.build_id.as_deref(), Some("abcd"));
+    assert_eq!(row.function.id.as_deref(), Some("abcd+0x10"));
     assert_eq!(result.coverage.named_share, Some(1.0));
 }
 
@@ -325,4 +334,58 @@ fn separates_builds_at_the_same_path_and_function_address() {
             .all(|row| row.function.function_address == Some(0x10))
     );
     assert_eq!(result.coverage.named_share, Some(0.0));
+}
+
+#[test]
+fn combines_copies_of_one_binary_at_different_paths() {
+    let mut recording = recording();
+    recording.mappings[0].build_id = Some("abcd".into());
+    let mut copy = recording.mappings[0].clone();
+    copy.path = "/opt/app".into();
+    copy.start = 0x2000;
+    copy.end = 0x3000;
+    recording.mappings.push(copy);
+    recording.frames = vec![frame(0x10, Some(0)), frame(0x2010, Some(1))];
+    recording.stacks = vec![vec![0], vec![1]];
+    recording.samples = vec![sample(0, 4), sample(1, 6)];
+    let symbols = Symbols {
+        names: vec![Some(FrameName::Symbol("worker".into())); 2],
+        function_addresses: vec![Some(0x10); 2],
+        sources: Vec::new(),
+    };
+
+    let result = run(&recording, Some(&symbols), &query(10));
+    assert_eq!(result.rows.len(), 1, "one function, one id");
+    let row = &result.rows[0];
+    assert_eq!(row.function.id.as_deref(), Some("abcd+0x10"));
+    assert_eq!(row.function.module.as_deref(), Some("/bin/app"));
+    assert_eq!(row.self_cpu_ns, 10);
+}
+
+#[test]
+fn the_entry_point_range_of_a_stripped_binary_has_no_id() {
+    let mut recording = recording();
+    recording.frames = vec![frame(0x10, Some(0)), frame(0x40, Some(0))];
+    recording.stacks = vec![vec![0], vec![1]];
+    recording.samples = vec![sample(0, 4), sample(1, 6)];
+    let symbols = Symbols {
+        names: vec![
+            Some(FrameName::Placeholder("EntryPoint".into())),
+            Some(FrameName::Placeholder("fun_40".into())),
+        ],
+        function_addresses: vec![Some(0x10), Some(0x40)],
+        sources: Vec::new(),
+    };
+
+    let result = run(&recording, Some(&symbols), &query(10));
+    let id = |placeholder: &str| {
+        let row = result
+            .rows
+            .iter()
+            .find(|r| r.function.placeholder.as_deref() == Some(placeholder))
+            .unwrap();
+        row.function.id.clone()
+    };
+    assert_eq!(id("EntryPoint"), None, "the range is not one function");
+    assert_eq!(id("fun_40").as_deref(), Some("/bin/app+0x40"));
 }

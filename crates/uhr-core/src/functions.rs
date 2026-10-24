@@ -8,13 +8,21 @@ use crate::symbols::{FrameName, Symbols};
 /// One function, or the unnamed code of one module.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Function {
+    /// The build-id, or the module path when there is none, and the function
+    /// start, as in `3f9a01c2+0x1550`. Starts come from symbols or the
+    /// binary's unwind tables, so the id stays the same across results and
+    /// when symbols are resolved again. `None` for code without a known
+    /// start: kernel code, a recording not yet symbolized, and the range a
+    /// stripped binary's `EntryPoint` placeholder covers.
+    pub id: Option<String>,
     /// `None` for frames without a name.
     #[serde(rename = "function")]
     pub name: Option<String>,
     /// The label wholesym made up from the address when there is no name,
     /// such as `fun_1200`. Counted as unnamed.
     pub placeholder: Option<String>,
-    /// Path of the file the code was mapped from.
+    /// Path of the file the code was mapped from. The first one seen, when
+    /// copies of one binary ran from several paths.
     pub module: Option<String>,
     pub build_id: Option<String>,
     /// Function start relative to the binary's image base, when known.
@@ -22,12 +30,34 @@ pub struct Function {
     pub origin: Origin,
 }
 
-/// Origin, module path and build-id, and function address.
-type Key<'a> = (Origin, Option<(&'a str, Option<&'a str>)>, Option<u32>);
+/// The placeholder wholesym gives the range from a stripped binary's entry
+/// point to the next function start it knows. That range is not one
+/// function, and debug symbols split it up.
+const ENTRY_POINT: &str = "EntryPoint";
 
-/// The frames of a recording, grouped into functions by module path,
-/// build-id and function address. Mapping ids change across processes and
-/// reloads, and build-ids tell apart different binaries at the same path.
+/// What identifies a function's file. Copies of one binary at different
+/// paths share a build-id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Module<'a> {
+    BuildId(&'a str),
+    /// For a file whose build-id was not recorded.
+    Path(&'a str),
+}
+
+impl Module<'_> {
+    fn as_str(&self) -> &str {
+        match self {
+            Module::BuildId(id) | Module::Path(id) => id,
+        }
+    }
+}
+
+type Key<'a> = (Origin, Option<Module<'a>>, Option<u32>);
+
+/// The frames of a recording, grouped into functions by build-id (or path
+/// without one) and function start. Mapping ids change across processes
+/// and reloads, and build-ids tell apart different binaries at the same
+/// path.
 pub(crate) struct Functions {
     /// The function of each frame.
     pub(crate) of_frame: Vec<u32>,
@@ -43,22 +73,28 @@ impl Functions {
             .iter()
             .enumerate()
             .map(|(frame_id, frame)| {
-                let module = frame.mapping.map(|m| {
-                    let mapping = &recording.mappings[m as usize];
-                    (mapping.path.as_str(), mapping.build_id.as_deref())
+                let mapping = frame.mapping.map(|m| &recording.mappings[m as usize]);
+                let module = mapping.map(|m| match &m.build_id {
+                    Some(id) => Module::BuildId(id),
+                    None => Module::Path(&m.path),
                 });
                 let address = symbols.and_then(|s| s.function_addresses[frame_id]);
                 *ids.entry((frame.origin, module, address))
                     .or_insert_with(|| {
                         let name = symbols.and_then(|s| s.names[frame_id].as_ref());
+                        let placeholder = match name {
+                            Some(FrameName::Placeholder(label)) => Some(label.clone()),
+                            _ => None,
+                        };
+                        let boundary = placeholder.as_deref() != Some(ENTRY_POINT);
                         functions.push(Function {
+                            id: module.zip(address).filter(|_| boundary).map(
+                                |(module, address)| format!("{}+0x{address:x}", module.as_str()),
+                            ),
                             name: name.and_then(FrameName::symbol).map(str::to_owned),
-                            placeholder: match name {
-                                Some(FrameName::Placeholder(label)) => Some(label.clone()),
-                                _ => None,
-                            },
-                            module: module.map(|(path, _)| path.to_owned()),
-                            build_id: module.and_then(|(_, id)| id.map(str::to_owned)),
+                            placeholder,
+                            module: mapping.map(|m| m.path.clone()),
+                            build_id: mapping.and_then(|m| m.build_id.clone()),
                             function_address: address,
                             origin: frame.origin,
                         });

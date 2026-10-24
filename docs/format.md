@@ -132,10 +132,11 @@ uses temporary disk space and copy I/O proportional to that binary and its debug
 files, without requiring their entire contents to stay in RAM. An in-place
 write detected during copying fails resolution for that file.
 
-Function queries group by module path, build-id and relative function start,
-so distinct functions sharing a name stay separate and remappings of the same
-function still combine. JSON rows expose `build_id` and `function_address`;
-the readable output includes the address beside the name.
+Function queries group by build-id, or by module path for a file without one,
+and relative function start. So distinct functions sharing a name stay
+separate, while remappings of a function and copies of its binary at other
+paths combine. JSON rows expose `build_id` and `function_address`; the
+readable output includes the address beside the name.
 
 Inline call chains are not yet expanded. Query coverage explicitly reports
 that self time is attributed to the enclosing machine function. Supporting
