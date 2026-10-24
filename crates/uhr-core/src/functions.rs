@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use serde::Serialize;
 
 use crate::recording::{Origin, Recording};
-use crate::symbols::{FrameName, Symbols};
+use crate::symbols::{FrameName, InlineFrame, Symbols};
 
 /// One function, or the unnamed code of one module.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -37,6 +37,14 @@ pub struct Function {
     /// The source file the function is declared in, from debug info.
     pub file: Option<String>,
     pub origin: Origin,
+}
+
+/// A place in source code, from debug info.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+pub struct SourceLine {
+    /// As written in the debug info, usually absolute.
+    pub file: String,
+    pub line: u32,
 }
 
 /// The placeholder wholesym gives the range from a stripped binary's entry
@@ -100,19 +108,34 @@ pub(crate) struct Functions {
     /// is the function the frame's machine code belongs to.
     chains: Vec<Vec<Step>>,
     functions: Vec<Function>,
+    lines: Vec<SourceLine>,
     symbolized: bool,
 }
 
-/// A function in a frame's chain.
+/// A function in a frame's chain, and the line the frame is at in it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct Step {
     pub(crate) function: u32,
+    /// Index of the line, `None` without line info.
+    pub(crate) line: Option<u32>,
 }
 
 impl Functions {
     pub(crate) fn new<'a>(recording: &'a Recording, symbols: Option<&'a Symbols>) -> Self {
         let mut ids: HashMap<Key<'a>, u32> = HashMap::new();
         let mut functions = Vec::new();
+        let mut line_ids: HashMap<(&'a str, u32), u32> = HashMap::new();
+        let mut lines = Vec::new();
+        let mut line = |call: &'a InlineFrame| {
+            let place = call.file.as_deref().zip(call.line)?;
+            Some(*line_ids.entry(place).or_insert_with(|| {
+                lines.push(SourceLine {
+                    file: place.0.to_owned(),
+                    line: place.1,
+                });
+                lines.len() as u32 - 1
+            }))
+        };
         let chains = recording
             .frames
             .iter()
@@ -159,7 +182,10 @@ impl Functions {
                             file: file.map(str::to_owned),
                             origin: frame.origin,
                         });
-                        Step { function: id }
+                        Step {
+                            function: id,
+                            line: line(call),
+                        }
                     })
                     .collect();
                 let address = symbols.and_then(|s| s.function_addresses[frame_id]);
@@ -185,18 +211,23 @@ impl Functions {
                         origin: frame.origin,
                     }
                 });
-                chain.push(Step { function: id });
+                chain.push(Step {
+                    function: id,
+                    line: inline.last().and_then(&mut line),
+                });
                 chain
             })
             .collect();
         Self {
             chains,
             functions,
+            lines,
             symbolized: symbols.is_some(),
         }
     }
 
-    /// The steps of a stack, leaf first, with inlined calls expanded.
+    /// The functions of a stack and their lines, leaf first, with inlined
+    /// calls expanded.
     pub(crate) fn steps<'a>(&'a self, stack: &'a [u32]) -> impl Iterator<Item = Step> + 'a {
         stack
             .iter()
@@ -211,6 +242,10 @@ impl Functions {
     /// The function running at the top of a stack.
     pub(crate) fn leaf(&self, stack: &[u32]) -> u32 {
         self.chains[stack[0] as usize][0].function
+    }
+
+    pub(crate) fn line(&self, id: u32) -> &SourceLine {
+        &self.lines[id as usize]
     }
 
     /// The function with the id `wanted`, or the only one named `wanted`.

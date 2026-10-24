@@ -148,6 +148,11 @@ same where the code itself reports other files, as code from macros or
 inlined is a separate function. Code without debug info cannot be expanded,
 and results list the files that have none.
 
+Grouped by line, a row is a function and a line from `inline_frames`. Self
+time goes to the innermost line, and total time to every line on the stack,
+which for a caller is the line of the call. Code without line info keeps its
+time in a row with no line.
+
 `symbols`:
 
 | Column | Type | Meaning |

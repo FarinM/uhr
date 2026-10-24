@@ -6,7 +6,7 @@ use serde::Serialize;
 
 use crate::coverage::{Coverage, SymbolCoverage};
 use crate::filter::Filter;
-use crate::functions::{self, Function, Functions};
+use crate::functions::{self, Function, Functions, SourceLine};
 use crate::recording::{self, Origin, Recording};
 use crate::symbols::Symbols;
 
@@ -14,6 +14,8 @@ use crate::symbols::Symbols;
 #[serde(rename_all = "snake_case")]
 pub enum GroupBy {
     Function,
+    /// Function and source line, from debug info.
+    Line,
 }
 
 #[derive(Debug, Clone)]
@@ -41,11 +43,14 @@ pub struct QueryResult {
 pub struct Row {
     #[serde(flatten)]
     pub function: Function,
-    /// CPU time with this function as the leaf.
+    /// Grouped by line, the line in the function. `None` there for code
+    /// without line info, and always `None` grouped by function.
+    pub line: Option<SourceLine>,
+    /// CPU time with this row as the leaf.
     pub self_cpu_ns: u64,
     pub self_share: f64,
-    /// CPU time with this function anywhere on the stack, counted once per
-    /// sample even when it recurses.
+    /// CPU time with this row anywhere on the stack, counted once per sample
+    /// even when it recurses. For a caller's line, the line of the call.
     pub total_cpu_ns: u64,
     pub total_share: f64,
 }
@@ -99,8 +104,9 @@ pub fn run(
             ns as f64 / cpu_ns as f64
         }
     };
-    let row = |function: u32, (self_ns, total_ns): (u64, u64)| Row {
+    let row = |function: u32, line: Option<u32>, (self_ns, total_ns): (u64, u64)| Row {
         function: functions.get(function).clone(),
+        line: line.map(|line| functions.line(line).clone()),
         self_cpu_ns: self_ns,
         self_share: share(self_ns),
         total_cpu_ns: total_ns,
@@ -111,7 +117,13 @@ pub fn run(
             keys.extend(functions.expand(stack))
         })
         .into_iter()
-        .map(|(function, times)| row(function, times))
+        .map(|(function, times)| row(function, None, times))
+        .collect(),
+        GroupBy::Line => tally(recording, &stack_cpu_ns, |stack, keys| {
+            keys.extend(functions.steps(stack))
+        })
+        .into_iter()
+        .map(|(step, times)| row(step.function, step.line, times))
         .collect(),
     };
     rows.sort_by(|a, b| {
@@ -127,6 +139,10 @@ pub fn run(
                     .cmp(&b.function.function_address)
             })
             .then_with(|| a.function.id.cmp(&b.function.id))
+            .then_with(|| {
+                let place = |row: &Row| row.line.as_ref().map(|l| (l.file.clone(), l.line));
+                place(a).cmp(&place(b))
+            })
     });
     let rows_omitted = rows.len().saturating_sub(query.top);
     rows.truncate(query.top);

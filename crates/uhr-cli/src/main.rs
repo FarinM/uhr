@@ -104,6 +104,8 @@ enum Command {
 #[derive(Clone, Copy, ValueEnum)]
 enum GroupByArg {
     Function,
+    /// Function and source line, from debug info
+    Line,
 }
 
 #[derive(Args)]
@@ -559,6 +561,7 @@ fn run_query(
     let query = Query {
         group_by: match group_by {
             GroupByArg::Function => GroupBy::Function,
+            GroupByArg::Line => GroupBy::Line,
         },
         top,
         filter: filter.into_filter()?,
@@ -574,20 +577,32 @@ fn run_query(
 }
 
 fn write_query(out: &mut impl Write, result: &QueryResult) -> io::Result<()> {
+    let by = match result.group_by {
+        GroupBy::Function => "function",
+        GroupBy::Line => "line",
+    };
     writeln!(
         out,
-        "{} samples, {:.2} s of CPU time, by function\n",
+        "{} samples, {:.2} s of CPU time, by {by}\n",
         result.samples,
         result.cpu_ns as f64 / 1e9
     )?;
     if !result.filter.is_empty() {
         writeln!(out, "filter: {}\n", describe_filter(&result.filter))?;
     }
-    writeln!(out, "{:>7} {:>7}  function", "self", "total")?;
+    writeln!(out, "{:>7} {:>7}  {by}", "self", "total")?;
     for row in &result.rows {
+        let line = match (&result.group_by, &row.line) {
+            (GroupBy::Function, _) => String::new(),
+            (GroupBy::Line, Some(line)) => {
+                let file = line.file.rsplit('/').next().unwrap_or(&line.file);
+                format!("  {file}:{}", line.line)
+            }
+            (GroupBy::Line, None) => "  (no line)".into(),
+        };
         writeln!(
             out,
-            "{:>6.1}% {:>6.1}%  {}  {}",
+            "{:>6.1}% {:>6.1}%  {}{line}  {}",
             row.self_share * 100.0,
             row.total_share * 100.0,
             function_name(&row.function),

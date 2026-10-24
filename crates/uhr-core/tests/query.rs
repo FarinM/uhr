@@ -552,3 +552,39 @@ fn lists_files_without_debug_info() {
     let result = run(&recording(), Some(&symbols()), &query(10)).unwrap();
     assert_eq!(result.coverage.symbols.without_debug_info, ["/bin/app"]);
 }
+
+#[test]
+fn groups_by_source_line() {
+    let mut query = query(20);
+    query.group_by = GroupBy::Line;
+    let result = run(&recording(), Some(&symbols_with_inlining()), &query).unwrap();
+    assert_eq!(result.group_by, GroupBy::Line);
+    let at = |function: &str, line: Option<u32>| {
+        result
+            .rows
+            .iter()
+            .find(|r| {
+                r.function.name.as_deref() == Some(function)
+                    && r.line.as_ref().map(|l| l.line) == line
+            })
+            .unwrap_or_else(|| panic!("no row for {function} at {line:?}"))
+    };
+    let helper = at("helper", Some(5));
+    assert_eq!(helper.line.as_ref().unwrap().file, "/src/app.c");
+    assert_eq!((helper.self_cpu_ns, helper.total_cpu_ns), (8, 8));
+    // The leaf frame's caller is at the line of the call.
+    assert_eq!(at("leaf", Some(20)).total_cpu_ns, 8);
+    assert_eq!(at("recurse", Some(30)).total_cpu_ns, 8);
+    // Code without line info keeps its time in a row with no line.
+    assert_eq!(at("main", None).total_cpu_ns, 10);
+    let rows: u64 = result.rows.iter().map(|r| r.self_cpu_ns).sum();
+    assert_eq!(rows, result.cpu_ns);
+
+    let by_function = run(
+        &recording(),
+        Some(&symbols_with_inlining()),
+        &self::query(10),
+    )
+    .unwrap();
+    assert!(by_function.rows.iter().all(|r| r.line.is_none()));
+}

@@ -35,6 +35,8 @@ uhr query rec --group-by function --thread 'worker-*' --mode kernel --from 1s
 uhr call-paths rec --function memcpy       # who calls it, and what it calls
 uhr query rec --group-by function --under run_bench
                                            # only time spent under one function
+uhr query rec --group-by line --under parse_json
+                                           # which source lines, from debug info
 ```
 
 Full stacks need frame pointers. `uhr doctor` lists the build flags.
