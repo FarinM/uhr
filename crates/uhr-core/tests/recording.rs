@@ -133,15 +133,35 @@ fn round_trips() {
 }
 
 #[test]
-fn rejects_dangling_references() {
-    let dir = scratch("dangling");
+fn will_not_write_what_it_could_not_read() {
+    let dir = scratch("unreadable");
     let mut recording = example();
     recording.stacks[1] = vec![5];
-    recording.write(&dir).unwrap();
-    match Recording::read(&dir).unwrap_err() {
+    match recording.write(&dir).unwrap_err() {
         Error::Invalid { path, reason } => {
             assert_eq!(path, dir);
             assert!(reason.contains("stack 1 refers to frame 5"), "{reason}");
+        }
+        error => panic!("{error}"),
+    }
+    assert!(!dir.exists());
+}
+
+#[test]
+fn rejects_dangling_references() {
+    let dir = scratch("dangling");
+    example().write(&dir).unwrap();
+    let other = scratch("dangling_other");
+    let mut fewer_frames = example();
+    fewer_frames.frames.truncate(1);
+    fewer_frames.stacks = vec![vec![0]];
+    fewer_frames.samples.truncate(1);
+    fewer_frames.write(&other).unwrap();
+    fs::copy(other.join("frames.parquet"), dir.join("frames.parquet")).unwrap();
+    match Recording::read(&dir).unwrap_err() {
+        Error::Invalid { path, reason } => {
+            assert_eq!(path, dir);
+            assert!(reason.contains("stack 0 refers to frame 1"), "{reason}");
         }
         error => panic!("{error}"),
     }

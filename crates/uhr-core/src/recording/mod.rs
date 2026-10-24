@@ -242,8 +242,13 @@ impl Mode {
 
 impl Recording {
     /// Writes the manifest last: a directory without one is a recording that
-    /// did not finish.
+    /// did not finish. Checks first what `read` checks, so a recording that
+    /// could not be read back is never written.
     pub fn write(&self, dir: &Path) -> Result<()> {
+        self.check_references().map_err(|reason| Error::Invalid {
+            path: dir.to_owned(),
+            reason,
+        })?;
         fs::create_dir_all(dir).map_err(Error::io("creating", dir))?;
         self.write_tables(dir)?;
         let path = dir.join(MANIFEST);

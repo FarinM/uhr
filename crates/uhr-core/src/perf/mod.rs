@@ -184,7 +184,16 @@ pub fn record(options: &RecordOptions, out: &Path) -> Result<Recording> {
         }
     };
 
-    recording.write(&staging)?;
+    match recording.write(&staging) {
+        // What it was converted from is all there is to look into.
+        Err(error @ recording::Error::Invalid { .. }) => {
+            return Err(Error::Convert {
+                path: perf_data,
+                source: Box::new(error.into()),
+            });
+        }
+        result => result?,
+    }
     fs::remove_file(&perf_data).map_err(io_error("removing", &perf_data))?;
     fs::rename(&staging, out).map_err(io_error("renaming into place", out))?;
     log_summary(&recording, out);
