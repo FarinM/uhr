@@ -29,9 +29,18 @@ pub fn scratch(name: &str) -> PathBuf {
 
 /// Builds `test-programs/<program>.c`.
 pub fn compile(program: &str, output: &Path, optimization: &str) {
+    build(program, output, &[optimization]);
+}
+
+/// Builds `test-programs/<program>.c` with DWARF debug info.
+pub fn compile_with_debug_info(program: &str, output: &Path, optimization: &str) {
+    build(program, output, &[optimization, "-g"]);
+}
+
+fn build(program: &str, output: &Path, flags: &[&str]) {
     let status = Command::new("cc")
+        .args(flags)
         .args([
-            optimization,
             "-pthread",
             "-fno-omit-frame-pointer",
             "-Wl,--build-id",
