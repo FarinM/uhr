@@ -1,6 +1,7 @@
 use serde::Serialize;
 
 use crate::recording::{Collector, MissingSignal, Recording, Signal, Unwinding};
+use crate::symbols::{Source, SourceStatus, Symbols};
 
 /// What a result can't see because of how the recording was made. Every
 /// result carries it.
@@ -60,5 +61,37 @@ impl Coverage {
             }
         }
         coverage
+    }
+}
+
+/// Whether a result could name the code it shows.
+#[derive(Debug, Clone, Serialize)]
+pub struct SymbolCoverage {
+    pub symbolized: bool,
+    /// Files whose frames got no names, or names that could not be checked.
+    pub symbol_problems: Vec<Source>,
+}
+
+impl SymbolCoverage {
+    /// Also adds to `coverage` what symbols leave unknown.
+    pub(crate) fn of(symbols: Option<&Symbols>, coverage: &mut Coverage) -> Self {
+        let Some(symbols) = symbols else {
+            return Self {
+                symbolized: false,
+                symbol_problems: Vec::new(),
+            };
+        };
+        coverage.unknown.push(
+            "inline call chains are not expanded; self time is attributed to the enclosing machine function".into(),
+        );
+        Self {
+            symbolized: true,
+            symbol_problems: symbols
+                .sources
+                .iter()
+                .filter(|s| s.status != SourceStatus::Resolved)
+                .cloned()
+                .collect(),
+        }
     }
 }

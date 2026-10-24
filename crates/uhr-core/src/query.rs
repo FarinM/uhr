@@ -3,11 +3,11 @@ use std::path::Path;
 
 use serde::Serialize;
 
-use crate::coverage::Coverage;
+use crate::coverage::{Coverage, SymbolCoverage};
 use crate::filter::Filter;
 use crate::functions::{Function, Functions};
 use crate::recording::{self, Origin, Recording};
-use crate::symbols::{Source, SourceStatus, Symbols};
+use crate::symbols::Symbols;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -56,9 +56,8 @@ pub struct QueryCoverage {
     pub named_share: Option<f64>,
     /// Share of CPU time whose leaf frame has no name, by origin.
     pub unnamed_by_origin: BTreeMap<Origin, f64>,
-    pub symbolized: bool,
-    /// Files whose frames got no names, or names that could not be checked.
-    pub symbol_problems: Vec<Source>,
+    #[serde(flatten)]
+    pub symbols: SymbolCoverage,
     #[serde(flatten)]
     pub recording: Coverage,
 }
@@ -146,28 +145,16 @@ fn by_function(recording: &Recording, symbols: Option<&Symbols>, query: &Query) 
         }
     }
 
-    let mut coverage = QueryCoverage {
+    let mut recording = Coverage::of(recording);
+    let coverage = QueryCoverage {
         named_share: (cpu_ns > 0).then(|| share(named_ns)),
         unnamed_by_origin: unnamed_by_origin
             .into_iter()
             .map(|(origin, ns)| (origin, share(ns)))
             .collect(),
-        symbolized: false,
-        symbol_problems: Vec::new(),
-        recording: Coverage::of(recording),
+        symbols: SymbolCoverage::of(symbols, &mut recording),
+        recording,
     };
-    if let Some(symbols) = symbols {
-        coverage.symbolized = true;
-        coverage.recording.unknown.push(
-            "inline call chains are not expanded; self time is attributed to the enclosing machine function".into(),
-        );
-        coverage.symbol_problems = symbols
-            .sources
-            .iter()
-            .filter(|s| s.status != SourceStatus::Resolved)
-            .cloned()
-            .collect();
-    }
 
     QueryResult {
         group_by: GroupBy::Function,

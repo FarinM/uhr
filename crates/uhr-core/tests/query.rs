@@ -153,8 +153,8 @@ fn reports_named_share_and_symbol_problems() {
     assert_eq!(coverage.named_share, Some(0.8));
     assert_eq!(coverage.unnamed_by_origin[&Origin::Binary], 0.1);
     assert_eq!(coverage.unnamed_by_origin[&Origin::Kernel], 0.1);
-    assert!(coverage.symbolized);
-    assert_eq!(coverage.symbol_problems.len(), 1);
+    assert!(coverage.symbols.symbolized);
+    assert_eq!(coverage.symbols.symbol_problems.len(), 1);
 }
 
 #[test]
@@ -167,7 +167,7 @@ fn reports_cut_rows() {
 #[test]
 fn works_without_symbols() {
     let result = run(&recording(), None, &query(10));
-    assert!(!result.coverage.symbolized);
+    assert!(!result.coverage.symbols.symbolized);
     assert_eq!(result.coverage.named_share, Some(0.0));
     assert!(result.rows.iter().all(|r| r.function.name.is_none()));
     assert!(result.rows.iter().all(|r| r.function.id.is_none()));

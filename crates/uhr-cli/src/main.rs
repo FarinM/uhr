@@ -6,7 +6,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::LevelFilter;
-use uhr_core::coverage::Coverage;
+use uhr_core::coverage::{Coverage, SymbolCoverage};
 use uhr_core::doctor::{self, Report, Status};
 use uhr_core::filter::Filter;
 use uhr_core::functions::Function;
@@ -460,6 +460,11 @@ fn write_query(out: &mut impl Write, result: &QueryResult) -> io::Result<()> {
     for (origin, share) in &coverage.unnamed_by_origin {
         writeln!(out, "  unnamed {}: {:.1}%", origin.as_str(), share * 100.0)?;
     }
+    write_symbol_coverage(out, &coverage.symbols)?;
+    write_coverage(out, &coverage.recording)
+}
+
+fn write_symbol_coverage(out: &mut impl Write, coverage: &SymbolCoverage) -> io::Result<()> {
     if !coverage.symbolized {
         writeln!(out, "  not symbolized: run `uhr symbolize`")?;
     }
@@ -473,7 +478,7 @@ fn write_query(out: &mut impl Write, result: &QueryResult) -> io::Result<()> {
             detail.unwrap_or_default()
         )?;
     }
-    write_coverage(out, &coverage.recording)
+    Ok(())
 }
 
 fn write_coverage(out: &mut impl Write, coverage: &Coverage) -> io::Result<()> {
