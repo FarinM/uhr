@@ -132,11 +132,7 @@ pub fn run(
             continue;
         }
         path.clear();
-        path.extend(
-            stack
-                .iter()
-                .map(|&frame| functions.of_frame[frame as usize]),
-        );
+        path.extend(functions.expand(stack));
         // Leaf first, so the outermost call is the last.
         let Some(outermost) = path.iter().rposition(|&f| f == target) else {
             continue;
@@ -214,7 +210,7 @@ pub fn run(
                 .into_iter()
                 .map(|(origin, ns)| (origin, ns as f64 / total_cpu_ns as f64))
                 .collect(),
-            symbols: SymbolCoverage::of(symbols, &mut recording_coverage),
+            symbols: SymbolCoverage::of(recording, symbols),
             recording: recording_coverage,
         },
     })

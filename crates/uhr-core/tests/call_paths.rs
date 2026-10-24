@@ -2,7 +2,7 @@ use uhr_core::call_paths::{CallPaths, Error, Node, Omitted, Query, run};
 use uhr_core::filter::Filter;
 use uhr_core::functions;
 use uhr_core::recording::*;
-use uhr_core::symbols::{FrameName, Symbols};
+use uhr_core::symbols::{FrameName, InlineFrame, Symbols};
 
 /// The binary's functions by frame id, then a kernel frame.
 const FUNCTIONS: [(&str, u32); 8] = [
@@ -360,4 +360,34 @@ fn a_binary_that_ran_from_two_paths_is_one_function() {
         assert_eq!(tree(&result.callers)[..2], ["a 9", "  main 9"]);
         assert!(tree(&result.callers).contains(&"main 5".to_owned()));
     }
+}
+
+#[test]
+fn goes_through_inlined_calls() {
+    let mut symbols = symbols();
+    let call = |function: &str| InlineFrame {
+        function: Some(function.into()),
+        file: Some("/src/app.c".into()),
+        line: Some(1),
+        decl_file: Some("/src/app.c".into()),
+        decl_line: Some(1),
+    };
+    symbols.inline[3] = vec![call("mixin"), call("spin")];
+    let mixin = run(&recording(), Some(&symbols), &query("mixin", 3, 5)).unwrap();
+    assert!(mixin.function.inlined);
+    assert_eq!((mixin.total_cpu_ns, mixin.self_cpu_ns), (12, 10));
+    assert_eq!(
+        tree(&mixin.callers),
+        ["spin 12", "  a 9", "    main 9", "  b 2", "    main 2"]
+    );
+
+    let spin = run(&recording(), Some(&symbols), &query("spin", 3, 5)).unwrap();
+    assert_eq!(spin.self_cpu_ns, 0, "the time is in the inlined code");
+    let callee = spin
+        .callees
+        .iter()
+        .find(|n| n.function.name.as_deref() == Some("mixin"))
+        .unwrap();
+    // The tenth is the recursive call, below the depth limit.
+    assert_eq!(callee.self_cpu_ns, Some(9));
 }

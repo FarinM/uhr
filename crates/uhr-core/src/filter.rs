@@ -74,11 +74,7 @@ impl Filter {
             recording
                 .stacks
                 .iter()
-                .map(|stack| {
-                    stack
-                        .iter()
-                        .any(|&frame| wanted.contains(&functions.of_frame[frame as usize]))
-                })
+                .map(|stack| functions.expand(stack).any(|f| wanted.contains(&f)))
                 .collect(),
         ))
     }

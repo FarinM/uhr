@@ -10,9 +10,11 @@ behaviors.
   are compact and carry IDs to drill down. A function's id is its build-id,
   or its path when there is none, and its start address. Starts come from
   symbols or the binary's unwind tables, so the id stays the same in every
-  result and after symbols are resolved again. Code without a known start
-  has no id: kernel code, a recording not yet symbolized, and the range a
-  stripped binary's `EntryPoint` placeholder covers.
+  result and after symbols are resolved again. An inlined function has no
+  start: its id is its build-id or path and a hash of its name and the file
+  and line it is declared at. Other code without a known start has no id: kernel code, a
+  recording not yet symbolized, and the range a stripped binary's
+  `EntryPoint` placeholder covers.
 - Prefer a few tools composed through filters and grouping over many
   single-purpose tools.
 - Every result carries coverage. See [model](model.md#coverage).

@@ -619,6 +619,9 @@ fn write_symbol_coverage(out: &mut impl Write, coverage: &SymbolCoverage) -> io:
     if !coverage.symbolized {
         writeln!(out, "  not symbolized: run `uhr symbolize`")?;
     }
+    for path in &coverage.without_debug_info {
+        writeln!(out, "  no debug info, inlined calls not expanded: {path}")?;
+    }
     for source in &coverage.symbol_problems {
         let detail = source.detail.as_deref().map(|d| format!(": {d}"));
         writeln!(
@@ -700,6 +703,7 @@ fn function_name(function: &Function) -> String {
     };
     match function.function_address {
         Some(address) => format!("{name} @0x{address:x}"),
+        None if function.inlined => format!("{name} (inlined)"),
         None => name,
     }
 }

@@ -139,9 +139,14 @@ separate, while remappings of a function and copies of its binary at other
 paths combine. JSON rows expose `build_id` and `function_address`; the
 readable output includes the address beside the name.
 
-Inline call chains are not yet expanded. Query coverage explicitly reports
-that self time is attributed to the enclosing machine function. Supporting
-inline function identity requires additional information from the symbol engine.
+Queries expand each frame's inlined calls from `inline_frames`, so time in
+inlined code counts for the inlined function. An inlined function has no
+address: it groups by build-id (or path), name and declaration (file and
+line), across every function it was inlined into. The declaration stays the
+same where the code itself reports other files, as code from macros or
+`#line` directives does. A copy of it that was called rather than
+inlined is a separate function. Code without debug info cannot be expanded,
+and results list the files that have none.
 
 `symbols`:
 

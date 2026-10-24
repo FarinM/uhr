@@ -1,6 +1,8 @@
+use std::collections::BTreeMap;
+
 use serde::Serialize;
 
-use crate::recording::{Collector, MissingSignal, Recording, Signal, Unwinding};
+use crate::recording::{Collector, MissingSignal, Origin, Recording, Signal, Unwinding};
 use crate::symbols::{Source, SourceStatus, Symbols};
 
 /// What a result can't see because of how the recording was made. Every
@@ -70,20 +72,36 @@ pub struct SymbolCoverage {
     pub symbolized: bool,
     /// Files whose frames got no names, or names that could not be checked.
     pub symbol_problems: Vec<Source>,
+    /// Files with named code but no debug info for any of it. Calls inlined
+    /// there are not expanded, so their time counts for the function they
+    /// were inlined into.
+    pub without_debug_info: Vec<String>,
 }
 
 impl SymbolCoverage {
-    /// Also adds to `coverage` what symbols leave unknown.
-    pub(crate) fn of(symbols: Option<&Symbols>, coverage: &mut Coverage) -> Self {
+    pub(crate) fn of(recording: &Recording, symbols: Option<&Symbols>) -> Self {
         let Some(symbols) = symbols else {
             return Self {
                 symbolized: false,
                 symbol_problems: Vec::new(),
+                without_debug_info: Vec::new(),
             };
         };
-        coverage.unknown.push(
-            "inline call chains are not expanded; self time is attributed to the enclosing machine function".into(),
-        );
+        // Startup code and hand-written assembly often lack debug info even
+        // in a file built with it, so only a file without any counts.
+        let mut debug_info: BTreeMap<&str, bool> = BTreeMap::new();
+        for (id, frame) in recording.frames.iter().enumerate() {
+            if let (Origin::Binary, Some(mapping)) = (frame.origin, frame.mapping)
+                && symbols.names[id].is_some()
+            {
+                let path = recording.mappings[mapping as usize].path.as_str();
+                *debug_info.entry(path).or_default() |= !symbols.inline[id].is_empty();
+            }
+        }
+        let without_debug_info = debug_info
+            .into_iter()
+            .filter(|&(_, has)| !has)
+            .map(|(path, _)| path.to_owned());
         Self {
             symbolized: true,
             symbol_problems: symbols
@@ -92,6 +110,7 @@ impl SymbolCoverage {
                 .filter(|s| s.status != SourceStatus::Resolved)
                 .cloned()
                 .collect(),
+            without_debug_info: without_debug_info.collect(),
         }
     }
 }

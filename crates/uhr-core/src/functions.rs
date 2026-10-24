@@ -11,9 +11,11 @@ pub struct Function {
     /// The build-id, or the module path when there is none, and the function
     /// start, as in `3f9a01c2+0x1550`. Starts come from symbols or the
     /// binary's unwind tables, so the id stays the same across results and
-    /// when symbols are resolved again. `None` for code without a known
-    /// start: kernel code, a recording not yet symbolized, and the range a
-    /// stripped binary's `EntryPoint` placeholder covers.
+    /// when symbols are resolved again. An inlined function has no start: its
+    /// id is the build-id or path and a hash of its name and the file and
+    /// line it is declared at, as in `3f9a01c2+inline:5d2c91a04e7b33f0`. `None` for code with neither:
+    /// kernel code, a recording not yet symbolized, and the range a stripped
+    /// binary's `EntryPoint` placeholder covers.
     pub id: Option<String>,
     /// `None` for frames without a name.
     #[serde(rename = "function")]
@@ -21,12 +23,19 @@ pub struct Function {
     /// The label wholesym made up from the address when there is no name,
     /// such as `fun_1200`. Counted as unnamed.
     pub placeholder: Option<String>,
+    /// Code inlined into other functions, from debug info. It has no
+    /// machine code of its own. A copy of the function that was called
+    /// rather than inlined is a separate function.
+    pub inlined: bool,
     /// Path of the file the code was mapped from. The first one seen, when
     /// copies of one binary ran from several paths.
     pub module: Option<String>,
     pub build_id: Option<String>,
     /// Function start relative to the binary's image base, when known.
+    /// `None` for inlined code.
     pub function_address: Option<u32>,
+    /// The source file the function is declared in, from debug info.
+    pub file: Option<String>,
     pub origin: Origin,
 }
 
@@ -52,7 +61,20 @@ impl Module<'_> {
     }
 }
 
-type Key<'a> = (Origin, Option<Module<'a>>, Option<u32>);
+/// What identifies a function's code within its file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Code<'a> {
+    /// Machine code, by its start when known.
+    Start(Option<u32>),
+    /// Code inlined from the function of this name, declared here.
+    Inlined {
+        name: Option<&'a str>,
+        file: Option<&'a str>,
+        line: Option<u32>,
+    },
+}
+
+type Key<'a> = (Origin, Option<Module<'a>>, Code<'a>);
 
 /// Why no single function matched what was asked for.
 #[derive(Debug, thiserror::Error)]
@@ -70,21 +92,28 @@ pub enum Error {
 }
 
 /// The frames of a recording, grouped into functions by build-id (or path
-/// without one) and function start. Mapping ids change across processes
-/// and reloads, and build-ids tell apart different binaries at the same
-/// path.
+/// without one) and function start, or by name and declaration for inlined
+/// code. Mapping ids change across processes and reloads, and build-ids
+/// tell apart different binaries at the same path.
 pub(crate) struct Functions {
-    /// The function of each frame.
-    pub(crate) of_frame: Vec<u32>,
+    /// The functions of each frame, innermost inlined call first. The last
+    /// is the function the frame's machine code belongs to.
+    chains: Vec<Vec<Step>>,
     functions: Vec<Function>,
     symbolized: bool,
 }
 
+/// A function in a frame's chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct Step {
+    pub(crate) function: u32,
+}
+
 impl Functions {
-    pub(crate) fn new(recording: &Recording, symbols: Option<&Symbols>) -> Self {
-        let mut ids: HashMap<Key, u32> = HashMap::new();
+    pub(crate) fn new<'a>(recording: &'a Recording, symbols: Option<&'a Symbols>) -> Self {
+        let mut ids: HashMap<Key<'a>, u32> = HashMap::new();
         let mut functions = Vec::new();
-        let of_frame = recording
+        let chains = recording
             .frames
             .iter()
             .enumerate()
@@ -94,35 +123,94 @@ impl Functions {
                     Some(id) => Module::BuildId(id),
                     None => Module::Path(&m.path),
                 });
-                let address = symbols.and_then(|s| s.function_addresses[frame_id]);
-                *ids.entry((frame.origin, module, address))
-                    .or_insert_with(|| {
-                        let name = symbols.and_then(|s| s.names[frame_id].as_ref());
-                        let placeholder = match name {
-                            Some(FrameName::Placeholder(label)) => Some(label.clone()),
-                            _ => None,
-                        };
-                        let boundary = placeholder.as_deref() != Some(ENTRY_POINT);
-                        functions.push(Function {
-                            id: module.zip(address).filter(|_| boundary).map(
-                                |(module, address)| format!("{}+0x{address:x}", module.as_str()),
-                            ),
-                            name: name.and_then(FrameName::symbol).map(str::to_owned),
-                            placeholder,
-                            module: mapping.map(|m| m.path.clone()),
-                            build_id: mapping.and_then(|m| m.build_id.clone()),
-                            function_address: address,
-                            origin: frame.origin,
-                        });
+                let inline = symbols.map_or(&[][..], |s| &s.inline[frame_id]);
+                let mut function = |code: Code<'a>, make: &dyn Fn() -> Function| {
+                    *ids.entry((frame.origin, module, code)).or_insert_with(|| {
+                        functions.push(make());
                         functions.len() as u32 - 1
                     })
+                };
+                let mut chain: Vec<Step> = inline
+                    .iter()
+                    .take(inline.len().saturating_sub(1))
+                    .map(|call| {
+                        let (name, file, declared_at) = (
+                            call.function.as_deref(),
+                            call.decl_file.as_deref(),
+                            call.decl_line,
+                        );
+                        let code = Code::Inlined {
+                            name,
+                            file,
+                            line: declared_at,
+                        };
+                        let id = function(code, &|| Function {
+                            id: module.zip(name).map(|(module, name)| {
+                                let at = declared_at.map(|l| l.to_string()).unwrap_or_default();
+                                let hash = fnv1a(&[name, file.unwrap_or_default(), &at]);
+                                format!("{}+inline:{hash:016x}", module.as_str())
+                            }),
+                            name: name.map(str::to_owned),
+                            placeholder: None,
+                            inlined: true,
+                            module: mapping.map(|m| m.path.clone()),
+                            build_id: mapping.and_then(|m| m.build_id.clone()),
+                            function_address: None,
+                            file: file.map(str::to_owned),
+                            origin: frame.origin,
+                        });
+                        Step { function: id }
+                    })
+                    .collect();
+                let address = symbols.and_then(|s| s.function_addresses[frame_id]);
+                let id = function(Code::Start(address), &|| {
+                    let name = symbols.and_then(|s| s.names[frame_id].as_ref());
+                    let placeholder = match name {
+                        Some(FrameName::Placeholder(label)) => Some(label.clone()),
+                        _ => None,
+                    };
+                    let boundary = placeholder.as_deref() != Some(ENTRY_POINT);
+                    Function {
+                        id: module
+                            .zip(address)
+                            .filter(|_| boundary)
+                            .map(|(module, address)| format!("{}+0x{address:x}", module.as_str())),
+                        name: name.and_then(FrameName::symbol).map(str::to_owned),
+                        placeholder,
+                        inlined: false,
+                        module: mapping.map(|m| m.path.clone()),
+                        build_id: mapping.and_then(|m| m.build_id.clone()),
+                        function_address: address,
+                        file: inline.last().and_then(|outer| outer.decl_file.clone()),
+                        origin: frame.origin,
+                    }
+                });
+                chain.push(Step { function: id });
+                chain
             })
             .collect();
         Self {
-            of_frame,
+            chains,
             functions,
             symbolized: symbols.is_some(),
         }
+    }
+
+    /// The steps of a stack, leaf first, with inlined calls expanded.
+    pub(crate) fn steps<'a>(&'a self, stack: &'a [u32]) -> impl Iterator<Item = Step> + 'a {
+        stack
+            .iter()
+            .flat_map(|&frame| self.chains[frame as usize].iter().copied())
+    }
+
+    /// The functions of a stack, leaf first, with inlined calls expanded.
+    pub(crate) fn expand<'a>(&'a self, stack: &'a [u32]) -> impl Iterator<Item = u32> + 'a {
+        self.steps(stack).map(|step| step.function)
+    }
+
+    /// The function running at the top of a stack.
+    pub(crate) fn leaf(&self, stack: &[u32]) -> u32 {
+        self.chains[stack[0] as usize][0].function
     }
 
     /// The function with the id `wanted`, or the only one named `wanted`.
@@ -157,4 +245,15 @@ impl Functions {
     pub(crate) fn get(&self, id: u32) -> &Function {
         &self.functions[id as usize]
     }
+}
+
+/// 64-bit FNV-1a over the parts, each ended by a zero byte. Part of the
+/// inline id format, so it must not change.
+fn fnv1a(parts: &[&str]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in parts.iter().flat_map(|part| part.bytes().chain([0])) {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }

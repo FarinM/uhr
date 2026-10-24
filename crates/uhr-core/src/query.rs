@@ -1,4 +1,5 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::hash::Hash;
 use std::path::Path;
 
 use serde::Serialize;
@@ -82,16 +83,6 @@ pub fn run(
     symbols: Option<&Symbols>,
     query: &Query,
 ) -> Result<QueryResult, Error> {
-    match query.group_by {
-        GroupBy::Function => by_function(recording, symbols, query),
-    }
-}
-
-fn by_function(
-    recording: &Recording,
-    symbols: Option<&Symbols>,
-    query: &Query,
-) -> Result<QueryResult, Error> {
     let functions = Functions::new(recording, symbols);
     let mut stack_cpu_ns = vec![0u64; recording.stacks.len()];
     let mut samples = 0;
@@ -101,23 +92,6 @@ fn by_function(
     }
     let cpu_ns: u64 = stack_cpu_ns.iter().sum();
 
-    let mut self_ns = vec![0u64; functions.len()];
-    let mut total_ns = vec![0u64; functions.len()];
-    let mut seen = HashSet::new();
-    for (stack, &weight) in recording.stacks.iter().zip(&stack_cpu_ns) {
-        if weight == 0 {
-            continue;
-        }
-        self_ns[functions.of_frame[stack[0] as usize] as usize] += weight;
-        seen.clear();
-        for &frame in stack {
-            let function = functions.of_frame[frame as usize];
-            if seen.insert(function) {
-                total_ns[function as usize] += weight;
-            }
-        }
-    }
-
     let share = |ns: u64| {
         if cpu_ns == 0 {
             0.0
@@ -125,16 +99,21 @@ fn by_function(
             ns as f64 / cpu_ns as f64
         }
     };
-    let mut rows: Vec<Row> = (0..functions.len())
-        .filter(|&id| total_ns[id] > 0)
-        .map(|id| Row {
-            function: functions.get(id as u32).clone(),
-            self_cpu_ns: self_ns[id],
-            self_share: share(self_ns[id]),
-            total_cpu_ns: total_ns[id],
-            total_share: share(total_ns[id]),
+    let row = |function: u32, (self_ns, total_ns): (u64, u64)| Row {
+        function: functions.get(function).clone(),
+        self_cpu_ns: self_ns,
+        self_share: share(self_ns),
+        total_cpu_ns: total_ns,
+        total_share: share(total_ns),
+    };
+    let mut rows: Vec<Row> = match query.group_by {
+        GroupBy::Function => tally(recording, &stack_cpu_ns, |stack, keys| {
+            keys.extend(functions.expand(stack))
         })
-        .collect();
+        .into_iter()
+        .map(|(function, times)| row(function, times))
+        .collect(),
+    };
     rows.sort_by(|a, b| {
         (b.self_cpu_ns, b.total_cpu_ns)
             .cmp(&(a.self_cpu_ns, a.total_cpu_ns))
@@ -147,34 +126,34 @@ fn by_function(
                     .function_address
                     .cmp(&b.function.function_address)
             })
+            .then_with(|| a.function.id.cmp(&b.function.id))
     });
     let rows_omitted = rows.len().saturating_sub(query.top);
     rows.truncate(query.top);
 
     let mut unnamed_by_origin = BTreeMap::new();
     let mut named_ns = 0;
-    for (id, &ns) in self_ns.iter().enumerate() {
-        let function = functions.get(id as u32);
-        if function.name.is_some() {
-            named_ns += ns;
-        } else if ns > 0 {
-            *unnamed_by_origin.entry(function.origin).or_insert(0) += ns;
+    for (stack, &weight) in recording.stacks.iter().zip(&stack_cpu_ns) {
+        let leaf = functions.get(functions.leaf(stack));
+        if leaf.name.is_some() {
+            named_ns += weight;
+        } else if weight > 0 {
+            *unnamed_by_origin.entry(leaf.origin).or_insert(0) += weight;
         }
     }
 
-    let mut recording = Coverage::of(recording);
     let coverage = QueryCoverage {
         named_share: (cpu_ns > 0).then(|| share(named_ns)),
         unnamed_by_origin: unnamed_by_origin
             .into_iter()
             .map(|(origin, ns)| (origin, share(ns)))
             .collect(),
-        symbols: SymbolCoverage::of(symbols, &mut recording),
-        recording,
+        symbols: SymbolCoverage::of(recording, symbols),
+        recording: Coverage::of(recording),
     };
 
     Ok(QueryResult {
-        group_by: GroupBy::Function,
+        group_by: query.group_by,
         filter: query.filter.clone(),
         samples,
         cpu_ns,
@@ -182,4 +161,32 @@ fn by_function(
         rows_omitted,
         coverage,
     })
+}
+
+/// Self and total CPU time of each key. `keys` lists the keys of a stack,
+/// leaf first. A sample counts once for each key, however often the key
+/// repeats on its stack.
+fn tally<K: Copy + Eq + Hash>(
+    recording: &Recording,
+    stack_cpu_ns: &[u64],
+    mut keys: impl FnMut(&[u32], &mut Vec<K>),
+) -> HashMap<K, (u64, u64)> {
+    let mut times: HashMap<K, (u64, u64)> = HashMap::new();
+    let mut stack_keys = Vec::new();
+    let mut seen = HashSet::new();
+    for (stack, &weight) in recording.stacks.iter().zip(stack_cpu_ns) {
+        if weight == 0 {
+            continue;
+        }
+        stack_keys.clear();
+        keys(stack, &mut stack_keys);
+        times.entry(stack_keys[0]).or_default().0 += weight;
+        seen.clear();
+        for &key in &stack_keys {
+            if seen.insert(key) {
+                times.entry(key).or_default().1 += weight;
+            }
+        }
+    }
+    times
 }
