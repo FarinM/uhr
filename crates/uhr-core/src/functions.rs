@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use serde::Serialize;
 
-use crate::recording::{Origin, Recording};
+use crate::recording::{KERNEL, Origin, Recording};
 use crate::symbols::{FrameName, InlineFrame, Symbols};
 
 /// One function, or the unnamed code of one module.
@@ -11,11 +11,16 @@ pub struct Function {
     /// The build-id, or the module path when there is none, and the function
     /// start, as in `3f9a01c2+0x1550`. Starts come from symbols or the
     /// binary's unwind tables, so the id stays the same across results and
-    /// when symbols are resolved again. An inlined function has no start: its
-    /// id is the build-id or path and a hash of its name and the file and
-    /// line it is declared at, as in `3f9a01c2+inline:5d2c91a04e7b33f0`. `None` for code with neither:
-    /// kernel code, a recording not yet symbolized, and the range a stripped
-    /// binary's `EntryPoint` placeholder covers.
+    /// when symbols are resolved again. A kernel function's start counts
+    /// from the kernel's or its module's mapping, which stays the same
+    /// across boots. An inlined function has no start: its id is the
+    /// build-id or path and a hash of its name and the file and line it is
+    /// declared at, as in `3f9a01c2+inline:5d2c91a04e7b33f0`. A BPF program
+    /// has the tag and name of its kernel symbol, as in
+    /// `bpf+6deef7357e7b4530_sd_fw_egress`. `None` for code with none of
+    /// these: other kernel code outside every mapping, a recording not yet
+    /// symbolized, and the range a stripped binary's `EntryPoint`
+    /// placeholder covers.
     pub id: Option<String>,
     /// `None` for frames without a name.
     #[serde(rename = "function")]
@@ -74,6 +79,13 @@ impl Module<'_> {
 enum Code<'a> {
     /// Machine code, by its start when known.
     Start(Option<u32>),
+    /// Kernel code outside every mapping has no start to count from. A BPF
+    /// program goes by its tag and name: the tag hashes its instructions,
+    /// so it stays the same when the program is loaded again.
+    Bpf(&'a str),
+    /// Other such code, such as a BPF trampoline, by where its saved
+    /// function starts.
+    Unmapped(u64),
     /// Code inlined from the function of this name, declared here.
     Inlined {
         name: Option<&'a str>,
@@ -153,6 +165,36 @@ impl Functions {
                         functions.len() as u32 - 1
                     })
                 };
+                if frame.mapping.is_none()
+                    && let Some(symbol) = symbols.and(recording.kernel_symbol(frame))
+                {
+                    let program = bpf_program(&symbol.name);
+                    let code = match program {
+                        Some(program) => Code::Bpf(program),
+                        None => Code::Unmapped(symbol.start),
+                    };
+                    let name = symbols
+                        .and_then(|s| s.names[frame_id].as_ref())
+                        .and_then(FrameName::symbol);
+                    let id = function(code, &|| Function {
+                        id: program.map(|program| format!("bpf+{program}")),
+                        name: name.map(str::to_owned),
+                        placeholder: None,
+                        inlined: false,
+                        module: Some(match &symbol.module {
+                            Some(module) => format!("[{module}]"),
+                            None => KERNEL.to_owned(),
+                        }),
+                        build_id: None,
+                        function_address: None,
+                        file: None,
+                        origin: frame.origin,
+                    });
+                    return vec![Step {
+                        function: id,
+                        line: None,
+                    }];
+                }
                 let mut chain: Vec<Step> = inline
                     .iter()
                     .take(inline.len().saturating_sub(1))
@@ -280,6 +322,17 @@ impl Functions {
     pub(crate) fn get(&self, id: u32) -> &Function {
         &self.functions[id as usize]
     }
+}
+
+/// The tag and name of a BPF program, from its kernel symbol
+/// `bpf_prog_<tag>` or `bpf_prog_<tag>_<name>`. The name tells apart
+/// functions with the same instructions.
+fn bpf_program(name: &str) -> Option<&str> {
+    let program = name.strip_prefix("bpf_prog_")?;
+    let tag = program.get(..16)?;
+    let tagged = tag.bytes().all(|b| b.is_ascii_hexdigit())
+        && matches!(program.as_bytes().get(16), None | Some(b'_'));
+    tagged.then_some(program)
 }
 
 /// 64-bit FNV-1a over the parts, each ended by a zero byte. Part of the

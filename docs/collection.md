@@ -133,6 +133,14 @@ Most bad profiles come from here, not from the sampler.
   even with `-fno-omit-frame-pointer -mno-omit-leaf-frame-pointer`, so
   frame-pointer stacks skip the caller of such a function. Clang 18 keeps it.
 - Inlined frames must be shown, or time gets blamed on the caller.
+- Kernel names come from `/proc/kallsyms`, read right after recording: the
+  kernel moves to a random address on every boot and modules come and go.
+  The recording keeps the functions its kernel frames fall in, so symbols
+  can still be resolved again later. The kernel shows these addresses only
+  to processes with CAP_SYSLOG, such as root, unless `kernel.kptr_restrict`
+  is 0 and `kernel.perf_event_paranoid` at most 1; at a `kptr_restrict` of 2
+  it shows them to no one. Without them kernel frames stay unnamed, and
+  coverage says why.
 - In containers, binaries can have different paths inside the target's mount
   namespace. Resolve by build-id.
 - Building blocks: samply's crates (`framehop` for unwinding,

@@ -10,9 +10,14 @@ behaviors.
   are compact and carry IDs to drill down. A function's id is its build-id,
   or its path when there is none, and its start address. Starts come from
   symbols or the binary's unwind tables, so the id stays the same in every
-  result and after symbols are resolved again. An inlined function has no
-  start: its id is its build-id or path and a hash of its name and the file
-  and line it is declared at. Other code without a known start has no id: kernel code, a
+  result and after symbols are resolved again. A kernel function's start
+  counts from the kernel's or its module's mapping, so its id stays the same
+  across boots, which move the kernel. An inlined function has no start: its
+  id is its build-id or path and a hash of its name and the file and line it
+  is declared at. A BPF program's id is `bpf+` and the tag and name of its
+  kernel symbol: the tag hashes its instructions, so the id stays the same
+  when the program is loaded again. Other code without a known start has no
+  id: other kernel code outside every mapping, such as BPF trampolines, a
   recording not yet symbolized, and the range a stripped binary's
   `EntryPoint` placeholder covers.
 - Prefer a few tools composed through filters and grouping over many

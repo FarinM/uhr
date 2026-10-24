@@ -15,7 +15,7 @@ use wholesym::samply_symbols::relative_address_base;
 use wholesym::samply_symbols::{LookupAddress, SymbolManager};
 
 use crate::recording::table::{self, Column, Table};
-use crate::recording::{self, Origin, Recording};
+use crate::recording::{self, KERNEL, KernelSymbols, Origin, Recording};
 
 /// Why symbolizing failed. Files that can't be read only leave their frames
 /// unnamed, with the reason in their source.
@@ -38,7 +38,9 @@ pub struct Symbols {
     /// Indexed by frame id. `None` if no name was found, and the frame's
     /// source says why.
     pub names: Vec<Option<FrameName>>,
-    /// Relative function starts in the binary, indexed by frame id.
+    /// Relative function starts in the binary, indexed by frame id. For
+    /// kernel code, relative to the start of the kernel's or the module's
+    /// mapping.
     pub function_addresses: Vec<Option<u32>>,
     /// Indexed by frame id: the functions at the frame's address from debug
     /// info, innermost inlined call first. The last is the function the
@@ -102,6 +104,9 @@ pub enum SourceStatus {
     BuildIdMismatch,
     Unsupported,
     Failed,
+    /// The names could not be read while recording, the only time they
+    /// could be.
+    Unavailable,
 }
 
 impl SourceStatus {
@@ -113,6 +118,7 @@ impl SourceStatus {
             SourceStatus::BuildIdMismatch => "build_id_mismatch",
             SourceStatus::Unsupported => "unsupported",
             SourceStatus::Failed => "failed",
+            SourceStatus::Unavailable => "unavailable",
         }
     }
 
@@ -124,6 +130,7 @@ impl SourceStatus {
             "build_id_mismatch" => SourceStatus::BuildIdMismatch,
             "unsupported" => SourceStatus::Unsupported,
             "failed" => SourceStatus::Failed,
+            "unavailable" => SourceStatus::Unavailable,
             _ => return Err(format!("unknown symbol source status {value:?}")),
         })
     }
@@ -169,6 +176,12 @@ fn log_summary(symbols: &Symbols) {
                 )
             }
             SourceStatus::Failed => warn!(path, detail, "reading symbols failed"),
+            SourceStatus::Unavailable => {
+                warn!(
+                    path,
+                    detail, "the names were not saved while recording, so its frames have none"
+                )
+            }
         }
     }
     let named = symbols
@@ -192,7 +205,7 @@ async fn resolve(recording: &Recording) -> Symbols {
     let mut sources = Vec::new();
 
     let mut by_file: BTreeMap<FileKey, Vec<(u32, u64)>> = BTreeMap::new();
-    let mut has_kernel_frames = false;
+    let mut kernel_frames = Vec::new();
     for (id, frame) in recording.frames.iter().enumerate() {
         match (frame.origin, frame.mapping, frame.file_offset) {
             (Origin::Binary, Some(mapping), Some(offset)) => {
@@ -203,18 +216,18 @@ async fn resolve(recording: &Recording) -> Symbols {
                     .or_default()
                     .push((id as u32, lookup));
             }
-            (Origin::Kernel, ..) => has_kernel_frames = true,
+            (Origin::Kernel, ..) => kernel_frames.push(id),
             _ => {}
         }
     }
 
-    if has_kernel_frames {
-        sources.push(Source {
-            path: "[kernel]".into(),
-            build_id: None,
-            status: SourceStatus::Unsupported,
-            detail: Some("kernel symbols are not resolved".into()),
-        });
+    if !kernel_frames.is_empty() {
+        sources.push(resolve_kernel(
+            recording,
+            &kernel_frames,
+            &mut names,
+            &mut function_addresses,
+        ));
     }
 
     for ((path, build_id), frames) in by_file {
@@ -384,6 +397,45 @@ async fn resolve(recording: &Recording) -> Symbols {
         inline,
         sources,
     }
+}
+
+/// Names kernel frames from the kernel symbols saved while recording. Starts
+/// count from the kernel's or the module's mapping, so they stay the same
+/// across boots, which move the kernel.
+fn resolve_kernel(
+    recording: &Recording,
+    frames: &[usize],
+    names: &mut [Option<FrameName>],
+    function_addresses: &mut [Option<u32>],
+) -> Source {
+    let source = |status, detail| Source {
+        path: KERNEL.into(),
+        build_id: None,
+        status,
+        detail: Some(detail),
+    };
+    if let KernelSymbols::Unavailable { reason } = &recording.manifest.kernel_symbols {
+        return source(SourceStatus::Unavailable, reason.clone());
+    }
+    let mut named = 0;
+    for &id in frames {
+        let frame = &recording.frames[id];
+        let Some(symbol) = recording.kernel_symbol(frame) else {
+            continue;
+        };
+        names[id] = Some(FrameName::Symbol(symbol.name.clone()));
+        function_addresses[id] = frame.mapping.and_then(|m| {
+            let offset = symbol
+                .start
+                .checked_sub(recording.mappings[m as usize].start)?;
+            u32::try_from(offset).ok()
+        });
+        named += 1;
+    }
+    source(
+        SourceStatus::Resolved,
+        format!("named {named} of {} frames", frames.len()),
+    )
 }
 
 /// Only names from the binary or a matching debug artifact are evidence.
@@ -1007,6 +1059,77 @@ mod tests {
             ],
             sources: Vec::new(),
         }
+    }
+
+    #[test]
+    fn names_kernel_frames_from_the_saved_symbols() {
+        use crate::recording::{Frame, KernelSymbol, Mapping};
+        let mut recording = recording(4);
+        let frame = |address, mapping, return_address| Frame {
+            origin: Origin::Kernel,
+            address,
+            mapping,
+            file_offset: None,
+            return_address,
+        };
+        recording.frames = vec![
+            frame(0xffffffff81001020, Some(0), false),
+            // Returns to the end of vfs_read, so the call is in it.
+            frame(0xffffffff81001400, Some(0), true),
+            frame(0xffffffffc0009010, None, false),
+            frame(0xffffffff81003000, Some(0), false),
+        ];
+        recording.mappings = vec![Mapping {
+            pid: None,
+            start: 0xffffffff81000000,
+            end: 0xffffffff82000000,
+            file_offset: 0,
+            path: KERNEL.into(),
+            build_id: Some("61e84c0b".into()),
+            time_ns: None,
+        }];
+        let symbol = |start, end, name: &str, module: Option<&str>| KernelSymbol {
+            start,
+            end,
+            name: name.into(),
+            module: module.map(str::to_owned),
+        };
+        recording.kernel_symbols = vec![
+            symbol(0xffffffff81001010, 0xffffffff81001400, "vfs_read", None),
+            symbol(
+                0xffffffffc0009000,
+                0xffffffffc000a000,
+                "bpf_prog_6d_x",
+                Some("bpf"),
+            ),
+        ];
+        let mut names = vec![None; 4];
+        let mut addresses = vec![None; 4];
+        let source = resolve_kernel(&recording, &[0, 1, 2, 3], &mut names, &mut addresses);
+        let name = |n: &str| Some(FrameName::Symbol(n.into()));
+        assert_eq!(
+            names,
+            [
+                name("vfs_read"),
+                name("vfs_read"),
+                name("bpf_prog_6d_x"),
+                None
+            ]
+        );
+        assert_eq!(addresses, [Some(0x1010), Some(0x1010), None, None]);
+        assert_eq!(source.status, SourceStatus::Resolved);
+        assert_eq!(source.detail.as_deref(), Some("named 3 of 4 frames"));
+
+        recording.manifest.kernel_symbols = KernelSymbols::Unavailable {
+            reason: "hidden".into(),
+        };
+        let mut names = vec![None; 4];
+        let source = resolve_kernel(&recording, &[0, 1, 2, 3], &mut names, &mut addresses);
+        assert_eq!(names, [None, None, None, None]);
+        assert_eq!(
+            (source.status, source.detail.as_deref()),
+            (SourceStatus::Unavailable, Some("hidden"))
+        );
     }
 
     #[test]

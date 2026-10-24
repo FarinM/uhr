@@ -102,11 +102,12 @@ fn the_time_is_in_the_kernel_on_behalf_of_read_zero() {
         "--top",
         "100",
     ]);
+    // The kernel has a read_zero of its own, which reads /dev/zero.
     let read_zero = query["rows"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|r| r["function"] == "read_zero")
+        .find(|r| r["function"] == "read_zero" && r["origin"] == "binary")
         .expect("read_zero is on the kernel stacks");
     assert!(
         read_zero["total_share"].as_f64().unwrap() > 0.95,

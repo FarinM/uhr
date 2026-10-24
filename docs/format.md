@@ -145,7 +145,8 @@ them.
 
 Written by `uhr symbolize`, which `uhr record` runs unless told not to. Names
 are matched to files by build-id, and come from the binary or from a separate
-debug file found by build-id or debug link.
+debug file found by build-id or debug link. Kernel frames are named from
+`kernel_symbols`, which the recording saved.
 
 Each file is copied to a private temporary snapshot before reading its identity
 or symbols. Subsequent reads use that snapshot while debug-file lookup retains
@@ -158,7 +159,12 @@ Function queries group by build-id, or by module path for a file without one,
 and relative function start. So distinct functions sharing a name stay
 separate, while remappings of a function and copies of its binary at other
 paths combine. JSON rows expose `build_id` and `function_address`; the
-readable output includes the address beside the name.
+readable output includes the address beside the name. Kernel code outside
+every mapping has no start to count from. A BPF program groups by the tag
+and name in its kernel symbol, `bpf_prog_<tag>_<name>`, and has the id
+`bpf+<tag>_<name>`: the tag hashes its instructions, so loading the program
+again keeps the id. Other such code, like BPF trampolines, groups by its
+kernel symbol and has no id.
 
 Queries expand each frame's inlined calls from `inline_frames`, so time in
 inlined code counts for the inlined function. An inlined function has no
@@ -179,7 +185,7 @@ time in a row with no line.
 | Column | Type | Meaning |
 |---|---|---|
 | `frame_id` | uint32 | One row per frame |
-| `function_address` | uint32, nullable | Function start relative to the binary's image base, including functions with placeholder labels. Null when no function boundary was resolved |
+| `function_address` | uint32, nullable | Function start relative to the binary's image base, including functions with placeholder labels. For kernel code, relative to the start of the kernel's or the module's mapping. Null when no function boundary was resolved |
 | `function` | string, nullable | Null if no name was found. The frame's source says why |
 | `placeholder` | string, nullable | A label wholesym made up from the address when the code has no symbol, such as `fun_1200` in a stripped binary. It tells functions apart, but is not a name. Null when `function` is set |
 
@@ -204,8 +210,9 @@ path `[kernel]`.
 | `unverified` | Resolved, but there was no recorded build-id to check |
 | `missing_file` | The file is gone |
 | `build_id_mismatch` | The file changed since recording. No names are taken from it |
-| `unsupported` | Kernel, `[vdso]` and other code that is not read from a file |
+| `unsupported` | `[vdso]` and other code that is not read from a file |
 | `failed` | Reading the file failed |
+| `unavailable` | The names could not be read while recording, the only time they could be. The kernel's, when the manifest's `kernel_symbols` is unavailable |
 
 `inline_frames`, one row per frame and function at the frame's address, from
 debug info. A frame inside inlined code has a row for each inlined call and

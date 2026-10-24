@@ -284,6 +284,87 @@ fn separates_distinct_functions_with_the_same_name() {
 }
 
 #[test]
+fn keeps_kernel_code_outside_mappings_apart() {
+    const EGRESS: &str = "bpf_prog_6deef7357e7b4530_sd_fw_egress";
+    const INGRESS: &str = "bpf_prog_ee0e253c78993a24_sd_fw_ingress";
+    const TRAMPOLINE: &str = "bpf_trampoline_6442";
+    let mut recording = recording();
+    // The egress program twice, as when it is loaded again.
+    let addresses = [0xc0009010, 0xc000b010, 0xc000a010, 0xc000c010, 0xc0020000];
+    recording.frames = addresses.map(|a| frame(a, None)).to_vec();
+    recording.stacks = (0..5).map(|frame| vec![frame]).collect();
+    recording.samples = [1, 8, 2, 16, 4]
+        .into_iter()
+        .enumerate()
+        .map(|(stack, cpu_ns)| sample(stack as u32, cpu_ns))
+        .collect();
+    let symbol = |start, name: &str| KernelSymbol {
+        start,
+        end: start + 0x800,
+        name: name.into(),
+        module: Some("bpf".into()),
+    };
+    recording.kernel_symbols = vec![
+        symbol(0xc0009000, EGRESS),
+        symbol(0xc000a000, INGRESS),
+        symbol(0xc000b000, EGRESS),
+        symbol(0xc000c000, TRAMPOLINE),
+    ];
+    let name = |n: &str| Some(FrameName::Symbol(n.into()));
+    let symbols = Symbols {
+        names: vec![
+            name(EGRESS),
+            name(EGRESS),
+            name(INGRESS),
+            name(TRAMPOLINE),
+            None,
+        ],
+        function_addresses: vec![None; 5],
+        inline: vec![Vec::new(); 5],
+        sources: Vec::new(),
+    };
+
+    let result = run(&recording, Some(&symbols), &query(10)).unwrap();
+    let rows: Vec<_> = result
+        .rows
+        .iter()
+        .map(|r| {
+            let f = &r.function;
+            (
+                f.name.as_deref(),
+                f.id.as_deref(),
+                f.module.as_deref(),
+                r.self_cpu_ns,
+            )
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            (Some(TRAMPOLINE), None, Some("[bpf]"), 16),
+            (
+                Some(EGRESS),
+                Some("bpf+6deef7357e7b4530_sd_fw_egress"),
+                Some("[bpf]"),
+                9
+            ),
+            (None, None, None, 4),
+            (
+                Some(INGRESS),
+                Some("bpf+ee0e253c78993a24_sd_fw_ingress"),
+                Some("[bpf]"),
+                2
+            ),
+        ]
+    );
+    assert_eq!(result.coverage.named_share, Some(27.0 / 31.0));
+    for wanted in [INGRESS, "bpf+ee0e253c78993a24_sd_fw_ingress"] {
+        let under = run(&recording, Some(&symbols), &under(&[wanted])).unwrap();
+        assert_eq!(under.cpu_ns, 2, "{wanted}");
+    }
+}
+
+#[test]
 fn merges_the_same_function_across_mappings_and_counts_recursion_once() {
     let mut recording = recording();
     recording.mappings[0].build_id = Some("abcd".into());

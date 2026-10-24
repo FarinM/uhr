@@ -297,6 +297,21 @@ impl Recording {
         Ok(recording)
     }
 
+    /// The saved kernel function a kernel frame falls in.
+    pub fn kernel_symbol(&self, frame: &Frame) -> Option<&KernelSymbol> {
+        if frame.origin != Origin::Kernel {
+            return None;
+        }
+        let address = frame
+            .address
+            .saturating_sub(u64::from(frame.return_address));
+        let symbols = &self.kernel_symbols;
+        let index = symbols
+            .partition_point(|s| s.start <= address)
+            .checked_sub(1)?;
+        Some(&symbols[index]).filter(|s| address < s.end)
+    }
+
     fn write_tables(&self, dir: &Path) -> Result<()> {
         let threads = &self.threads;
         table::write(
