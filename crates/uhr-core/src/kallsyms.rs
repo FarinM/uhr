@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::fs;
-use std::io;
+use std::fs::{self, File};
+use std::io::{self, BufRead, BufReader};
 
 use crate::recording::{Frame, KERNEL, KernelSymbol, Mapping, Origin};
 
@@ -49,6 +49,19 @@ pub(crate) struct Kallsyms {
 struct Symbol {
     start: u64,
     name: String,
+}
+
+/// Whether the kernel shows this process its addresses, without reading
+/// all of its symbols. It hides either every address or none.
+pub fn check() -> Result<(), Error> {
+    let file = File::open(KALLSYMS).map_err(Error::Read)?;
+    for line in BufReader::new(file).lines() {
+        let line = line.map_err(Error::Read)?;
+        if let Some((start, ..)) = symbol(&line) {
+            return if start == 0 { Err(hidden()) } else { Ok(()) };
+        }
+    }
+    Err(hidden())
 }
 
 fn hidden() -> Error {

@@ -163,6 +163,12 @@ is not decided.
   at 1 Hz with the collector's flags, then reads the event attributes to learn
   whether kernel sampling was excluded. It does not infer permission from
   uhr's UID or capabilities: the perf executable can have different credentials.
+- It also checks whether `/proc/kallsyms` shows the kernel's addresses. uhr
+  reads that file itself, so there its own credentials are the ones that
+  count. Without them kernel frames have no names, and the fix depends on
+  `kptr_restrict` and `perf_event_paranoid`: recording as root works unless
+  `kptr_restrict` is 2, and every user sees them only with `kptr_restrict`
+  at 0 and `perf_event_paranoid` at most 1.
 - The agent-facing server must not run as root. Privileged work (eBPF, perf)
   goes through a narrow helper with a fixed set of operations. Its shape is
   not decided.

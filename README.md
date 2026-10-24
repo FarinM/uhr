@@ -41,7 +41,9 @@ uhr query rec --group-by line --under parse_json
 
 Full stacks need frame pointers, and `uhr doctor` lists the build flags. Or
 record with `--unwind dwarf`, which needs no rebuild and finds the callers
-frame pointers miss, at the cost of a stack copy in every sample.
+frame pointers miss, at the cost of a stack copy in every sample. Kernel
+functions get names only if the kernel shows uhr its addresses while
+recording; `uhr doctor` says how to allow that.
 
 ## Docs
 

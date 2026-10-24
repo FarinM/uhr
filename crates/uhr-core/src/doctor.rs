@@ -6,6 +6,7 @@ use std::process::Command;
 use linux_perf_data::{PerfFileReader, linux_perf_event_reader::AttrFlags};
 use serde::Serialize;
 
+use crate::kallsyms;
 use crate::perf::{RecordOptions, Unwind, perf_args};
 
 #[derive(Debug, Clone, Serialize)]
@@ -42,6 +43,7 @@ pub fn check_perf() -> Report {
     let mut checks = vec![check_perf_binary()];
     if checks[0].status != Status::Blocked {
         checks.push(check_recording());
+        checks.push(check_kernel_symbols());
         checks.push(check_dwarf_unwinding());
     }
     Report {
@@ -165,6 +167,60 @@ fn check_recording() -> Check {
     }
 }
 
+/// Kernel names can only be read while recording, so a host that hides
+/// them loses them for good.
+fn check_kernel_symbols() -> Check {
+    let error = match kallsyms::check() {
+        Ok(()) => {
+            return Check {
+                status: Status::Ok,
+                detail: "kernel functions can be named: /proc/kallsyms shows their addresses"
+                    .into(),
+                fix: None,
+            };
+        }
+        Err(error) => error,
+    };
+    let fix = match &error {
+        kallsyms::Error::Hidden {
+            kptr_restrict,
+            perf_event_paranoid,
+        } => Some(hidden_fix(*kptr_restrict, *perf_event_paranoid)),
+        kallsyms::Error::Read(_) => None,
+    };
+    Check {
+        status: Status::Limited,
+        detail: format!("{error}, so kernel frames will have no names"),
+        fix,
+    }
+}
+
+/// The kernel shows the addresses to a process with CAP_SYSLOG, such as
+/// root, unless kptr_restrict is 2, and to everyone when kptr_restrict is 0
+/// and perf_event_paranoid at most 1.
+fn hidden_fix(kptr_restrict: Option<i32>, perf_event_paranoid: Option<i32>) -> String {
+    const KEEP: &str = "Put that in /etc/sysctl.d to keep it after a reboot.";
+    const PARANOID: &str = "A perf_event_paranoid of 1 also lets every user profile the kernel.";
+    let paranoid_ok = perf_event_paranoid.is_some_and(|p| p <= 1);
+    let open_to_all = if paranoid_ok {
+        "`sudo sysctl kernel.kptr_restrict=0`. ".to_owned()
+    } else {
+        format!("`sudo sysctl kernel.kptr_restrict=0 kernel.perf_event_paranoid=1`. {PARANOID} ")
+    };
+    match kptr_restrict {
+        Some(level) if level >= 2 => format!(
+            "At {level} the kernel hides them from root too. Set it to 1 and record as root, \
+             or let every user see them with {open_to_all}{KEEP}"
+        ),
+        Some(0) => format!(
+            "At kernel.kptr_restrict 0 the kernel only shows them to every user while \
+             kernel.perf_event_paranoid is at most 1. Record as root, or set \
+             `sudo sysctl kernel.perf_event_paranoid=1`. {PARANOID} {KEEP}"
+        ),
+        _ => format!("Record as root, or let every user see them with {open_to_all}{KEEP}"),
+    }
+}
+
 fn probe_recording(perf: &Path) -> Result<bool, String> {
     let dir = tempfile::tempdir().map_err(|e| format!("creating perf probe directory: {e}"))?;
     let data = dir.path().join("perf.data");
@@ -200,6 +256,28 @@ fn probe_recording(perf: &Path) -> Result<bool, String> {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn suggests_what_shows_kernel_addresses_on_this_host() {
+        let fix = hidden_fix(Some(1), Some(1));
+        assert!(
+            fix.contains("`sudo sysctl kernel.kptr_restrict=0`"),
+            "{fix}"
+        );
+        let fix = hidden_fix(Some(1), Some(4));
+        assert!(fix.contains("kernel.perf_event_paranoid=1`"), "{fix}");
+        let fix = hidden_fix(Some(0), Some(2));
+        assert!(
+            fix.contains("`sudo sysctl kernel.perf_event_paranoid=1`"),
+            "{fix}"
+        );
+        assert!(!fix.contains("kptr_restrict=0`"), "{fix}");
+        let fix = hidden_fix(Some(2), None);
+        assert!(
+            fix.starts_with("At 2 the kernel hides them from root too"),
+            "{fix}"
+        );
+    }
 
     #[test]
     fn reports_the_backends_actual_failure() {
