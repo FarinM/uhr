@@ -44,6 +44,19 @@ impl Filter {
         })
     }
 
+    /// Whether a thread with these ids, and these names over its life, can
+    /// have samples that pass.
+    pub(crate) fn matches_thread<'n>(
+        &self,
+        pid: u32,
+        tid: u32,
+        mut names: impl Iterator<Item = &'n str>,
+    ) -> bool {
+        (self.pids.is_empty() || self.pids.contains(&pid))
+            && (self.tids.is_empty() || self.tids.contains(&tid))
+            && (self.thread_names.is_empty() || names.any(|name| self.matches_name(name)))
+    }
+
     fn matches_name(&self, name: &str) -> bool {
         let name: Vec<char> = name.chars().collect();
         self.thread_names.iter().any(|pattern| {

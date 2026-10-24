@@ -15,7 +15,8 @@ behaviors.
   form.
 - Large results are paged, and truncation is always reported.
 - Times in results and filters are nanosecond offsets from the recording
-  start. Raw clock values are large numbers that are easy to get wrong.
+  start, which `overview` gives once as a clock value. Raw clock values are
+  large numbers that are easy to get wrong.
 
 ## Sketch of the tool surface
 

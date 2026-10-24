@@ -9,9 +9,10 @@ use tracing_subscriber::filter::LevelFilter;
 use uhr_core::coverage::Coverage;
 use uhr_core::doctor::{self, Report, Status};
 use uhr_core::filter::Filter;
+use uhr_core::overview::{self, CPUTime, Overview};
 use uhr_core::perf::{self, RecordOptions};
 use uhr_core::query::{self, GroupBy, Query, QueryResult, Row};
-use uhr_core::recording::Mode;
+use uhr_core::recording::{Exit, Mode};
 use uhr_core::symbols;
 
 #[derive(Parser)]
@@ -49,6 +50,18 @@ enum Command {
     },
     /// Resolve function names in a recording against the files on this machine
     Symbolize { recording: PathBuf },
+    /// Show CPU time by mode, process and thread against time alive: is it
+    /// computing or waiting?
+    Overview {
+        recording: PathBuf,
+        /// Processes and threads to print
+        #[arg(long, default_value_t = 20)]
+        top: usize,
+        #[arg(long)]
+        json: bool,
+        #[command(flatten)]
+        filter: FilterArgs,
+    },
     /// Group a recording's CPU time and print the top rows, with coverage
     Query {
         recording: PathBuf,
@@ -154,6 +167,12 @@ fn main() -> ExitCode {
             command,
         } => run_record(output, frequency, no_symbolize, command),
         Command::Symbolize { recording } => run_symbolize(&recording),
+        Command::Overview {
+            recording,
+            top,
+            json,
+            filter,
+        } => run_overview(&recording, top, filter, json),
         Command::Query {
             recording,
             group_by,
@@ -248,6 +267,134 @@ fn run_record(
 fn run_symbolize(recording: &Path) -> Result<ExitCode> {
     symbols::symbolize(recording)?;
     Ok(ExitCode::SUCCESS)
+}
+
+fn run_overview(recording: &Path, top: usize, filter: FilterArgs, json: bool) -> Result<ExitCode> {
+    let result = overview::overview(recording, &filter.into_filter()?, top)?;
+    if json {
+        let text = serde_json::to_string_pretty(&result)?;
+        write_output(|out| writeln!(out, "{text}"))?;
+    } else {
+        write_output(|out| write_overview(out, &result))?;
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn write_overview(out: &mut impl Write, result: &Overview) -> io::Result<()> {
+    let exit = match &result.exit {
+        Some(Exit::Code(code)) => format!("exited with code {code}"),
+        Some(Exit::Signal(signal)) => format!("killed by signal {signal}"),
+        Some(Exit::Unknown(reason)) => format!("exit status unknown: {reason}"),
+        None => "still running when the recording stopped".into(),
+    };
+    writeln!(out, "{}, {exit}", result.command.join(" "))?;
+    let window = &result.window;
+    write!(out, "{} recorded", seconds(result.recording_duration_ns))?;
+    if !result.filter.is_empty() {
+        write!(
+            out,
+            ", showing {} to {}, filter: {}",
+            seconds(window.start_ns),
+            seconds(window.end_ns),
+            describe_filter(&result.filter)
+        )?;
+    }
+    writeln!(out)?;
+    let cpu = &result.cpu;
+    write!(
+        out,
+        "{} samples, {} of CPU time",
+        cpu.samples,
+        seconds(cpu.cpu_ns)
+    )?;
+    if let Some(utilization) = result.cpu_utilization {
+        write!(out, ", {utilization:.2} CPUs busy on average")?;
+    }
+    writeln!(out)?;
+    match cpu.kernel_cpu_ns {
+        Some(kernel) => writeln!(
+            out,
+            "  user {}, kernel {}",
+            seconds(cpu.user_cpu_ns),
+            seconds(kernel)
+        ),
+        None => writeln!(
+            out,
+            "  user {}, kernel not sampled",
+            seconds(cpu.user_cpu_ns)
+        ),
+    }?;
+    if cpu.unknown_mode_cpu_ns > 0 {
+        writeln!(out, "  unknown mode {}", seconds(cpu.unknown_mode_cpu_ns))?;
+    }
+
+    writeln!(out, "\nprocesses")?;
+    writeln!(
+        out,
+        "{:>9} {:>7} {:>6} {:>8} {:>9}  name",
+        "cpu", "kernel", "cpus", "threads", "pid"
+    )?;
+    for process in &result.processes {
+        writeln!(
+            out,
+            "{:>9} {:>7} {:>6} {:>8} {:>9}  {}",
+            seconds(process.cpu.cpu_ns),
+            kernel_share(&process.cpu),
+            process
+                .cpu_utilization
+                .map_or("-".into(), |u| format!("{u:.2}")),
+            process.threads,
+            process.pid,
+            process.name.as_deref().unwrap_or("<unnamed>"),
+        )?;
+    }
+    if result.processes_omitted > 0 {
+        writeln!(
+            out,
+            "({} more processes, raise --top to see them)",
+            result.processes_omitted
+        )?;
+    }
+
+    writeln!(out, "\nthreads")?;
+    writeln!(
+        out,
+        "{:>9} {:>7} {:>7} {:>9} {:>9}  name",
+        "cpu", "kernel", "on cpu", "alive", "tid"
+    )?;
+    for thread in &result.threads {
+        writeln!(
+            out,
+            "{:>9} {:>7} {:>7} {:>9} {:>9}  {}",
+            seconds(thread.cpu.cpu_ns),
+            kernel_share(&thread.cpu),
+            thread
+                .on_cpu_share
+                .map_or("-".into(), |share| format!("{:.1}%", share * 100.0)),
+            seconds(thread.alive_ns),
+            thread.tid,
+            thread.names.last().map_or("<unnamed>", String::as_str),
+        )?;
+    }
+    if result.threads_omitted > 0 {
+        writeln!(
+            out,
+            "({} more threads, raise --top to see them)",
+            result.threads_omitted
+        )?;
+    }
+
+    writeln!(out, "\ncoverage")?;
+    write_coverage(out, &result.coverage)
+}
+
+/// The share of a row's CPU time spent in the kernel.
+fn kernel_share(cpu: &CPUTime) -> String {
+    match cpu.kernel_cpu_ns {
+        None => "?".into(),
+        Some(_) if cpu.cpu_ns == 0 => "-".into(),
+        Some(kernel) => format!("{:.1}%", kernel as f64 / cpu.cpu_ns as f64 * 100.0),
+    }
 }
 
 fn run_query(

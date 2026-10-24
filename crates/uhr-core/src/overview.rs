@@ -1,0 +1,436 @@
+use std::collections::HashMap;
+use std::path::Path;
+
+use serde::Serialize;
+
+use crate::coverage::Coverage;
+use crate::filter::Filter;
+use crate::recording::{self, Collector, Exit, Mode, Recording, Sample, Signal, Thread};
+use crate::threads::ThreadNames;
+
+/// Time level 0: how much CPU time each process and thread used, in which
+/// mode, against how long it was alive. It tells computing from waiting.
+#[derive(Debug, Clone, Serialize)]
+pub struct Overview {
+    pub command: Vec<String>,
+    /// `None` if the target was still running when the recording stopped.
+    pub exit: Option<Exit>,
+    pub filter: Filter,
+    /// On the recording's clock. Every other time is an offset from it.
+    /// `None` if nothing was recorded.
+    pub recording_start_ns: Option<u64>,
+    pub recording_duration_ns: u64,
+    /// The part of the recording covered: all of it, or what the time
+    /// filter selects.
+    pub window: Window,
+    #[serde(flatten)]
+    pub cpu: CPUTime,
+    /// CPU time over the window's wall time: 2.0 means two CPUs busy on
+    /// average. `None` for an empty window.
+    pub cpu_utilization: Option<f64>,
+    /// Sorted by CPU time.
+    pub processes: Vec<ProcessRow>,
+    /// Rows cut by `top`.
+    pub processes_omitted: usize,
+    /// One row per thread lifetime, sorted by CPU time.
+    pub threads: Vec<ThreadRow>,
+    /// Rows cut by `top`.
+    pub threads_omitted: usize,
+    pub coverage: Coverage,
+}
+
+/// The end is exclusive when the time filter sets it, like the filter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct Window {
+    pub start_ns: u64,
+    pub end_ns: u64,
+}
+
+/// Sampled CPU time, by mode.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CPUTime {
+    pub samples: u64,
+    pub cpu_ns: u64,
+    pub user_cpu_ns: u64,
+    /// `None` if the kernel was not sampled. `cpu_ns` then leaves it out.
+    pub kernel_cpu_ns: Option<u64>,
+    /// Hypervisor, guest, or a mode the sampler did not report.
+    pub unknown_mode_cpu_ns: u64,
+}
+
+/// One process lifetime: a reused pid gets a row per lifetime. Its name,
+/// times and thread count describe the process, whatever the filter. Its
+/// CPU time is that of the samples that passed.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProcessRow {
+    pub pid: u32,
+    /// The last name of its main thread in the window, or of its first
+    /// thread if the main thread was not seen.
+    pub name: Option<String>,
+    /// When its first thread started. `None` if before the recording.
+    pub start_ns: Option<u64>,
+    /// When its last thread ended. `None` if a thread outlived the
+    /// recording, or its exit was not seen.
+    pub end_ns: Option<u64>,
+    /// Thread lifetimes in the window.
+    pub threads: usize,
+    /// From its first thread start to its last thread end, in the window.
+    pub alive_ns: u64,
+    #[serde(flatten)]
+    pub cpu: CPUTime,
+    /// CPU time over `alive_ns`: 2.0 means two CPUs busy on average.
+    pub cpu_utilization: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ThreadRow {
+    pub pid: u32,
+    pub tid: u32,
+    /// The names it had in the window, oldest first.
+    pub names: Vec<String>,
+    /// `None` if it started before the recording.
+    pub start_ns: Option<u64>,
+    /// `None` if it outlived the recording, or its exit was not seen.
+    pub end_ns: Option<u64>,
+    /// Time alive in the window.
+    pub alive_ns: u64,
+    #[serde(flatten)]
+    pub cpu: CPUTime,
+    /// Share of `alive_ns` spent on a CPU. The rest it was blocked,
+    /// sleeping, waiting to run, or in a mode that was not sampled.
+    /// Sampling error can put it slightly above 1. `None` if it was not
+    /// alive in the window.
+    pub on_cpu_share: Option<f64>,
+}
+
+pub fn overview(dir: &Path, filter: &Filter, top: usize) -> Result<Overview, recording::Error> {
+    Ok(run(&Recording::read(dir)?, filter, top))
+}
+
+pub fn run(recording: &Recording, filter: &Filter, top: usize) -> Overview {
+    let manifest = &recording.manifest;
+    let start = manifest.start_ns;
+    let duration = start
+        .zip(manifest.end_ns)
+        .map_or(0, |(start, end)| end.saturating_sub(start));
+    let from = filter.from_ns.unwrap_or(0);
+    let window = Window {
+        start_ns: from.min(duration),
+        end_ns: filter
+            .to_ns
+            .unwrap_or(duration)
+            .clamp(from.min(duration), duration),
+    };
+    // Absolute times, for comparing with the tables. Presence in the window
+    // is half-open up to `limit`, like the time filter, but without one the
+    // window keeps the end of the capture.
+    let base = start.unwrap_or(0);
+    let bounds = Bounds {
+        from: base.saturating_add(from),
+        to: base + window.end_ns,
+        limit: base + filter.to_ns.unwrap_or(duration + 1).min(duration + 1),
+    };
+
+    let kernel_sampled = manifest
+        .streams
+        .iter()
+        .any(|s| s.signals.contains(&Signal::KernelCPUSamples))
+        || recording.samples.iter().any(|s| s.mode == Mode::Kernel);
+    let empty = CPUTime::new(kernel_sampled);
+
+    let lifetimes = Lifetimes::new(recording);
+    let names = ThreadNames::new(recording);
+    let lives: Vec<Life> = lifetimes
+        .threads
+        .iter()
+        .map(|thread| {
+            let present = bounds.presence(thread);
+            Life {
+                names: names.during(thread.pid, thread.tid, present.0, present.1),
+                present: present.0 < present.1,
+                alive: bounds.clip(thread),
+                process: (
+                    thread.pid,
+                    lifetimes.at(thread.pid, thread.pid, thread.start_ns),
+                ),
+            }
+        })
+        .collect();
+    let row = |id: usize| {
+        let (thread, life) = (&lifetimes.threads[id], &lives[id]);
+        ThreadRow {
+            pid: thread.pid,
+            tid: thread.tid,
+            names: life.names.iter().map(|n| n.to_string()).collect(),
+            start_ns: thread.start_ns.map(|t| t.saturating_sub(base)),
+            end_ns: thread.end_ns.map(|t| t.saturating_sub(base)),
+            alive_ns: life.alive.1.saturating_sub(life.alive.0),
+            cpu: empty.clone(),
+            on_cpu_share: None,
+        }
+    };
+    let mut threads: HashMap<usize, ThreadRow> = HashMap::new();
+    for (id, (thread, life)) in lifetimes.threads.iter().zip(&lives).enumerate() {
+        if life.present && filter.matches_thread(thread.pid, thread.tid, life.names.iter().copied())
+        {
+            threads.insert(id, row(id));
+        }
+    }
+
+    let mut cpu = empty.clone();
+    for sample in filter.samples(recording) {
+        cpu.add(sample);
+        let id = lifetimes.of(sample);
+        // Inserts the lifetime if the sample lies outside it, so the
+        // sample still counts.
+        threads.entry(id).or_insert_with(|| row(id)).cpu.add(sample);
+    }
+
+    let mut processes = processes(&lifetimes, &lives, &threads, &empty, base);
+    processes.sort_by(|a, b| {
+        b.cpu
+            .cpu_ns
+            .cmp(&a.cpu.cpu_ns)
+            .then((a.pid, a.start_ns).cmp(&(b.pid, b.start_ns)))
+    });
+    let processes_omitted = processes.len().saturating_sub(top);
+    processes.truncate(top);
+    let mut threads: Vec<ThreadRow> = threads
+        .into_values()
+        .map(|mut row| {
+            row.on_cpu_share = ratio(row.cpu.cpu_ns, row.alive_ns);
+            row
+        })
+        .collect();
+    threads.sort_by(|a, b| {
+        b.cpu
+            .cpu_ns
+            .cmp(&a.cpu.cpu_ns)
+            .then(b.alive_ns.cmp(&a.alive_ns))
+            .then((a.pid, a.tid, a.start_ns).cmp(&(b.pid, b.tid, b.start_ns)))
+    });
+    let threads_omitted = threads.len().saturating_sub(top);
+    threads.truncate(top);
+
+    let mut coverage = Coverage::of(recording);
+    coverage.unknown.push(
+        "why threads were off CPU (blocked, sleeping or waiting to run): no scheduler signal was \
+         recorded"
+            .into(),
+    );
+    coverage
+        .unknown
+        .push("memory use: no memory signal was recorded".into());
+    for stream in &manifest.streams {
+        let Collector::Perf { frequency_hz, .. } = &stream.collector;
+        coverage.unknown.push(format!(
+            "CPU time per thread more precise than one sample period ({:.1} ms at \
+             {frequency_hz} Hz in stream {})",
+            1e3 / *frequency_hz as f64,
+            stream.id
+        ));
+    }
+
+    Overview {
+        command: manifest.target.command.clone(),
+        exit: manifest.target.exit.clone(),
+        filter: filter.clone(),
+        recording_start_ns: start,
+        recording_duration_ns: duration,
+        window,
+        cpu_utilization: ratio(cpu.cpu_ns, window.end_ns - window.start_ns),
+        cpu,
+        processes,
+        processes_omitted,
+        threads,
+        threads_omitted,
+        coverage,
+    }
+}
+
+impl CPUTime {
+    fn new(kernel_sampled: bool) -> Self {
+        Self {
+            samples: 0,
+            cpu_ns: 0,
+            user_cpu_ns: 0,
+            kernel_cpu_ns: kernel_sampled.then_some(0),
+            unknown_mode_cpu_ns: 0,
+        }
+    }
+
+    fn add(&mut self, sample: &Sample) {
+        self.samples += 1;
+        self.cpu_ns += sample.cpu_ns;
+        match sample.mode {
+            Mode::User => self.user_cpu_ns += sample.cpu_ns,
+            Mode::Kernel => *self.kernel_cpu_ns.get_or_insert(0) += sample.cpu_ns,
+            Mode::Unknown => self.unknown_mode_cpu_ns += sample.cpu_ns,
+        }
+    }
+
+    fn merge(&mut self, other: &CPUTime) {
+        self.samples += other.samples;
+        self.cpu_ns += other.cpu_ns;
+        self.user_cpu_ns += other.user_cpu_ns;
+        if let Some(kernel) = other.kernel_cpu_ns {
+            *self.kernel_cpu_ns.get_or_insert(0) += kernel;
+        }
+        self.unknown_mode_cpu_ns += other.unknown_mode_cpu_ns;
+    }
+}
+
+/// Every thread lifetime, including ids that only appear in samples.
+struct Lifetimes {
+    threads: Vec<Thread>,
+    /// Lifetimes of each thread id, by start. Ones that started before the
+    /// recording come first.
+    by_id: HashMap<(u32, u32), Vec<usize>>,
+}
+
+impl Lifetimes {
+    fn new(recording: &Recording) -> Self {
+        let mut threads = recording.threads.clone();
+        let mut by_id: HashMap<(u32, u32), Vec<usize>> = HashMap::new();
+        for (id, thread) in threads.iter().enumerate() {
+            by_id.entry((thread.pid, thread.tid)).or_default().push(id);
+        }
+        for sample in &recording.samples {
+            by_id.entry((sample.pid, sample.tid)).or_insert_with(|| {
+                threads.push(Thread {
+                    pid: sample.pid,
+                    tid: sample.tid,
+                    parent_pid: None,
+                    parent_tid: None,
+                    start_ns: None,
+                    end_ns: None,
+                });
+                vec![threads.len() - 1]
+            });
+        }
+        for ids in by_id.values_mut() {
+            ids.sort_by_key(|&id| threads[id].start_ns);
+        }
+        Self { threads, by_id }
+    }
+
+    /// The last lifetime of a thread id that started by `time`, where
+    /// `None` is before the recording.
+    fn at(&self, pid: u32, tid: u32, time: Option<u64>) -> Option<usize> {
+        let ids = self.by_id.get(&(pid, tid))?;
+        let started = ids.partition_point(|&id| match (self.threads[id].start_ns, time) {
+            (None, _) => true,
+            (Some(_), None) => false,
+            (Some(start), Some(time)) => start <= time,
+        });
+        Some(ids[started.saturating_sub(1)])
+    }
+
+    fn of(&self, sample: &Sample) -> usize {
+        self.at(sample.pid, sample.tid, Some(sample.time_ns))
+            .expect("every sampled thread id has a lifetime")
+    }
+}
+
+/// The window in absolute times.
+struct Bounds {
+    from: u64,
+    /// Where the time alive ends.
+    to: u64,
+    /// Where presence ends, exclusive.
+    limit: u64,
+}
+
+impl Bounds {
+    /// When the thread was in the window, half-open. It counts as alive
+    /// at the moment it exits.
+    fn presence(&self, thread: &Thread) -> (u64, u64) {
+        (
+            thread
+                .start_ns
+                .map_or(self.from, |start| start.max(self.from)),
+            thread
+                .end_ns
+                .map_or(self.limit, |end| end.saturating_add(1).min(self.limit)),
+        )
+    }
+
+    /// The part of a lifetime inside the window, empty when the start comes
+    /// after the end.
+    fn clip(&self, thread: &Thread) -> (u64, u64) {
+        (
+            thread
+                .start_ns
+                .map_or(self.from, |start| start.max(self.from)),
+            thread.end_ns.map_or(self.to, |end| end.min(self.to)),
+        )
+    }
+}
+
+/// What the window holds of one thread lifetime.
+struct Life<'a> {
+    /// The names it had while in the window.
+    names: Vec<&'a str>,
+    present: bool,
+    /// Absolute times it was alive in the window.
+    alive: (u64, u64),
+    /// Its pid and the lifetime of that pid's main thread, if seen.
+    process: (u32, Option<usize>),
+}
+
+/// One row per process lifetime that has a thread row.
+fn processes(
+    lifetimes: &Lifetimes,
+    lives: &[Life],
+    threads: &HashMap<usize, ThreadRow>,
+    empty: &CPUTime,
+    base: u64,
+) -> Vec<ProcessRow> {
+    let mut members: HashMap<(u32, Option<usize>), Vec<usize>> = HashMap::new();
+    for (id, life) in lives.iter().enumerate() {
+        if life.present || threads.contains_key(&id) {
+            members.entry(life.process).or_default().push(id);
+        }
+    }
+    let mut cpu: HashMap<(u32, Option<usize>), CPUTime> = HashMap::new();
+    for (&id, row) in threads {
+        cpu.entry(lives[id].process)
+            .or_insert_with(|| empty.clone())
+            .merge(&row.cpu);
+    }
+    cpu.into_iter()
+        .map(|((pid, main), cpu)| {
+            let ids = &members[&(pid, main)];
+            let first = ids.iter().map(|&id| lives[id].alive.0).min().unwrap_or(0);
+            let last = ids.iter().map(|&id| lives[id].alive.1).max().unwrap_or(0);
+            let alive_ns = last.saturating_sub(first);
+            let starts = ids.iter().map(|&id| lifetimes.threads[id].start_ns);
+            let ends = ids.iter().map(|&id| lifetimes.threads[id].end_ns);
+            let last_name = |id: usize| lives[id].names.last().map(|n| n.to_string());
+            let name = main.and_then(last_name).or_else(|| {
+                let first = ids.iter().copied().min_by_key(|&id| lives[id].alive.0)?;
+                last_name(first)
+            });
+            ProcessRow {
+                pid,
+                name,
+                start_ns: starts
+                    .collect::<Option<Vec<u64>>>()
+                    .and_then(|s| s.into_iter().min())
+                    .map(|t| t.saturating_sub(base)),
+                end_ns: ends
+                    .collect::<Option<Vec<u64>>>()
+                    .and_then(|e| e.into_iter().max())
+                    .map(|t| t.saturating_sub(base)),
+                threads: ids.len(),
+                alive_ns,
+                cpu_utilization: ratio(cpu.cpu_ns, alive_ns),
+                cpu,
+            }
+        })
+        .collect()
+}
+
+fn ratio(part: u64, whole: u64) -> Option<f64> {
+    (whole > 0).then(|| part as f64 / whole as f64)
+}

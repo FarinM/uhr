@@ -33,6 +33,24 @@ impl<'a> ThreadNames<'a> {
         let set = history.partition_point(|&(time, _)| time.is_none_or(|t| t <= time_ns));
         set.checked_sub(1).map(|i| history[i].1)
     }
+
+    /// The names the thread had at some point in `from_ns..to_ns`, oldest
+    /// first.
+    pub(crate) fn during(&self, pid: u32, tid: u32, from_ns: u64, to_ns: u64) -> Vec<&'a str> {
+        let Some(history) = self.names.get(&(pid, tid)).filter(|_| from_ns < to_ns) else {
+            return Vec::new();
+        };
+        let mut names: Vec<&str> = self.at(pid, tid, from_ns).into_iter().collect();
+        let later = history
+            .iter()
+            .filter(|&&(time, _)| time.is_some_and(|t| from_ns < t && t < to_ns));
+        for &(_, name) in later {
+            if names.last() != Some(&name) {
+                names.push(name);
+            }
+        }
+        names
+    }
 }
 
 #[cfg(test)]
@@ -87,5 +105,23 @@ mod tests {
         assert_eq!(names.at(1, 1, 25), Some("worker"));
         assert_eq!(names.at(1, 2, 14), None);
         assert_eq!(names.at(1, 3, 25), None);
+
+        assert_eq!(names.during(1, 1, 0, 100), ["perf-exec", "app", "worker"]);
+        assert_eq!(names.during(1, 1, 10, 20), ["app"], "the end is exclusive");
+        assert_eq!(names.during(1, 1, 12, 21), ["app", "worker"]);
+        assert_eq!(names.during(1, 1, 20, 20), Vec::<&str>::new());
+        assert_eq!(names.during(1, 2, 0, 15), Vec::<&str>::new());
+        assert_eq!(names.during(1, 2, 0, 16), ["other"]);
+    }
+
+    #[test]
+    fn skips_a_repeated_name() {
+        let recording = recording(vec![
+            name(1, Some(10), "app"),
+            name(1, Some(20), "app"),
+            name(1, Some(30), "worker"),
+        ]);
+        let names = ThreadNames::new(&recording);
+        assert_eq!(names.during(1, 1, 0, 40), ["app", "worker"]);
     }
 }
