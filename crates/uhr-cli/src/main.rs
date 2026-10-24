@@ -6,6 +6,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::LevelFilter;
+use uhr_core::call_paths::{self, CallPaths, Node, Omitted};
 use uhr_core::coverage::{Coverage, SymbolCoverage};
 use uhr_core::doctor::{self, Report, Status};
 use uhr_core::filter::Filter;
@@ -70,6 +71,28 @@ enum Command {
         group_by: GroupByArg,
         /// Rows to print
         #[arg(long, default_value_t = 20)]
+        top: usize,
+        #[arg(long)]
+        json: bool,
+        #[command(flatten)]
+        filter: FilterArgs,
+    },
+    /// Show who calls a function and what it calls, with their CPU time
+    CallPaths {
+        recording: PathBuf,
+        /// A function id from `uhr query --json`, or a name only one function
+        /// has
+        #[arg(long)]
+        function: String,
+        /// Levels of callers and of callees to show
+        #[arg(
+            long,
+            default_value_t = 3,
+            value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..)
+        )]
+        depth: usize,
+        /// Children to show per node. The rest are summed
+        #[arg(long, default_value_t = 5)]
         top: usize,
         #[arg(long)]
         json: bool,
@@ -181,6 +204,14 @@ fn main() -> ExitCode {
             filter,
             json,
         } => run_query(&recording, group_by, top, filter, json),
+        Command::CallPaths {
+            recording,
+            function,
+            depth,
+            top,
+            json,
+            filter,
+        } => run_call_paths(&recording, function, depth, top, filter, json),
     };
     result.unwrap_or_else(|error| {
         tracing::error!("{error:#}");
@@ -396,6 +427,121 @@ fn kernel_share(cpu: &CPUTime) -> String {
         Some(_) if cpu.cpu_ns == 0 => "-".into(),
         Some(kernel) => format!("{:.1}%", kernel as f64 / cpu.cpu_ns as f64 * 100.0),
     }
+}
+
+fn run_call_paths(
+    recording: &Path,
+    function: String,
+    depth: usize,
+    top: usize,
+    filter: FilterArgs,
+    json: bool,
+) -> Result<ExitCode> {
+    let query = call_paths::Query {
+        function,
+        depth,
+        top,
+        filter: filter.into_filter()?,
+    };
+    let result = call_paths::call_paths(recording, &query)?;
+    if json {
+        let text = serde_json::to_string_pretty(&result)?;
+        write_output(|out| writeln!(out, "{text}"))?;
+    } else {
+        write_output(|out| write_call_paths(out, &result))?;
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn write_call_paths(out: &mut impl Write, result: &CallPaths) -> io::Result<()> {
+    let percent = |ns: u64| {
+        if result.cpu_ns == 0 {
+            0.0
+        } else {
+            ns as f64 / result.cpu_ns as f64 * 100.0
+        }
+    };
+    writeln!(
+        out,
+        "{}  {}",
+        function_name(&result.function),
+        module_name(&result.function)
+    )?;
+    writeln!(
+        out,
+        "{} samples, {:.2} s of CPU time. On the stack for {:.1}% of it, the leaf for {:.1}%",
+        result.samples,
+        result.cpu_ns as f64 / 1e9,
+        result.total_share * 100.0,
+        result.self_share * 100.0
+    )?;
+    if !result.filter.is_empty() {
+        writeln!(out, "filter: {}", describe_filter(&result.filter))?;
+    }
+
+    writeln!(out, "\ncallers")?;
+    write_nodes(out, &result.callers, &result.callers_omitted, 0, &percent)?;
+    if result.no_caller_cpu_ns > 0 {
+        writeln!(
+            out,
+            "{:>6.1}%  (no caller: where the thread started, or the stack was cut short)",
+            percent(result.no_caller_cpu_ns)
+        )?;
+    }
+    writeln!(out, "\ncallees")?;
+    write_nodes(out, &result.callees, &result.callees_omitted, 0, &percent)?;
+
+    let coverage = &result.coverage;
+    writeln!(out, "\ncoverage")?;
+    match coverage.named_share {
+        Some(share) => writeln!(
+            out,
+            "  function time with every frame named, within the depth: {:.1}%",
+            share * 100.0
+        ),
+        None => writeln!(out, "  named frames: unknown, no samples of the function"),
+    }?;
+    for (origin, share) in &coverage.unnamed_by_origin {
+        writeln!(out, "  unnamed {}: {:.1}%", origin.as_str(), share * 100.0)?;
+    }
+    write_symbol_coverage(out, &coverage.symbols)?;
+    write_coverage(out, &coverage.recording)
+}
+
+fn write_nodes(
+    out: &mut impl Write,
+    nodes: &[Node],
+    omitted: &Omitted,
+    level: usize,
+    percent: &dyn Fn(u64) -> f64,
+) -> io::Result<()> {
+    let indent = "  ".repeat(level);
+    if level == 0 && nodes.is_empty() && omitted.nodes == 0 {
+        writeln!(out, "  none")?;
+    }
+    for node in nodes {
+        let leaf = match node.self_cpu_ns {
+            Some(ns) if ns > 0 => format!("  (leaf {:.1}%)", percent(ns)),
+            _ => String::new(),
+        };
+        writeln!(
+            out,
+            "{:>6.1}%  {indent}{}  {}{leaf}",
+            percent(node.cpu_ns),
+            function_name(&node.function),
+            module_name(&node.function)
+        )?;
+        write_nodes(out, &node.children, &node.omitted, level + 1, percent)?;
+    }
+    if omitted.nodes > 0 {
+        writeln!(
+            out,
+            "{:>6.1}%  {indent}({} more)",
+            percent(omitted.cpu_ns),
+            omitted.nodes
+        )?;
+    }
+    Ok(())
 }
 
 fn run_query(

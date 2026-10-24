@@ -39,6 +39,12 @@ behaviors.
 | `export` | Write Perfetto, Firefox Profiler or speedscope files for human review |
 | `doctor` | What the requested signals need on this target and host |
 
+`call_paths` takes a function by its id, or by a name only one function
+has, and returns two trees from it outward: its callers and its callees. Both
+stop at a depth limit and keep the top children of each node, and they report
+the time of what they cut. Where a function recurses, each sample counts from
+its outermost call, so the callers show where the function is entered.
+
 Moving across levels on one recording:
 
 ```

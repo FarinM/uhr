@@ -32,6 +32,7 @@ uhr query rec --group-by function          # top functions, with coverage
 uhr query rec --group-by function --json   # the same, for agents
 uhr query rec --group-by function --thread 'worker-*' --mode kernel --from 1s
                                            # only some samples
+uhr call-paths rec --function memcpy       # who calls it, and what it calls
 ```
 
 Full stacks need frame pointers. `uhr doctor` lists the build flags.
