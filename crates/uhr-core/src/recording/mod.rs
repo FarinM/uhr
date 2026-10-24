@@ -2,10 +2,11 @@ mod manifest;
 pub(crate) mod table;
 
 use std::fs;
-use std::io::ErrorKind;
-use std::path::Path;
+use std::io::{self, ErrorKind};
+use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
+use arrow_schema::ArrowError;
+use parquet::errors::ParquetError;
 use serde::{Deserialize, Serialize};
 
 pub use manifest::*;
@@ -18,6 +19,90 @@ const MAPPINGS: &str = "mappings.parquet";
 const FRAMES: &str = "frames.parquet";
 const STACKS: &str = "stacks.parquet";
 const SAMPLES: &str = "samples.parquet";
+
+type Result<T, E = Error> = std::result::Result<T, E>;
+
+/// Why a recording could not be read or written.
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error(
+        "{} has no {MANIFEST}: it is not a recording, or the recording did not finish",
+        .0.display()
+    )]
+    NotARecording(PathBuf),
+    #[error(
+        "{} has format version {found}, this build reads version {FORMAT_VERSION}",
+        .path.display()
+    )]
+    FormatVersion { path: PathBuf, found: u32 },
+    /// The files can be read, but break the format.
+    #[error("invalid recording {}: {reason}", .path.display())]
+    Invalid { path: PathBuf, reason: String },
+    #[error("{action} {}", .path.display())]
+    Io {
+        action: &'static str,
+        path: PathBuf,
+        source: io::Error,
+    },
+    #[error("{action} {}", .path.display())]
+    Parquet {
+        action: &'static str,
+        path: PathBuf,
+        source: ParquetError,
+    },
+    #[error("{action} {}", .path.display())]
+    Arrow {
+        action: &'static str,
+        path: PathBuf,
+        source: ArrowError,
+    },
+    #[error("{action} {}", .path.display())]
+    Manifest {
+        action: &'static str,
+        path: PathBuf,
+        source: serde_json::Error,
+    },
+}
+
+/// Each returns a `map_err` argument that adds what was being done to which
+/// file.
+impl Error {
+    pub(crate) fn io(action: &'static str, path: &Path) -> impl FnOnce(io::Error) -> Self {
+        let path = path.to_owned();
+        move |source| Self::Io {
+            action,
+            path,
+            source,
+        }
+    }
+
+    pub(crate) fn parquet(action: &'static str, path: &Path) -> impl FnOnce(ParquetError) -> Self {
+        let path = path.to_owned();
+        move |source| Self::Parquet {
+            action,
+            path,
+            source,
+        }
+    }
+
+    pub(crate) fn arrow(action: &'static str, path: &Path) -> impl FnOnce(ArrowError) -> Self {
+        let path = path.to_owned();
+        move |source| Self::Arrow {
+            action,
+            path,
+            source,
+        }
+    }
+
+    fn manifest(action: &'static str, path: &Path) -> impl FnOnce(serde_json::Error) -> Self {
+        let path = path.to_owned();
+        move |source| Self::Manifest {
+            action,
+            path,
+            source,
+        }
+    }
+}
 
 /// One finished profiling session. Ids are positions in their tables, and
 /// `read` checks every reference, so code holding a `Recording` can index
@@ -102,12 +187,12 @@ impl Origin {
         }
     }
 
-    fn parse(value: &str) -> Result<Self> {
+    fn parse(value: &str) -> Result<Self, String> {
         Ok(match value {
             "binary" => Origin::Binary,
             "kernel" => Origin::Kernel,
             "unresolved" => Origin::Unresolved,
-            _ => bail!("unknown frame origin {value:?}"),
+            _ => return Err(format!("unknown frame origin {value:?}")),
         })
     }
 }
@@ -140,12 +225,12 @@ impl Mode {
         }
     }
 
-    fn parse(value: &str) -> Result<Self> {
+    fn parse(value: &str) -> Result<Self, String> {
         Ok(match value {
             "user" => Mode::User,
             "kernel" => Mode::Kernel,
             "unknown" => Mode::Unknown,
-            _ => bail!("unknown mode {value:?}"),
+            _ => return Err(format!("unknown mode {value:?}")),
         })
     }
 }
@@ -154,12 +239,14 @@ impl Recording {
     /// Writes the manifest last: a directory without one is a recording that
     /// did not finish.
     pub fn write(&self, dir: &Path) -> Result<()> {
-        fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        fs::create_dir_all(dir).map_err(Error::io("creating", dir))?;
         self.write_tables(dir)?;
-        let manifest = serde_json::to_vec_pretty(&self.manifest)?;
+        let path = dir.join(MANIFEST);
+        let manifest = serde_json::to_vec_pretty(&self.manifest)
+            .map_err(Error::manifest("serializing", &path))?;
         let partial = dir.join(format!("{MANIFEST}.partial"));
-        fs::write(&partial, manifest)?;
-        fs::rename(&partial, dir.join(MANIFEST))?;
+        fs::write(&partial, manifest).map_err(Error::io("writing", &partial))?;
+        fs::rename(&partial, &path).map_err(Error::io("renaming into place", &path))?;
         Ok(())
     }
 
@@ -176,7 +263,10 @@ impl Recording {
         };
         recording
             .check_references()
-            .with_context(|| format!("invalid recording {}", dir.display()))?;
+            .map_err(|reason| Error::Invalid {
+                path: dir.to_owned(),
+                reason,
+            })?;
         Ok(recording)
     }
 
@@ -268,10 +358,10 @@ impl Recording {
         )
     }
 
-    fn check_references(&self) -> Result<()> {
+    fn check_references(&self) -> Result<(), String> {
         for (id, mapping) in self.mappings.iter().enumerate() {
             if mapping.start >= mapping.end {
-                bail!("mapping {id} has start >= end");
+                return Err(format!("mapping {id} has start >= end"));
             }
         }
         for (id, frame) in self.frames.iter().enumerate() {
@@ -281,7 +371,7 @@ impl Recording {
         }
         for (id, stack) in self.stacks.iter().enumerate() {
             if stack.is_empty() {
-                bail!("stack {id} has no frames");
+                return Err(format!("stack {id} has no frames"));
             }
             for &frame in stack {
                 check_id("stack", id, "frame", frame, self.frames.len())?;
@@ -298,11 +388,10 @@ fn read_manifest(dir: &Path) -> Result<Manifest> {
     let path = dir.join(MANIFEST);
     let text = match fs::read(&path) {
         Ok(text) => text,
-        Err(e) if e.kind() == ErrorKind::NotFound => bail!(
-            "{} has no {MANIFEST}: it is not a recording, or the recording did not finish",
-            dir.display()
-        ),
-        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            return Err(Error::NotARecording(dir.to_owned()));
+        }
+        Err(e) => return Err(Error::io("reading", &path)(e)),
     };
 
     #[derive(Deserialize)]
@@ -310,15 +399,14 @@ fn read_manifest(dir: &Path) -> Result<Manifest> {
         format_version: u32,
     }
     let version: Version = serde_json::from_slice(&text)
-        .with_context(|| format!("{}: no format_version", path.display()))?;
+        .map_err(Error::manifest("reading the format version of", &path))?;
     if version.format_version != FORMAT_VERSION {
-        bail!(
-            "{} has format version {}, this build reads version {FORMAT_VERSION}",
-            dir.display(),
-            version.format_version
-        );
+        return Err(Error::FormatVersion {
+            path: dir.to_owned(),
+            found: version.format_version,
+        });
     }
-    serde_json::from_slice(&text).with_context(|| format!("parsing {}", path.display()))
+    serde_json::from_slice(&text).map_err(Error::manifest("parsing", &path))
 }
 
 fn read_threads(dir: &Path) -> Result<Vec<Thread>> {
@@ -391,7 +479,7 @@ fn read_frames(dir: &Path) -> Result<Vec<Frame>> {
     (0..table.len())
         .map(|i| {
             Ok(Frame {
-                origin: Origin::parse(&origin[i])?,
+                origin: Origin::parse(&origin[i]).map_err(|reason| table.invalid(reason))?,
                 address: address[i],
                 mapping: mapping[i],
                 file_offset: file_offset[i],
@@ -423,7 +511,7 @@ fn read_samples(dir: &Path) -> Result<Vec<Sample>> {
                 pid: pid[i],
                 tid: tid[i],
                 cpu: cpu[i],
-                mode: Mode::parse(&mode[i])?,
+                mode: Mode::parse(&mode[i]).map_err(|reason| table.invalid(reason))?,
                 stack: stack[i],
                 cpu_ns: cpu_ns[i],
             })
@@ -438,14 +526,16 @@ fn ids(len: usize) -> Vec<u32> {
 fn check_ids(table: &Table, column: &str) -> Result<()> {
     let ids = table.u32(column)?;
     if ids.iter().enumerate().any(|(i, &id)| id as usize != i) {
-        bail!("{column} must count up from 0 in row order");
+        return Err(table.invalid(format!("{column} must count up from 0 in row order")));
     }
     Ok(())
 }
 
-fn check_id(kind: &str, index: usize, target: &str, id: u32, len: usize) -> Result<()> {
+fn check_id(kind: &str, index: usize, target: &str, id: u32, len: usize) -> Result<(), String> {
     if id as usize >= len {
-        bail!("{kind} {index} refers to {target} {id}, but there are only {len}");
+        return Err(format!(
+            "{kind} {index} refers to {target} {id}, but there are only {len}"
+        ));
     }
     Ok(())
 }

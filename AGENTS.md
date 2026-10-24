@@ -41,6 +41,8 @@ and the code covers only part of the design.
 - `uhr-core` holds the model, collectors, symbol resolution and queries.
   `uhr-cli` is the `uhr` binary. Put new tools in the core, so the CLI and a
   later MCP server share them.
+- Core returns typed errors, one `thiserror` enum per module, so callers can
+  tell failures apart. Only the CLI uses `anyhow`, to print them.
 - Diagnostics go through `tracing` to stderr. Command results go to stdout
   through `write_output`, never `println!`, which panics when a reader such
   as `head` stops early.

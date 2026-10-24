@@ -2,9 +2,9 @@ mod files;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
+use std::io;
 use std::path::Path;
 
-use anyhow::{Context, Result, bail};
 use files::{Files, Location};
 use serde::Serialize;
 use tracing::{debug, info, warn};
@@ -13,7 +13,17 @@ use wholesym::samply_symbols::relative_address_base;
 use wholesym::samply_symbols::{LookupAddress, SymbolManager};
 
 use crate::recording::table::{self, Column, Table};
-use crate::recording::{Origin, Recording};
+use crate::recording::{self, Origin, Recording};
+
+/// Why symbolizing failed. Files that can't be read only leave their frames
+/// unnamed, with the reason in their source.
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error(transparent)]
+    Recording(#[from] recording::Error),
+    #[error("starting the runtime for symbol lookups")]
+    Runtime(#[source] io::Error),
+}
 
 const NAMES: &str = "symbols.parquet";
 const SOURCES: &str = "symbol_sources.parquet";
@@ -84,7 +94,7 @@ impl SourceStatus {
         }
     }
 
-    fn parse(value: &str) -> Result<Self> {
+    fn parse(value: &str) -> Result<Self, String> {
         Ok(match value {
             "resolved" => SourceStatus::Resolved,
             "unverified" => SourceStatus::Unverified,
@@ -92,7 +102,7 @@ impl SourceStatus {
             "build_id_mismatch" => SourceStatus::BuildIdMismatch,
             "unsupported" => SourceStatus::Unsupported,
             "failed" => SourceStatus::Failed,
-            _ => bail!("unknown symbol source status {value:?}"),
+            _ => return Err(format!("unknown symbol source status {value:?}")),
         })
     }
 }
@@ -102,11 +112,12 @@ type FileKey<'a> = (&'a str, Option<&'a str>);
 
 /// Resolves the recording in `dir` against the files on this machine and
 /// writes the result beside it.
-pub fn symbolize(dir: &Path) -> Result<Symbols> {
+pub fn symbolize(dir: &Path) -> Result<Symbols, Error> {
     let recording = Recording::read(dir)?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
-        .build()?;
+        .build()
+        .map_err(Error::Runtime)?;
     let symbols = runtime.block_on(resolve(&recording));
     symbols.write(dir)?;
     log_summary(&symbols);
@@ -250,13 +261,13 @@ async fn resolve(recording: &Recording) -> Symbols {
                 .load_symbol_map(&info)
                 .await
                 .map(|map| (segments, map))
-                .map_err(anyhow::Error::from),
-            Err(error) => Err(error),
+                .map_err(|error| chain(&error)),
+            Err(error) => Err(format!("parsing binary snapshot: {error}")),
         };
         let (segments, map) = match loaded {
             Ok(loaded) => loaded,
             Err(error) => {
-                sources.push(source(SourceStatus::Failed, Some(format!("{error:#}"))));
+                sources.push(source(SourceStatus::Failed, Some(error)));
                 continue;
             }
         };
@@ -411,8 +422,8 @@ struct Segments {
 }
 
 impl Segments {
-    fn read(bytes: &[u8]) -> Result<Self> {
-        let object = object::File::parse(bytes).context("parsing binary snapshot")?;
+    fn read(bytes: &[u8]) -> Result<Self, object::Error> {
+        let object = object::File::parse(bytes)?;
         let ranges = object
             .segments()
             .map(|segment| {
@@ -436,7 +447,7 @@ impl Segments {
 
 impl Symbols {
     /// `None` if the recording has not been symbolized.
-    pub fn read(dir: &Path, recording: &Recording) -> Result<Option<Self>> {
+    pub fn read(dir: &Path, recording: &Recording) -> Result<Option<Self>, recording::Error> {
         if !dir.join(NAMES).exists() {
             return Ok(None);
         }
@@ -448,7 +459,7 @@ impl Symbols {
                 .enumerate()
                 .any(|(i, &id)| id as usize != i)
         {
-            bail!("{NAMES} must have one row per frame, in frame id order");
+            return Err(table.invalid("must have one row per frame, in frame id order"));
         }
         let function_addresses = table.optional_u32("function_address")?;
         let functions = table.optional_string("function")?;
@@ -460,9 +471,11 @@ impl Symbols {
                 (Some(function), None) => Ok(Some(FrameName::Symbol(function))),
                 (None, Some(placeholder)) => Ok(Some(FrameName::Placeholder(placeholder))),
                 (None, None) => Ok(None),
-                (Some(_), Some(_)) => bail!("{NAMES}: a frame has a function and a placeholder"),
+                (Some(_), Some(_)) => {
+                    Err(table.invalid("a frame has a function and a placeholder"))
+                }
             })
-            .collect::<Result<_>>()?;
+            .collect::<Result<_, _>>()?;
 
         let table = Table::read(&dir.join(SOURCES))?;
         let path = table.string("path")?;
@@ -474,11 +487,12 @@ impl Symbols {
                 Ok(Source {
                     path: path[i].clone(),
                     build_id: build_id[i].clone(),
-                    status: SourceStatus::parse(&status[i])?,
+                    status: SourceStatus::parse(&status[i])
+                        .map_err(|reason| table.invalid(reason))?,
                     detail: detail[i].clone(),
                 })
             })
-            .collect::<Result<_>>()?;
+            .collect::<Result<_, recording::Error>>()?;
         Ok(Some(Self {
             names,
             function_addresses,
@@ -488,7 +502,7 @@ impl Symbols {
 
     /// Each file is written under a temporary name and renamed, so a reader
     /// never sees a half-written file.
-    fn write(&self, dir: &Path) -> Result<()> {
+    fn write(&self, dir: &Path) -> Result<(), recording::Error> {
         let names_partial = dir.join(format!("{NAMES}.partial"));
         table::write(
             &names_partial,
@@ -534,10 +548,25 @@ impl Symbols {
                 ),
             ],
         )?;
-        fs::rename(&sources_partial, dir.join(SOURCES)).context("replacing symbol sources")?;
-        fs::rename(&names_partial, dir.join(NAMES)).context("replacing symbols")?;
+        let sources = dir.join(SOURCES);
+        fs::rename(&sources_partial, &sources)
+            .map_err(recording::Error::io("replacing", &sources))?;
+        let names = dir.join(NAMES);
+        fs::rename(&names_partial, &names).map_err(recording::Error::io("replacing", &names))?;
         Ok(())
     }
+}
+
+/// An error followed by each error that caused it.
+fn chain(error: &dyn std::error::Error) -> String {
+    let mut text = error.to_string();
+    let mut cause = error.source();
+    while let Some(next) = cause {
+        text.push_str(": ");
+        text.push_str(&next.to_string());
+        cause = next.source();
+    }
+    text
 }
 
 #[cfg(test)]

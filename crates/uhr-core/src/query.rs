@@ -1,10 +1,9 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
-use anyhow::Result;
 use serde::Serialize;
 
-use crate::recording::{Collector, MissingSignal, Origin, Recording, Unwinding};
+use crate::recording::{self, Collector, MissingSignal, Origin, Recording, Unwinding};
 use crate::symbols::{FrameName, Source, SourceStatus, Symbols};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -73,7 +72,7 @@ pub struct Coverage {
     pub known_biases: Vec<String>,
 }
 
-pub fn query(dir: &Path, query: &Query) -> Result<QueryResult> {
+pub fn query(dir: &Path, query: &Query) -> Result<QueryResult, recording::Error> {
     let recording = Recording::read(dir)?;
     let symbols = Symbols::read(dir, &recording)?;
     Ok(run(&recording, symbols.as_ref(), query))

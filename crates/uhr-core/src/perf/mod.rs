@@ -15,11 +15,78 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
 use tracing::{debug, info, warn};
 
 use crate::doctor;
-use crate::recording::{Collector, Exit, Recording};
+use crate::recording::{self, Collector, Exit, Recording};
+
+type Result<T, E = Error> = std::result::Result<T, E>;
+
+/// Why recording failed.
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    /// The host can't record, and `fix` says how to change that.
+    #[error(
+        "cannot record: {detail}{}",
+        .fix.as_ref().map(|fix| format!("\nfix: {fix}")).unwrap_or_default()
+    )]
+    Blocked { detail: String, fix: Option<String> },
+    #[error("no command to record")]
+    NoCommand,
+    #[error("command not found or not executable: {0}")]
+    CommandNotFound(String),
+    #[error("{} already exists", .0.display())]
+    OutputExists(PathBuf),
+    /// The staging directory of a recording that did not finish.
+    #[error(
+        "{} exists, probably from a recording that did not finish. Remove it to record again",
+        .0.display()
+    )]
+    Unfinished(PathBuf),
+    #[error("{} is not a usable output directory", .0.display())]
+    UnusableOutput(PathBuf),
+    #[error("{0}")]
+    PerfVersion(String),
+    #[error("{path} is not a number: {value:?}")]
+    NotANumber { path: &'static str, value: String },
+    #[error("installing the SIGINT handler")]
+    SignalHandler(#[source] io::Error),
+    #[error("{action} {}", .path.display())]
+    Io {
+        action: &'static str,
+        path: PathBuf,
+        source: io::Error,
+    },
+    /// perf failed, and what it left could not be converted.
+    #[error(
+        "perf exited with {status} and wrote no usable data. Run `uhr doctor`, or run \
+         `perf {command}` to see perf's own error"
+    )]
+    NoUsableData {
+        status: ExitStatus,
+        command: String,
+        source: Box<Error>,
+    },
+    #[error("converting {}, which is kept for inspection", .path.display())]
+    Convert { path: PathBuf, source: Box<Error> },
+    /// perf.data does not hold what the collector asked perf for.
+    #[error("{0}")]
+    UnexpectedData(String),
+    #[error("parsing perf.data")]
+    PerfData(#[source] linux_perf_data::Error),
+    #[error(transparent)]
+    Recording(#[from] recording::Error),
+}
+
+/// Returns a `map_err` argument that adds what was being done to which file.
+fn io_error(action: &'static str, path: &Path) -> impl FnOnce(io::Error) -> Error {
+    let path = path.to_owned();
+    move |source| Error::Io {
+        action,
+        path,
+        source,
+    }
+}
 
 pub struct RecordOptions {
     pub command: Vec<String>,
@@ -32,30 +99,31 @@ pub struct RecordOptions {
 pub fn record(options: &RecordOptions, out: &Path) -> Result<Recording> {
     let report = doctor::check_perf();
     if let Some(check) = report.blocked().next() {
-        let fix = check.fix.as_deref().map(|f| format!("\nfix: {f}"));
-        bail!("cannot record: {}{}", check.detail, fix.unwrap_or_default());
+        return Err(Error::Blocked {
+            detail: check.detail.clone(),
+            fix: check.fix.clone(),
+        });
     }
     let Some(program) = options.command.first() else {
-        bail!("no command to record");
+        return Err(Error::NoCommand);
     };
     check_program(program)?;
     if out.exists() {
-        bail!("{} already exists", out.display());
+        return Err(Error::OutputExists(out.to_owned()));
     }
     let staging = staging_dir(out)?;
     if let Some(parent) = staging.parent().filter(|p| !p.as_os_str().is_empty()) {
-        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+        fs::create_dir_all(parent).map_err(io_error("creating", parent))?;
     }
     // Exclusive, so two recordings to the same output can't share it.
     match fs::create_dir(&staging) {
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => bail!(
-            "{} exists, probably from a recording that did not finish. Remove it to record again",
-            staging.display()
-        ),
-        result => result.with_context(|| format!("creating {}", staging.display()))?,
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            return Err(Error::Unfinished(staging));
+        }
+        result => result.map_err(io_error("creating", &staging))?,
     }
 
-    let perf_version = doctor::perf_version().map_err(anyhow::Error::msg)?;
+    let perf_version = doctor::perf_version().map_err(Error::PerfVersion)?;
     let max_stack_depth = read_max_stack_depth()?;
     let perf_data = staging.join("perf.data");
     let args = perf_args(&perf_data, options);
@@ -79,24 +147,23 @@ pub fn record(options: &RecordOptions, out: &Path) -> Result<Recording> {
             // Without --quiet, perf prints the error it kept to itself.
             let mut retry = perf_args(Path::new("perf.data"), options);
             retry.retain(|a| a != "--quiet");
-            return Err(error.context(format!(
-                "perf exited with {status} and wrote no usable data. Run `uhr doctor`, or run \
-                 `perf {}` to see perf's own error",
-                join_args(&retry)
-            )));
+            return Err(Error::NoUsableData {
+                status,
+                command: join_args(&retry),
+                source: Box::new(error),
+            });
         }
         Err(error) => {
-            return Err(error.context(format!(
-                "converting {}, which is kept for inspection",
-                perf_data.display()
-            )));
+            return Err(Error::Convert {
+                path: perf_data,
+                source: Box::new(error),
+            });
         }
     };
 
     recording.write(&staging)?;
-    fs::remove_file(&perf_data).with_context(|| format!("removing {}", perf_data.display()))?;
-    fs::rename(&staging, out)
-        .with_context(|| format!("renaming {} to {}", staging.display(), out.display()))?;
+    fs::remove_file(&perf_data).map_err(io_error("removing", &perf_data))?;
+    fs::rename(&staging, out).map_err(io_error("renaming into place", out))?;
     log_summary(&recording, out);
     Ok(recording)
 }
@@ -185,7 +252,8 @@ fn join_args(args: &[OsString]) -> String {
 fn run_perf(args: &[OsString]) -> Result<(ExitStatus, bool)> {
     let interrupted = Arc::new(AtomicBool::new(false));
     let handler =
-        signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&interrupted))?;
+        signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&interrupted))
+            .map_err(Error::SignalHandler)?;
     let status = spawn_perf(args);
     signal_hook::low_level::unregister(handler);
     Ok((status?, interrupted.load(Ordering::Relaxed)))
@@ -201,9 +269,13 @@ fn spawn_perf(args: &[OsString]) -> Result<ExitStatus> {
     if stderr_can_break() {
         command.stderr(Stdio::piped());
     }
-    let mut child = command.spawn().context("running perf")?;
+    let mut child = command
+        .spawn()
+        .map_err(io_error("running", Path::new("perf")))?;
     let relay = child.stderr.take().map(relay_stderr);
-    let status = child.wait().context("waiting for perf")?;
+    let status = child
+        .wait()
+        .map_err(io_error("waiting for", Path::new("perf")))?;
     if let Some(done) = relay {
         let _ = done.recv_timeout(RELAY_GRACE);
     }
@@ -280,14 +352,14 @@ fn check_program(program: &str) -> Result<()> {
         })
     };
     if !found {
-        bail!("command not found or not executable: {program}");
+        return Err(Error::CommandNotFound(program.to_owned()));
     }
     Ok(())
 }
 
 fn staging_dir(out: &Path) -> Result<PathBuf> {
     let Some(name) = out.file_name() else {
-        bail!("{} is not a usable output directory", out.display());
+        return Err(Error::UnusableOutput(out.to_owned()));
     };
     let mut staging = name.to_owned();
     staging.push(".partial");
@@ -296,8 +368,9 @@ fn staging_dir(out: &Path) -> Result<PathBuf> {
 
 fn read_max_stack_depth() -> Result<u32> {
     let path = "/proc/sys/kernel/perf_event_max_stack";
-    let text = fs::read_to_string(path).with_context(|| format!("reading {path}"))?;
-    text.trim()
-        .parse()
-        .with_context(|| format!("{path} is not a number: {:?}", text.trim()))
+    let text = fs::read_to_string(path).map_err(io_error("reading", Path::new(path)))?;
+    text.trim().parse().map_err(|_| Error::NotANumber {
+        path,
+        value: text.trim().to_owned(),
+    })
 }

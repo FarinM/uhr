@@ -2334,7 +2334,6 @@ dependencies = [
 name = "uhr-core"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "arrow-array",
  "arrow-buffer",
  "arrow-schema",
@@ -2348,6 +2347,7 @@ dependencies = [
  "serde_json",
  "signal-hook",
  "tempfile",
+ "thiserror",
  "tokio",
  "tracing",
  "wholesym",

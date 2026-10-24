@@ -1,8 +1,7 @@
 use std::fs::File;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{Context, Result, bail};
 use arrow_array::types::{UInt32Type, UInt64Type};
 use arrow_array::{
     Array, ArrayRef, ArrowPrimitiveType, BooleanArray, ListArray, PrimitiveArray, RecordBatch,
@@ -14,6 +13,8 @@ use parquet::arrow::ArrowWriter;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::WriterProperties;
+
+use super::{Error, Result};
 
 pub(crate) struct Column {
     name: &'static str,
@@ -74,38 +75,54 @@ pub(crate) fn write(path: &Path, columns: Vec<Column>) -> Result<()> {
         .collect();
     let schema = Arc::new(Schema::new(fields));
     let arrays = columns.into_iter().map(|c| c.array).collect();
-    let batch = RecordBatch::try_new(schema.clone(), arrays)?;
+    let batch =
+        RecordBatch::try_new(schema.clone(), arrays).map_err(Error::arrow("building", path))?;
 
     let properties = WriterProperties::builder()
         .set_compression(Compression::ZSTD(ZstdLevel::default()))
         .build();
-    let file = File::create(path).with_context(|| format!("creating {}", path.display()))?;
-    let mut writer = ArrowWriter::try_new(file, schema, Some(properties))?;
-    writer.write(&batch)?;
-    writer.close()?;
+    let file = File::create(path).map_err(Error::io("creating", path))?;
+    let mut writer = ArrowWriter::try_new(file, schema, Some(properties))
+        .map_err(Error::parquet("writing", path))?;
+    writer
+        .write(&batch)
+        .map_err(Error::parquet("writing", path))?;
+    writer.close().map_err(Error::parquet("writing", path))?;
     Ok(())
 }
 
 /// A table read back from disk. Getters fail on missing columns, wrong
 /// types and unexpected nulls, so callers get plain values.
 pub(crate) struct Table {
-    name: String,
+    path: PathBuf,
     batch: RecordBatch,
 }
 
 impl Table {
     pub fn read(path: &Path) -> Result<Self> {
-        let name = path.display().to_string();
-        let file = File::open(path).with_context(|| format!("opening {name}"))?;
+        let file = File::open(path).map_err(Error::io("opening", path))?;
         let builder = ParquetRecordBatchReaderBuilder::try_new(file)
-            .with_context(|| format!("reading {name}"))?;
+            .map_err(Error::parquet("reading", path))?;
         let schema = builder.schema().clone();
         let batches = builder
-            .build()?
+            .build()
+            .map_err(Error::parquet("reading", path))?
             .collect::<Result<Vec<_>, _>>()
-            .with_context(|| format!("reading {name}"))?;
-        let batch = arrow_select::concat::concat_batches(&schema, &batches)?;
-        Ok(Self { name, batch })
+            .map_err(Error::arrow("reading", path))?;
+        let batch = arrow_select::concat::concat_batches(&schema, &batches)
+            .map_err(Error::arrow("reading", path))?;
+        Ok(Self {
+            path: path.to_owned(),
+            batch,
+        })
+    }
+
+    /// An error for a table that can be read but breaks the format.
+    pub fn invalid(&self, reason: impl Into<String>) -> Error {
+        Error::Invalid {
+            path: self.path.clone(),
+            reason: reason.into(),
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -152,7 +169,7 @@ impl Table {
             .values()
             .as_any()
             .downcast_ref::<UInt32Array>()
-            .with_context(|| format!("{}: column {column} is not a list of u32", self.name))?;
+            .ok_or_else(|| self.invalid(format!("column {column} is not a list of u32")))?;
         self.check_no_nulls(column, values)?;
         let values = values.values();
         Ok(array
@@ -176,19 +193,18 @@ impl Table {
         let array = self
             .batch
             .column_by_name(column)
-            .with_context(|| format!("{}: missing column {column}", self.name))?;
-        array.as_any().downcast_ref::<T>().with_context(|| {
-            format!(
-                "{}: column {column} has unexpected type {}",
-                self.name,
+            .ok_or_else(|| self.invalid(format!("missing column {column}")))?;
+        array.as_any().downcast_ref::<T>().ok_or_else(|| {
+            self.invalid(format!(
+                "column {column} has unexpected type {}",
                 array.data_type()
-            )
+            ))
         })
     }
 
     fn check_no_nulls(&self, column: &str, array: &dyn Array) -> Result<()> {
         if array.null_count() > 0 {
-            bail!("{}: column {column} must not contain nulls", self.name);
+            return Err(self.invalid(format!("column {column} must not contain nulls")));
         }
         Ok(())
     }

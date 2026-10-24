@@ -133,8 +133,13 @@ fn rejects_dangling_references() {
     let mut recording = example();
     recording.stacks[1] = vec![5];
     recording.write(&dir).unwrap();
-    let error = format!("{:#}", Recording::read(&dir).unwrap_err());
-    assert!(error.contains("stack 1 refers to frame 5"), "{error}");
+    match Recording::read(&dir).unwrap_err() {
+        Error::Invalid { path, reason } => {
+            assert_eq!(path, dir);
+            assert!(reason.contains("stack 1 refers to frame 5"), "{reason}");
+        }
+        error => panic!("{error}"),
+    }
 }
 
 #[test]
@@ -142,8 +147,8 @@ fn rejects_unfinished_recordings() {
     let dir = scratch("unfinished");
     example().write(&dir).unwrap();
     fs::remove_file(dir.join("manifest.json")).unwrap();
-    let error = format!("{:#}", Recording::read(&dir).unwrap_err());
-    assert!(error.contains("did not finish"), "{error}");
+    let error = Recording::read(&dir).unwrap_err();
+    assert!(matches!(error, Error::NotARecording(_)), "{error}");
 }
 
 #[test]
@@ -152,6 +157,9 @@ fn rejects_other_format_versions() {
     let mut recording = example();
     recording.manifest.format_version = FORMAT_VERSION + 1;
     recording.write(&dir).unwrap();
-    let error = format!("{:#}", Recording::read(&dir).unwrap_err());
-    assert!(error.contains("format version"), "{error}");
+    let error = Recording::read(&dir).unwrap_err();
+    assert!(
+        matches!(error, Error::FormatVersion { found, .. } if found == FORMAT_VERSION + 1),
+        "{error}"
+    );
 }

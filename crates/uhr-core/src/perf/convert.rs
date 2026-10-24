@@ -3,7 +3,6 @@ use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
 
-use anyhow::{Context, Result, bail};
 use linux_perf_data::linux_perf_event_reader::constants::{
     PERF_CONTEXT_KERNEL, PERF_CONTEXT_MAX, PERF_CONTEXT_USER,
 };
@@ -13,6 +12,7 @@ use linux_perf_data::linux_perf_event_reader::{
 };
 use linux_perf_data::{PerfFileReader, PerfFileRecord};
 
+use super::{Error, Result, io_error};
 use crate::recording::{
     Clock, Collector, Exit, FORMAT_VERSION, Frame, Manifest, Mapping, MissingSignal, Mode, Origin,
     Recording, Sample, Signal, Stream, StreamCoverage, Target, Thread, ThreadName, Unwinding,
@@ -35,42 +35,47 @@ const KNOWN_BIASES: [&str; 2] = [
 ];
 
 pub(super) fn convert(input: Input) -> Result<Recording> {
-    let file = File::open(input.perf_data)
-        .with_context(|| format!("opening {}", input.perf_data.display()))?;
+    let file = File::open(input.perf_data).map_err(io_error("opening", input.perf_data))?;
     let PerfFileReader {
         mut perf_file,
         mut record_iter,
-    } = PerfFileReader::parse_file(BufReader::new(file)).context("parsing perf.data")?;
+    } = PerfFileReader::parse_file(BufReader::new(file)).map_err(Error::PerfData)?;
 
     let [attributes] = perf_file.event_attributes() else {
-        bail!(
+        return Err(unexpected(format!(
             "expected one perf event, found {}",
             perf_file.event_attributes().len()
-        );
+        )));
     };
     let attr = attributes.attributes();
     if !matches!(
         attr.type_,
         PerfEventType::Software(SoftwareCounterType::CpuClock)
     ) {
-        bail!("expected a cpu-clock event, found {:?}", attr.type_);
+        return Err(unexpected(format!(
+            "expected a cpu-clock event, found {:?}",
+            attr.type_
+        )));
     }
     if !matches!(attr.clock, PerfClock::ClockId(ClockId::Monotonic)) {
-        bail!(
+        return Err(unexpected(format!(
             "expected CLOCK_MONOTONIC timestamps, found {:?}",
             attr.clock
-        );
+        )));
     }
     let SamplingPolicy::Frequency(frequency_hz) = attr.sampling_policy else {
-        bail!(
+        return Err(unexpected(format!(
             "expected sampling by frequency, found {:?}",
             attr.sampling_policy
-        );
+        )));
     };
     let kernel_excluded = attr.flags.contains(AttrFlags::EXCLUDE_KERNEL);
 
     let mut state = State::new(input.max_stack_depth);
-    while let Some(record) = record_iter.next_record(&mut perf_file)? {
+    while let Some(record) = record_iter
+        .next_record(&mut perf_file)
+        .map_err(Error::PerfData)?
+    {
         let PerfFileRecord::EventRecord { record, .. } = record else {
             continue;
         };
@@ -80,7 +85,10 @@ pub(super) fn convert(input: Input) -> Result<Recording> {
             state.start_ns = Some(state.start_ns.map_or(time, |t| t.min(time)));
             state.end_ns = Some(state.end_ns.map_or(time, |t| t.max(time)));
         }
-        match record.parse()? {
+        let parsed = record
+            .parse()
+            .map_err(io_error("parsing a record in", input.perf_data))?;
+        match parsed {
             EventRecord::Sample(sample) => state.sample(&sample)?,
             EventRecord::Mmap(m) => state.mmap(Mmap {
                 pid: m.pid,
@@ -340,7 +348,7 @@ impl State {
         let (Some(pid), Some(tid), Some(time_ns), Some(period)) =
             (sample.pid, sample.tid, sample.timestamp, sample.period)
         else {
-            bail!("sample without pid, tid, time or period");
+            return Err(unexpected("sample without pid, tid, time or period".into()));
         };
         let (pid, tid) = (id(pid)?, id(tid)?);
         self.thread(pid, tid);
@@ -376,7 +384,7 @@ impl State {
             }
         }
         if stack.is_empty() {
-            bail!("sample at {time_ns} has no address");
+            return Err(unexpected(format!("sample at {time_ns} has no address")));
         }
         if stack.len() >= self.max_stack_depth as usize {
             self.samples_at_stack_limit += 1;
@@ -484,8 +492,12 @@ fn intern<T: Clone + Eq + std::hash::Hash>(
     })
 }
 
+fn unexpected(what: String) -> Error {
+    Error::UnexpectedData(what)
+}
+
 fn id(value: i32) -> Result<u32> {
-    u32::try_from(value).with_context(|| format!("unexpected negative pid or tid {value}"))
+    u32::try_from(value).map_err(|_| unexpected(format!("unexpected negative pid or tid {value}")))
 }
 
 fn lossy(bytes: &[u8]) -> String {
