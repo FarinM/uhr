@@ -28,6 +28,8 @@ uhr doctor                                 # what this host is missing, and the 
 uhr record -o rec -- ./my-program args     # record CPU samples and resolve names
 uhr query rec --group-by function          # top functions, with coverage
 uhr query rec --group-by function --json   # the same, for agents
+uhr query rec --group-by function --thread 'worker-*' --mode kernel --from 1s
+                                           # only some samples
 ```
 
 Full stacks need frame pointers. `uhr doctor` lists the build flags.

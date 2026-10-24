@@ -4,6 +4,7 @@ use std::path::Path;
 use serde::Serialize;
 
 use crate::coverage::Coverage;
+use crate::filter::Filter;
 use crate::recording::{self, Origin, Recording};
 use crate::symbols::{FrameName, Source, SourceStatus, Symbols};
 
@@ -17,11 +18,14 @@ pub enum GroupBy {
 pub struct Query {
     pub group_by: GroupBy,
     pub top: usize,
+    pub filter: Filter,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct QueryResult {
     pub group_by: GroupBy,
+    pub filter: Filter,
+    /// Samples that passed the filter.
     pub samples: u64,
     pub cpu_ns: u64,
     /// Sorted by self time, then total time.
@@ -76,7 +80,7 @@ pub fn query(dir: &Path, query: &Query) -> Result<QueryResult, recording::Error>
 
 pub fn run(recording: &Recording, symbols: Option<&Symbols>, query: &Query) -> QueryResult {
     match query.group_by {
-        GroupBy::Function => by_function(recording, symbols, query.top),
+        GroupBy::Function => by_function(recording, symbols, query),
     }
 }
 
@@ -87,7 +91,7 @@ struct FunctionKey {
     address: Option<u32>,
 }
 
-fn by_function(recording: &Recording, symbols: Option<&Symbols>, top: usize) -> QueryResult {
+fn by_function(recording: &Recording, symbols: Option<&Symbols>, query: &Query) -> QueryResult {
     // Mapping ids change across processes and reloads; build ids distinguish
     // different binaries that occupied the same path.
     let mut module_ids: HashMap<(&str, Option<&str>), u32> = HashMap::new();
@@ -122,8 +126,10 @@ fn by_function(recording: &Recording, symbols: Option<&Symbols>, top: usize) -> 
         .collect();
 
     let mut stack_cpu_ns = vec![0u64; recording.stacks.len()];
-    for sample in &recording.samples {
+    let mut samples = 0;
+    for sample in query.filter.samples(recording) {
         stack_cpu_ns[sample.stack as usize] += sample.cpu_ns;
+        samples += 1;
     }
     let cpu_ns: u64 = stack_cpu_ns.iter().sum();
 
@@ -185,8 +191,8 @@ fn by_function(recording: &Recording, symbols: Option<&Symbols>, top: usize) -> 
             .then_with(|| a.build_id.cmp(&b.build_id))
             .then_with(|| a.function_address.cmp(&b.function_address))
     });
-    let rows_omitted = rows.len().saturating_sub(top);
-    rows.truncate(top);
+    let rows_omitted = rows.len().saturating_sub(query.top);
+    rows.truncate(query.top);
 
     let mut unnamed_by_origin = BTreeMap::new();
     let mut named_ns = 0;
@@ -223,7 +229,8 @@ fn by_function(recording: &Recording, symbols: Option<&Symbols>, top: usize) -> 
 
     QueryResult {
         group_by: GroupBy::Function,
-        samples: recording.samples.len() as u64,
+        filter: query.filter.clone(),
+        samples,
         cpu_ns,
         rows,
         rows_omitted,

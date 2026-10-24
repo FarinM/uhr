@@ -1,3 +1,4 @@
+use uhr_core::filter::Filter;
 use uhr_core::query::{GroupBy, Query, run};
 use uhr_core::recording::*;
 use uhr_core::symbols::{FrameName, Source, SourceStatus, Symbols};
@@ -100,6 +101,7 @@ fn query(top: usize) -> Query {
     Query {
         group_by: GroupBy::Function,
         top,
+        filter: Filter::default(),
     }
 }
 

@@ -6,6 +6,7 @@ use crate::recording::{Collector, MissingSignal, Recording, Signal, Unwinding};
 /// result carries it.
 #[derive(Debug, Clone, Serialize)]
 pub struct Coverage {
+    /// This and the next two count the whole recording, whatever the filter.
     pub lost_events: u64,
     pub throttle_events: u64,
     pub samples_at_stack_limit: u64,

@@ -2,14 +2,16 @@ use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use anyhow::{Context, Result};
-use clap::{Parser, Subcommand, ValueEnum};
+use anyhow::{Context, Result, bail};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::LevelFilter;
 use uhr_core::coverage::Coverage;
 use uhr_core::doctor::{self, Report, Status};
+use uhr_core::filter::Filter;
 use uhr_core::perf::{self, RecordOptions};
 use uhr_core::query::{self, GroupBy, Query, QueryResult, Row};
+use uhr_core::recording::Mode;
 use uhr_core::symbols;
 
 #[derive(Parser)]
@@ -57,12 +59,87 @@ enum Command {
         top: usize,
         #[arg(long)]
         json: bool,
+        #[command(flatten)]
+        filter: FilterArgs,
     },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
 enum GroupByArg {
     Function,
+}
+
+#[derive(Args)]
+#[command(next_help_heading = "Filters (repeat a flag to allow several values)")]
+struct FilterArgs {
+    /// Only samples of this process
+    #[arg(long = "pid", value_name = "PID")]
+    pids: Vec<u32>,
+    /// Only samples of this thread id
+    #[arg(long = "tid", value_name = "TID")]
+    tids: Vec<u32>,
+    /// Only samples taken while the thread's name matched. `*` matches any
+    /// characters, `?` one character
+    #[arg(long = "thread", value_name = "PATTERN")]
+    thread_names: Vec<String>,
+    /// Only samples in this CPU mode
+    #[arg(long = "mode", value_name = "MODE", value_enum)]
+    modes: Vec<ModeArg>,
+    /// Only samples from this offset into the recording on, such as 1.5s or
+    /// 200ms
+    #[arg(long, value_name = "OFFSET", value_parser = parse_offset)]
+    from: Option<u64>,
+    /// Only samples before this offset into the recording
+    #[arg(long, value_name = "OFFSET", value_parser = parse_offset)]
+    to: Option<u64>,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum ModeArg {
+    User,
+    Kernel,
+    Unknown,
+}
+
+impl FilterArgs {
+    fn into_filter(self) -> Result<Filter> {
+        if let (Some(from), Some(to)) = (self.from, self.to)
+            && from >= to
+        {
+            bail!("--from must be before --to");
+        }
+        Ok(Filter {
+            pids: self.pids,
+            tids: self.tids,
+            thread_names: self.thread_names,
+            modes: self
+                .modes
+                .into_iter()
+                .map(|mode| match mode {
+                    ModeArg::User => Mode::User,
+                    ModeArg::Kernel => Mode::Kernel,
+                    ModeArg::Unknown => Mode::Unknown,
+                })
+                .collect(),
+            from_ns: self.from,
+            to_ns: self.to,
+        })
+    }
+}
+
+/// A duration with a unit, in nanoseconds.
+fn parse_offset(text: &str) -> Result<u64, String> {
+    let units = [("ns", 1.0), ("us", 1e3), ("ms", 1e6), ("s", 1e9)];
+    let Some((number, scale)) = units
+        .iter()
+        .find_map(|&(unit, scale)| text.strip_suffix(unit).map(|n| (n, scale)))
+    else {
+        return Err("needs a unit: ns, us, ms or s, as in 1.5s".into());
+    };
+    match number.parse::<f64>() {
+        Ok(value) if value.is_finite() && value >= 0.0 => Ok((value * scale).round() as u64),
+        _ => Err(format!("{number:?} is not a non-negative number")),
+    }
 }
 
 fn main() -> ExitCode {
@@ -81,8 +158,9 @@ fn main() -> ExitCode {
             recording,
             group_by,
             top,
+            filter,
             json,
-        } => run_query(&recording, group_by, top, json),
+        } => run_query(&recording, group_by, top, filter, json),
     };
     result.unwrap_or_else(|error| {
         tracing::error!("{error:#}");
@@ -172,12 +250,19 @@ fn run_symbolize(recording: &Path) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-fn run_query(recording: &Path, group_by: GroupByArg, top: usize, json: bool) -> Result<ExitCode> {
+fn run_query(
+    recording: &Path,
+    group_by: GroupByArg,
+    top: usize,
+    filter: FilterArgs,
+    json: bool,
+) -> Result<ExitCode> {
     let query = Query {
         group_by: match group_by {
             GroupByArg::Function => GroupBy::Function,
         },
         top,
+        filter: filter.into_filter()?,
     };
     let result = query::query(recording, &query)?;
     if json {
@@ -196,6 +281,9 @@ fn write_query(out: &mut impl Write, result: &QueryResult) -> io::Result<()> {
         result.samples,
         result.cpu_ns as f64 / 1e9
     )?;
+    if !result.filter.is_empty() {
+        writeln!(out, "filter: {}\n", describe_filter(&result.filter))?;
+    }
     writeln!(out, "{:>7} {:>7}  function", "self", "total")?;
     for row in &result.rows {
         writeln!(
@@ -263,6 +351,35 @@ fn write_coverage(out: &mut impl Write, coverage: &Coverage) -> io::Result<()> {
         writeln!(out, "  bias: {bias}")?;
     }
     Ok(())
+}
+
+fn describe_filter(filter: &Filter) -> String {
+    let mut parts = Vec::new();
+    parts.extend(filter.pids.iter().map(|pid| format!("pid {pid}")));
+    parts.extend(filter.tids.iter().map(|tid| format!("tid {tid}")));
+    parts.extend(
+        filter
+            .thread_names
+            .iter()
+            .map(|name| format!("thread {name}")),
+    );
+    parts.extend(
+        filter
+            .modes
+            .iter()
+            .map(|mode| format!("mode {}", mode.as_str())),
+    );
+    if let Some(from) = filter.from_ns {
+        parts.push(format!("from {}", seconds(from)));
+    }
+    if let Some(to) = filter.to_ns {
+        parts.push(format!("to {}", seconds(to)));
+    }
+    parts.join(", ")
+}
+
+fn seconds(ns: u64) -> String {
+    format!("{:.3}s", ns as f64 / 1e9)
 }
 
 fn function_name(row: &Row) -> String {

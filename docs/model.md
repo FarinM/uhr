@@ -132,7 +132,8 @@ Memory and time link up. Page faults are attributed to stacks, and time in
 - Identity: tid, name history (kernel name, pthread name, runtime thread name),
   and role when known (main, GC, JIT compiler, pool worker, I/O).
 - Every query can filter or group by a thread or a thread group (name pattern,
-  role).
+  role). A name pattern matches the name the thread had when the observation
+  was made, so it follows renames and exec.
 - Blocked intervals record why the thread blocked and, when available, which
   thread woke it. That lets lock contention be shown as a holder and its
   waiters.
