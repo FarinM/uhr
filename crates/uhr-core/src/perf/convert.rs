@@ -375,11 +375,27 @@ impl State {
         } else {
             m.path
         };
+        let start = m.start;
+        let mut end = m.start.saturating_add(m.len);
+        if m.kernel {
+            // perf gives a module the start of its code and its total size,
+            // but its data can lie elsewhere, so ranges overlap. A module's
+            // code ends before the next one's starts.
+            for &id in &self.kernel_mappings {
+                let other = &mut self.mappings[id as usize];
+                if other.start < start && start < other.end {
+                    other.end = start;
+                }
+                if start < other.start && other.start < end {
+                    end = other.start;
+                }
+            }
+        }
         let mapping_id = self.mappings.len() as u32;
         self.mappings.push(Mapping {
             pid,
-            start: m.start,
-            end: m.start.saturating_add(m.len),
+            start,
+            end,
             file_offset: m.file_offset,
             path,
             build_id: m.build_id,
@@ -673,6 +689,47 @@ mod tests {
         assert_eq!(state.mappings[0].path, KERNEL);
         let frame = state.frame(7, ChainContext::Kernel, 0xffff_0010, false);
         assert_eq!(state.frames[frame as usize].mapping, Some(0));
+    }
+
+    #[test]
+    fn ends_kernel_modules_where_the_next_one_starts() {
+        let module = |start, len, path: &str| Mmap {
+            pid: -1,
+            start,
+            len,
+            file_offset: 0,
+            kernel: true,
+            executable: false,
+            path: path.into(),
+            build_id: None,
+            time: None,
+        };
+        let mut state = State::new(127);
+        // As this host's /proc/modules gives them, and in either order.
+        for m in [
+            module(0xffffffffc051c000, 0x57000, "[aesni_intel]"),
+            module(0xffffffffc0572000, 0x5000, "[xhci_pci_renesas]"),
+            module(0xffffffffc05a0000, 0x2000, "[libahci]"),
+            module(0xffffffffc059e000, 0x5000, "[raid0]"),
+        ] {
+            state.mmap(m).unwrap();
+        }
+        let ranges: Vec<_> = state
+            .mappings
+            .iter()
+            .map(|m| (m.path.as_str(), m.start, m.end))
+            .collect();
+        assert_eq!(
+            ranges,
+            [
+                ("[aesni_intel]", 0xffffffffc051c000, 0xffffffffc0572000),
+                ("[xhci_pci_renesas]", 0xffffffffc0572000, 0xffffffffc0577000),
+                ("[libahci]", 0xffffffffc05a0000, 0xffffffffc05a2000),
+                ("[raid0]", 0xffffffffc059e000, 0xffffffffc05a0000),
+            ]
+        );
+        let frame = state.frame(7, ChainContext::Kernel, 0xffffffffc0572010, false);
+        assert_eq!(state.frames[frame as usize].mapping, Some(1));
     }
 
     #[test]

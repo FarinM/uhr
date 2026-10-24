@@ -87,7 +87,7 @@ Each stream has:
 |---|---|---|
 | `mapping_id` | uint32 | |
 | `pid` | uint32, nullable | Null for kernel mappings |
-| `start`, `end` | uint64 | Address range, end exclusive |
+| `start`, `end` | uint64 | Address range, end exclusive. Kernel mappings end where the next one starts: perf gives a module the start of its code and its total size, but its data can lie elsewhere |
 | `file_offset` | uint64 | File offset of `start` |
 | `path` | string | File path, or a name such as `[vdso]` or `//anon`. `[kernel]` for the kernel, and the module name in brackets for a kernel module, as in `[ext4]` |
 | `build_id` | string, nullable | Hex. Null if the kernel could not read it |
