@@ -16,8 +16,9 @@ use linux_perf_data::{PerfFileReader, PerfFileRecord};
 use super::unwind::Unwinding as UserUnwinding;
 use super::{Error, Result, io_error};
 use crate::recording::{
-    Clock, Collector, Exit, FORMAT_VERSION, Frame, Manifest, Mapping, MissingSignal, Mode, Origin,
-    Recording, Sample, Signal, Stream, StreamCoverage, Target, Thread, ThreadName, Unwinding,
+    Clock, Collector, Exit, FORMAT_VERSION, Frame, KERNEL, Manifest, Mapping, MissingSignal, Mode,
+    Origin, Recording, Sample, Signal, Stream, StreamCoverage, Target, Thread, ThreadName,
+    Unwinding,
 };
 
 pub(super) struct Input<'a> {
@@ -369,13 +370,18 @@ impl State {
             return Ok(());
         }
         let pid = if m.kernel { None } else { Some(id(m.pid)?) };
+        let path = if m.kernel {
+            kernel_mapping_path(m.path)
+        } else {
+            m.path
+        };
         let mapping_id = self.mappings.len() as u32;
         self.mappings.push(Mapping {
             pid,
             start: m.start,
             end: m.start.saturating_add(m.len),
             file_offset: m.file_offset,
-            path: m.path,
+            path,
             build_id: m.build_id,
             time_ns: m.time,
         });
@@ -577,6 +583,25 @@ fn user_regs_abi(record: &RawEventRecord, sample: &SampleRecord) -> Result<u64> 
     }
 }
 
+/// `[kernel]` for the kernel, and the module's name in brackets for a
+/// module. perf names the kernel after the file it reads its symbols from,
+/// and a module `[name]` or, when it finds one, after the module's file,
+/// whose name the kernel turns into the module's by changing `-` to `_`.
+fn kernel_mapping_path(path: String) -> String {
+    if path.starts_with("[kernel.kallsyms]") {
+        return KERNEL.to_owned();
+    }
+    let file = path.rsplit('/').next().unwrap_or_default();
+    let module = [".ko", ".ko.gz", ".ko.xz", ".ko.zst"]
+        .iter()
+        .find_map(|suffix| file.strip_suffix(suffix))
+        .filter(|_| path.starts_with('/'));
+    match module {
+        Some(name) => format!("[{}]", name.replace('-', "_")),
+        None => path,
+    }
+}
+
 /// Anonymous executable memory is usually JIT code and has no file to read
 /// symbols from. Some of its names look like absolute paths. `[vdso]` is an
 /// ELF image the kernel maps into every process.
@@ -645,8 +670,26 @@ mod tests {
             .unwrap();
         state.mmap(mmap(7, 0x1000, "/data", false, false)).unwrap();
         assert_eq!(state.mappings.len(), 1);
+        assert_eq!(state.mappings[0].path, KERNEL);
         let frame = state.frame(7, ChainContext::Kernel, 0xffff_0010, false);
         assert_eq!(state.frames[frame as usize].mapping, Some(0));
+    }
+
+    #[test]
+    fn names_kernel_modules_as_the_kernel_does() {
+        let crypto = "/lib/modules/6.8.0-139-generic/kernel/arch/x86/crypto";
+        for (path, name) in [
+            ("[kernel.kallsyms]_text", "[kernel]"),
+            ("[ghash_clmulni_intel]", "[ghash_clmulni_intel]"),
+            (
+                &format!("{crypto}/ghash-clmulni-intel.ko.zst"),
+                "[ghash_clmulni_intel]",
+            ),
+            ("/lib/modules/6.8.0/kernel/fs/ext4/ext4.ko", "[ext4]"),
+            ("/lib/modules/6.8.0/kernel/fs/xfs/xfs.ko.xz", "[xfs]"),
+        ] {
+            assert_eq!(kernel_mapping_path(path.into()), name, "{path}");
+        }
     }
 
     #[test]

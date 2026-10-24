@@ -89,7 +89,7 @@ Each stream has:
 | `pid` | uint32, nullable | Null for kernel mappings |
 | `start`, `end` | uint64 | Address range, end exclusive |
 | `file_offset` | uint64 | File offset of `start` |
-| `path` | string | File path, or a name such as `[vdso]` or `//anon` |
+| `path` | string | File path, or a name such as `[vdso]` or `//anon`. `[kernel]` for the kernel, and the module name in brackets for a kernel module, as in `[ext4]` |
 | `build_id` | string, nullable | Hex. Null if the kernel could not read it |
 | `time_ns` | uint64, nullable | When it was mapped. Null if before the recording |
 

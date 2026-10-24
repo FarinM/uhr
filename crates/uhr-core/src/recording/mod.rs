@@ -144,6 +144,10 @@ pub struct ThreadName {
     pub name: String,
 }
 
+/// The path of the kernel's own mapping. A module's is its name in
+/// brackets, as in `[ext4]`.
+pub const KERNEL: &str = "[kernel]";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Mapping {
     /// `None` for kernel mappings.
