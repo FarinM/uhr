@@ -42,7 +42,7 @@ fn doctor_keeps_its_exit_code_when_stdout_is_closed() {
 fn record_finishes_when_stderr_is_closed() {
     let dir = common::scratch("record_with_closed_stderr");
     let program = dir.join("cpu_bound");
-    common::compile(&program, "-O2");
+    common::compile("cpu_bound", &program, "-O2");
     let recording = dir.join("rec");
     // The target writes to stderr itself, so this fails on any host, not
     // only on those where perf prints a warning.
@@ -82,7 +82,7 @@ fn record_finishes_when_stderr_is_closed() {
 fn query_succeeds_when_stdout_is_closed() {
     let dir = common::scratch("query_with_closed_stdout");
     let program = dir.join("cpu_bound");
-    common::compile(&program, "-O2");
+    common::compile("cpu_bound", &program, "-O2");
     let recording = dir.join("rec");
     let recording = recording.to_str().unwrap();
     let record = uhr(

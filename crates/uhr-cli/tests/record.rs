@@ -33,7 +33,7 @@ fn record(recording: &Path, extra: &[&str], target: &[&str]) -> Output {
 fn records_the_frequency_perf_actually_used() {
     let dir = common::scratch("records_the_actual_frequency");
     let program = dir.join("cpu_bound");
-    common::compile(&program, "-O2");
+    common::compile("cpu_bound", &program, "-O2");
     let recording = dir.join("rec");
     // Far above any kernel's sampling limit, so perf has to lower it.
     let output = record(
@@ -55,7 +55,7 @@ fn records_the_frequency_perf_actually_used() {
 fn an_interrupt_makes_the_exit_status_unknown() {
     let dir = common::scratch("interrupt_makes_exit_unknown");
     let program = dir.join("cpu_bound");
-    common::compile(&program, "-O2");
+    common::compile("cpu_bound", &program, "-O2");
     let recording = dir.join("rec");
     let mut uhr = Command::new(common::UHR)
         .arg("record")

@@ -4,21 +4,11 @@
 mod common;
 
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::Command;
 
 use serde_json::Value;
 
-use common::{compile, scratch};
-
-fn uhr(args: &[&str]) -> Output {
-    let output = Command::new(common::UHR).args(args).output().unwrap();
-    assert!(
-        output.status.success(),
-        "uhr {args:?} failed:\n{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    output
-}
+use common::{compile, scratch, uhr};
 
 fn query(recording: &Path) -> Value {
     let output = uhr(&[
@@ -50,7 +40,7 @@ fn share(result: &Value, function: &str, kind: &str) -> f64 {
 fn finds_the_hot_function_with_its_share() {
     let dir = scratch("finds_the_hot_function");
     let program = dir.join("cpu_bound");
-    compile(&program, "-O2");
+    compile("cpu_bound", &program, "-O2");
     let recording = dir.join("rec");
     uhr(&[
         "record",
@@ -84,7 +74,7 @@ fn finds_the_hot_function_with_its_share() {
 fn resolves_symbols_after_recording_and_rejects_rebuilt_binaries() {
     let dir = scratch("resolves_symbols_later");
     let program = dir.join("cpu_bound");
-    compile(&program, "-O2");
+    compile("cpu_bound", &program, "-O2");
     let recording = dir.join("rec");
     let recording = recording.to_str().unwrap();
     uhr(&[
@@ -107,7 +97,7 @@ fn resolves_symbols_after_recording_and_rejects_rebuilt_binaries() {
     assert!(row(&result, "hot").is_some());
 
     // A different build at the same path has a different build-id.
-    compile(&program, "-O1");
+    compile("cpu_bound", &program, "-O1");
     uhr(&["symbolize", recording]);
     let result = query(Path::new(recording));
     assert!(row(&result, "hot").is_none());
@@ -124,7 +114,7 @@ fn resolves_symbols_after_recording_and_rejects_rebuilt_binaries() {
 fn placeholder_names_do_not_count_as_named() {
     let dir = scratch("placeholder_names");
     let program = dir.join("stripped");
-    compile(&program, "-O2");
+    compile("cpu_bound", &program, "-O2");
     let status = Command::new("strip").arg(&program).status().unwrap();
     assert!(status.success());
     let recording = dir.join("rec");
