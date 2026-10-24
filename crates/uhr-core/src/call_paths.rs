@@ -5,7 +5,7 @@ use serde::Serialize;
 
 use crate::coverage::{Coverage, SymbolCoverage};
 use crate::filter::Filter;
-use crate::functions::{Function, Functions};
+use crate::functions::{self, Function, Functions};
 use crate::recording::{self, Collector, Origin, Recording, Unwinding};
 use crate::symbols::Symbols;
 
@@ -24,16 +24,8 @@ pub struct Query {
 pub enum Error {
     #[error(transparent)]
     Recording(#[from] recording::Error),
-    #[error("the recording has no function names or ids yet: run `uhr symbolize`")]
-    NotSymbolized,
-    #[error("no function in the samples has the id or name {0:?}")]
-    NotFound(String),
-    #[error(
-        "{} functions are named {name:?}. Pass one of their ids: {}",
-        .ids.len(),
-        .ids.join(", ")
-    )]
-    Ambiguous { name: String, ids: Vec<String> },
+    #[error(transparent)]
+    Function(#[from] functions::Error),
 }
 
 /// Who calls a function and what it calls, as trees from the function out.
@@ -116,7 +108,7 @@ pub fn run(
     query: &Query,
 ) -> Result<CallPaths, Error> {
     let functions = Functions::new(recording, symbols);
-    let target = select(&functions, &query.function, symbols.is_some())?;
+    let target = functions.select(&query.function)?;
 
     let mut stack_cpu_ns = vec![0u64; recording.stacks.len()];
     let mut samples = 0;
@@ -226,30 +218,6 @@ pub fn run(
             recording: recording_coverage,
         },
     })
-}
-
-fn select(functions: &Functions, wanted: &str, symbolized: bool) -> Result<u32, Error> {
-    if !symbolized {
-        return Err(Error::NotSymbolized);
-    }
-    let all = || (0..functions.len() as u32).map(|id| (id, functions.get(id)));
-    if let Some((id, _)) = all().find(|(_, f)| f.id.as_deref() == Some(wanted)) {
-        return Ok(id);
-    }
-    let named: Vec<_> = all()
-        .filter(|(_, f)| f.name.as_deref() == Some(wanted))
-        .collect();
-    match named[..] {
-        [] => Err(Error::NotFound(wanted.to_owned())),
-        [(id, _)] => Ok(id),
-        _ => Err(Error::Ambiguous {
-            name: wanted.to_owned(),
-            ids: named
-                .iter()
-                .map(|(_, f)| f.id.clone().unwrap_or_else(|| "<no id>".into()))
-                .collect(),
-        }),
-    }
 }
 
 /// Paths as a prefix tree. Node 0 is the root, the selected function.

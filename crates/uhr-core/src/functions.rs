@@ -54,6 +54,21 @@ impl Module<'_> {
 
 type Key<'a> = (Origin, Option<Module<'a>>, Option<u32>);
 
+/// Why no single function matched what was asked for.
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error("the recording has no function names or ids yet: run `uhr symbolize`")]
+    NotSymbolized,
+    #[error("no function in the samples has the id or name {0:?}")]
+    NotFound(String),
+    #[error(
+        "{} functions are named {name:?}. Pass one of their ids: {}",
+        .ids.len(),
+        .ids.join(", ")
+    )]
+    Ambiguous { name: String, ids: Vec<String> },
+}
+
 /// The frames of a recording, grouped into functions by build-id (or path
 /// without one) and function start. Mapping ids change across processes
 /// and reloads, and build-ids tell apart different binaries at the same
@@ -62,6 +77,7 @@ pub(crate) struct Functions {
     /// The function of each frame.
     pub(crate) of_frame: Vec<u32>,
     functions: Vec<Function>,
+    symbolized: bool,
 }
 
 impl Functions {
@@ -105,6 +121,32 @@ impl Functions {
         Self {
             of_frame,
             functions,
+            symbolized: symbols.is_some(),
+        }
+    }
+
+    /// The function with the id `wanted`, or the only one named `wanted`.
+    pub(crate) fn select(&self, wanted: &str) -> Result<u32, Error> {
+        if !self.symbolized {
+            return Err(Error::NotSymbolized);
+        }
+        let all = || (0..self.len() as u32).map(|id| (id, self.get(id)));
+        if let Some((id, _)) = all().find(|(_, f)| f.id.as_deref() == Some(wanted)) {
+            return Ok(id);
+        }
+        let named: Vec<_> = all()
+            .filter(|(_, f)| f.name.as_deref() == Some(wanted))
+            .collect();
+        match named[..] {
+            [] => Err(Error::NotFound(wanted.to_owned())),
+            [(id, _)] => Ok(id),
+            _ => Err(Error::Ambiguous {
+                name: wanted.to_owned(),
+                ids: named
+                    .iter()
+                    .map(|(_, f)| f.id.clone().unwrap_or_else(|| "<no id>".into()))
+                    .collect(),
+            }),
         }
     }
 

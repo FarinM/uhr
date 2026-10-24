@@ -1,5 +1,6 @@
 use uhr_core::call_paths::{CallPaths, Error, Node, Omitted, Query, run};
 use uhr_core::filter::Filter;
+use uhr_core::functions;
 use uhr_core::recording::*;
 use uhr_core::symbols::{FrameName, Symbols};
 
@@ -262,16 +263,19 @@ fn selects_by_id_or_unique_name() {
     let recording = recording();
     let error = |name: &str| run(&recording, Some(&symbols()), &query(name, 3, 5)).unwrap_err();
     match error("dup") {
-        Error::Ambiguous { name, ids } => {
+        Error::Function(functions::Error::Ambiguous { name, ids }) => {
             assert_eq!(name, "dup");
             assert_eq!(ids, ["/bin/app+0x70", "/bin/app+0x80"]);
         }
         other => panic!("{other}"),
     }
-    assert!(matches!(error("missing"), Error::NotFound(_)));
+    assert!(matches!(
+        error("missing"),
+        Error::Function(functions::Error::NotFound(_))
+    ));
     assert!(matches!(
         run(&recording, None, &query("spin", 3, 5)),
-        Err(Error::NotSymbolized)
+        Err(Error::Function(functions::Error::NotSymbolized))
     ));
 
     let dup = paths(&query("/bin/app+0x80", 3, 5));
