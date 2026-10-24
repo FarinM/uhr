@@ -197,7 +197,7 @@ fn reports_throttling() {
         },
     });
     let result = run(&recording, Some(&symbols()), &query(10));
-    assert_eq!(result.coverage.throttle_events, 3);
+    assert_eq!(result.coverage.recording.throttle_events, 3);
 }
 
 #[test]

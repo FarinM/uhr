@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::LevelFilter;
+use uhr_core::coverage::Coverage;
 use uhr_core::doctor::{self, Report, Status};
 use uhr_core::perf::{self, RecordOptions};
 use uhr_core::query::{self, GroupBy, Query, QueryResult, Row};
@@ -236,6 +237,10 @@ fn write_query(out: &mut impl Write, result: &QueryResult) -> io::Result<()> {
             detail.unwrap_or_default()
         )?;
     }
+    write_coverage(out, &coverage.recording)
+}
+
+fn write_coverage(out: &mut impl Write, coverage: &Coverage) -> io::Result<()> {
     writeln!(out, "  lost events: {}", coverage.lost_events)?;
     writeln!(out, "  throttle events: {}", coverage.throttle_events)?;
     writeln!(

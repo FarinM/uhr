@@ -3,7 +3,8 @@ use std::path::Path;
 
 use serde::Serialize;
 
-use crate::recording::{self, Collector, MissingSignal, Origin, Recording, Unwinding};
+use crate::coverage::Coverage;
+use crate::recording::{self, Origin, Recording};
 use crate::symbols::{FrameName, Source, SourceStatus, Symbols};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -27,7 +28,7 @@ pub struct QueryResult {
     pub rows: Vec<Row>,
     /// Rows cut by `top`.
     pub rows_omitted: usize,
-    pub coverage: Coverage,
+    pub coverage: QueryCoverage,
 }
 
 /// One function, or the unnamed code of one module.
@@ -54,7 +55,7 @@ pub struct Row {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct Coverage {
+pub struct QueryCoverage {
     /// Share of CPU time whose leaf frame has a name. Placeholders don't
     /// count. `None` without samples.
     pub named_share: Option<f64>,
@@ -63,13 +64,8 @@ pub struct Coverage {
     pub symbolized: bool,
     /// Files whose frames got no names, or names that could not be checked.
     pub symbol_problems: Vec<Source>,
-    pub lost_events: u64,
-    pub throttle_events: u64,
-    pub samples_at_stack_limit: u64,
-    pub missing_signals: Vec<MissingSignal>,
-    /// What this result cannot account for because it was not measured.
-    pub unknown: Vec<String>,
-    pub known_biases: Vec<String>,
+    #[serde(flatten)]
+    pub recording: Coverage,
 }
 
 pub fn query(dir: &Path, query: &Query) -> Result<QueryResult, recording::Error> {
@@ -202,15 +198,19 @@ fn by_function(recording: &Recording, symbols: Option<&Symbols>, top: usize) -> 
         }
     }
 
-    let mut coverage = stream_coverage(recording);
-    coverage.named_share = (cpu_ns > 0).then(|| share(named_ns));
-    coverage.unnamed_by_origin = unnamed_by_origin
-        .into_iter()
-        .map(|(origin, ns)| (origin, share(ns)))
-        .collect();
+    let mut coverage = QueryCoverage {
+        named_share: (cpu_ns > 0).then(|| share(named_ns)),
+        unnamed_by_origin: unnamed_by_origin
+            .into_iter()
+            .map(|(origin, ns)| (origin, share(ns)))
+            .collect(),
+        symbolized: false,
+        symbol_problems: Vec::new(),
+        recording: Coverage::of(recording),
+    };
     if let Some(symbols) = symbols {
         coverage.symbolized = true;
-        coverage.unknown.push(
+        coverage.recording.unknown.push(
             "inline call chains are not expanded; self time is attributed to the enclosing machine function".into(),
         );
         coverage.symbol_problems = symbols
@@ -229,42 +229,4 @@ fn by_function(recording: &Recording, symbols: Option<&Symbols>, top: usize) -> 
         rows_omitted,
         coverage,
     }
-}
-
-fn stream_coverage(recording: &Recording) -> Coverage {
-    let mut coverage = Coverage {
-        named_share: None,
-        unnamed_by_origin: BTreeMap::new(),
-        symbolized: false,
-        symbol_problems: Vec::new(),
-        lost_events: 0,
-        throttle_events: 0,
-        samples_at_stack_limit: 0,
-        missing_signals: Vec::new(),
-        unknown: Vec::new(),
-        known_biases: Vec::new(),
-    };
-    for stream in &recording.manifest.streams {
-        let c = &stream.coverage;
-        coverage.lost_events += c.lost_events;
-        coverage.throttle_events += c.throttle_events;
-        coverage.samples_at_stack_limit += c.samples_at_stack_limit;
-        coverage
-            .missing_signals
-            .extend(stream.missing_signals.iter().cloned());
-        coverage.known_biases.extend(c.known_biases.iter().cloned());
-        if c.overhead_ns.is_none() {
-            coverage
-                .unknown
-                .push(format!("profiler overhead of stream {}", stream.id));
-        }
-        let Collector::Perf { unwinding, .. } = &stream.collector;
-        if *unwinding == Unwinding::FramePointers {
-            coverage.unknown.push(format!(
-                "stacks of stream {} cut short where frame pointers are missing",
-                stream.id
-            ));
-        }
-    }
-    coverage
 }
