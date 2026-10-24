@@ -1,4 +1,5 @@
 mod convert;
+mod unwind;
 
 use std::env;
 use std::ffi::OsString;
@@ -91,6 +92,18 @@ fn io_error(action: &'static str, path: &Path) -> impl FnOnce(io::Error) -> Erro
 pub struct RecordOptions {
     pub command: Vec<String>,
     pub frequency_hz: u64,
+    pub unwind: Unwind,
+}
+
+/// How user stacks are walked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unwind {
+    FramePointers,
+    /// perf copies this many bytes of user stack with each sample, and uhr
+    /// unwinds them with the files' unwind tables after recording.
+    Dwarf {
+        stack_bytes: u32,
+    },
 }
 
 /// Launches `options.command` under `perf record` and writes the recording
@@ -103,6 +116,15 @@ pub fn record(options: &RecordOptions, out: &Path) -> Result<Recording> {
             detail: check.detail.clone(),
             fix: check.fix.clone(),
         });
+    }
+    if let Unwind::Dwarf { .. } = options.unwind {
+        let check = doctor::check_dwarf_unwinding();
+        if check.status != doctor::Status::Ok {
+            return Err(Error::Blocked {
+                detail: check.detail,
+                fix: check.fix,
+            });
+        }
     }
     let Some(program) = options.command.first() else {
         return Err(Error::NoCommand);
@@ -222,15 +244,22 @@ pub(crate) fn perf_args(perf_data: &Path, options: &RecordOptions) -> Vec<OsStri
         "--quiet",
         "--event=cpu-clock",
         &format!("--freq={}", options.frequency_hz),
-        "--call-graph=fp",
         "--sample-cpu",
         "--clockid=CLOCK_MONOTONIC",
         "--buildid-mmap",
-        "--output",
     ]
     .iter()
     .map(OsString::from)
     .collect();
+    match options.unwind {
+        Unwind::FramePointers => args.push("--call-graph=fp".into()),
+        Unwind::Dwarf { stack_bytes } => {
+            args.push(format!("--call-graph=dwarf,{stack_bytes}").into());
+            // The stack copies are most of the data, and compress well.
+            args.push("-z".into());
+        }
+    }
+    args.push("--output".into());
     args.push(perf_data.into());
     args.push("--".into());
     args.extend(options.command.iter().map(OsString::from));

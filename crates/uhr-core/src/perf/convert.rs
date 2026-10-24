@@ -4,14 +4,16 @@ use std::io::BufReader;
 use std::path::Path;
 
 use linux_perf_data::linux_perf_event_reader::constants::{
-    PERF_CONTEXT_KERNEL, PERF_CONTEXT_MAX, PERF_CONTEXT_USER,
+    PERF_CONTEXT_KERNEL, PERF_CONTEXT_MAX, PERF_CONTEXT_USER, PERF_SAMPLE_REGS_ABI_32,
+    PERF_SAMPLE_REGS_ABI_64,
 };
 use linux_perf_data::linux_perf_event_reader::{
-    AttrFlags, ClockId, CpuMode, EventRecord, Mmap2FileId, PerfClock, PerfEventType, SampleRecord,
-    SamplingPolicy, SoftwareCounterType,
+    AttrFlags, ClockId, CpuMode, Endianness, EventRecord, Mmap2FileId, PerfClock, PerfEventType,
+    RawEventRecord, SampleFormat, SampleRecord, SamplingPolicy, SoftwareCounterType,
 };
 use linux_perf_data::{PerfFileReader, PerfFileRecord};
 
+use super::unwind::Unwinding as UserUnwinding;
 use super::{Error, Result, io_error};
 use crate::recording::{
     Clock, Collector, Exit, FORMAT_VERSION, Frame, Manifest, Mapping, MissingSignal, Mode, Origin,
@@ -29,12 +31,12 @@ pub(super) struct Input<'a> {
     pub max_stack_depth: u32,
 }
 
-const KNOWN_BIASES: [&str; 2] = [
-    "cpu-clock samples come from a timer interrupt, so code that runs with interrupts \
-     disabled is under-sampled and samples can land a few instructions late.",
-    "Frame-pointer unwinding cuts stacks short in code built without frame pointers, \
-     and misses the caller of a leaf function that has no frame setup.",
-];
+const TIMER_BIAS: &str = "cpu-clock samples come from a timer interrupt, so code that runs \
+     with interrupts disabled is under-sampled and samples can land a few instructions late.";
+const FRAME_POINTER_BIAS: &str = "Frame-pointer unwinding cuts stacks short in code built \
+     without frame pointers, and misses the caller of a leaf function that has no frame setup.";
+const DWARF_BIAS: &str = "DWARF unwinding falls back to frame pointers in code without unwind \
+     tables, such as JIT code, and stops at the end of each sample's stack copy.";
 
 pub(super) fn convert(input: Input) -> Result<Recording> {
     let file = File::open(input.perf_data).map_err(io_error("opening", input.perf_data))?;
@@ -72,8 +74,15 @@ pub(super) fn convert(input: Input) -> Result<Recording> {
         )));
     };
     let kernel_excluded = attr.flags.contains(AttrFlags::EXCLUDE_KERNEL);
+    let stack_copy_bytes = attr
+        .sample_format
+        .contains(SampleFormat::REGS_USER | SampleFormat::STACK_USER)
+        .then_some(attr.sample_stack_user);
 
     let mut state = State::new(input.max_stack_depth);
+    if stack_copy_bytes.is_some() {
+        state.unwinding = Some(UserUnwinding::new());
+    }
     while let Some(record) = record_iter
         .next_record(&mut perf_file)
         .map_err(Error::PerfData)?
@@ -91,7 +100,7 @@ pub(super) fn convert(input: Input) -> Result<Recording> {
             .parse()
             .map_err(io_error("parsing a record in", input.perf_data))?;
         match parsed {
-            EventRecord::Sample(sample) => state.sample(&sample)?,
+            EventRecord::Sample(sample) => state.sample(&record, &sample)?,
             EventRecord::Mmap(m) => state.mmap(Mmap {
                 pid: m.pid,
                 start: m.address,
@@ -164,7 +173,11 @@ pub(super) fn convert(input: Input) -> Result<Recording> {
             event: "cpu-clock".into(),
             frequency_hz,
             requested_frequency_hz: input.requested_frequency_hz,
-            unwinding: Unwinding::FramePointers,
+            unwinding: match stack_copy_bytes {
+                Some(_) => Unwinding::Dwarf,
+                None => Unwinding::FramePointers,
+            },
+            stack_copy_bytes,
         },
         signals,
         missing_signals,
@@ -174,8 +187,19 @@ pub(super) fn convert(input: Input) -> Result<Recording> {
             throttle_events: state.throttle_events,
             max_stack_depth: input.max_stack_depth,
             samples_at_stack_limit: state.samples_at_stack_limit,
+            samples_cut_at_stack_copy: stack_copy_bytes.map(|_| state.samples_cut_at_stack_copy),
+            samples_not_unwound: stack_copy_bytes.map(|_| state.samples_not_unwound),
             overhead_ns: None,
-            known_biases: KNOWN_BIASES.iter().map(|b| b.to_string()).collect(),
+            known_biases: [
+                TIMER_BIAS,
+                match stack_copy_bytes {
+                    Some(_) => DWARF_BIAS,
+                    None => FRAME_POINTER_BIAS,
+                },
+            ]
+            .iter()
+            .map(|b| b.to_string())
+            .collect(),
         },
     };
 
@@ -246,6 +270,10 @@ struct State {
     lost_events: u64,
     throttle_events: u64,
     samples_at_stack_limit: u64,
+    /// Only for recordings with a stack copy in each sample.
+    unwinding: Option<UserUnwinding>,
+    samples_cut_at_stack_copy: u64,
+    samples_not_unwound: u64,
 }
 
 impl State {
@@ -269,6 +297,9 @@ impl State {
             lost_events: 0,
             throttle_events: 0,
             samples_at_stack_limit: 0,
+            unwinding: None,
+            samples_cut_at_stack_copy: 0,
+            samples_not_unwound: 0,
         }
     }
 
@@ -355,7 +386,7 @@ impl State {
         Ok(())
     }
 
-    fn sample(&mut self, sample: &SampleRecord) -> Result<()> {
+    fn sample(&mut self, record: &RawEventRecord, sample: &SampleRecord) -> Result<()> {
         let (Some(pid), Some(tid), Some(time_ns), Some(period)) =
             (sample.pid, sample.tid, sample.timestamp, sample.period)
         else {
@@ -365,34 +396,49 @@ impl State {
         self.thread(pid, tid);
 
         let mut stack = Vec::new();
-        match &sample.callchain {
-            Some(callchain) if !callchain.is_empty() => {
-                let mut context = ChainContext::Other;
-                let mut first_in_context = true;
-                for address in (0..callchain.len()).filter_map(|i| callchain.get(i)) {
-                    if address >= PERF_CONTEXT_MAX {
-                        context = match address {
-                            PERF_CONTEXT_KERNEL => ChainContext::Kernel,
-                            PERF_CONTEXT_USER => ChainContext::User,
-                            _ => ChainContext::Other,
-                        };
-                        first_in_context = true;
-                        continue;
-                    }
-                    stack.push(self.frame(pid, context, address, !first_in_context));
-                    first_in_context = false;
-                }
-            }
-            _ => {
-                if let Some(ip) = sample.ip {
-                    let context = match sample.cpu_mode {
-                        CpuMode::Kernel => ChainContext::Kernel,
-                        CpuMode::User => ChainContext::User,
+        if let Some(callchain) = &sample.callchain {
+            let mut context = ChainContext::Other;
+            let mut first_in_context = true;
+            for address in (0..callchain.len()).filter_map(|i| callchain.get(i)) {
+                if address >= PERF_CONTEXT_MAX {
+                    context = match address {
+                        PERF_CONTEXT_KERNEL => ChainContext::Kernel,
+                        PERF_CONTEXT_USER => ChainContext::User,
                         _ => ChainContext::Other,
                     };
-                    stack.push(self.frame(pid, context, ip, false));
+                    first_in_context = true;
+                    continue;
                 }
+                stack.push(self.frame(pid, context, address, !first_in_context));
+                first_in_context = false;
             }
+        }
+        // With a stack copy, perf leaves user frames out of the chain.
+        let user = match self.unwinding.as_mut() {
+            Some(unwinding) => {
+                let abi = user_regs_abi(record, sample)?;
+                let ids = self.processes.get(&pid).map_or(&[][..], Vec::as_slice);
+                let room = (self.max_stack_depth as usize).saturating_sub(stack.len());
+                unwinding.unwind(sample, abi, pid, ids, &self.mappings, room)
+            }
+            None => None,
+        };
+        if let Some(user) = user {
+            self.samples_cut_at_stack_copy += u64::from(user.cut);
+            self.samples_not_unwound += u64::from(user.not_unwound);
+            for (address, return_address) in user.frames {
+                stack.push(self.frame(pid, ChainContext::User, address, return_address));
+            }
+        }
+        if stack.is_empty()
+            && let Some(ip) = sample.ip
+        {
+            let context = match sample.cpu_mode {
+                CpuMode::Kernel => ChainContext::Kernel,
+                CpuMode::User => ChainContext::User,
+                _ => ChainContext::Other,
+            };
+            stack.push(self.frame(pid, context, ip, false));
         }
         if stack.is_empty() {
             return Err(unexpected(format!("sample at {time_ns} has no address")));
@@ -474,6 +520,60 @@ impl State {
             let m = &self.mappings[id as usize];
             m.start <= address && address < m.end
         })
+    }
+}
+
+/// The ABI perf recorded the sample's user registers in, which tells 32-bit
+/// code apart. linux-perf-event-reader reads it but does not keep it, so this
+/// finds it in the record and checks the registers after it against the
+/// parsed ones.
+fn user_regs_abi(record: &RawEventRecord, sample: &SampleRecord) -> Result<u64> {
+    let info = &record.parse_info;
+    let format = info.sample_format;
+    // They come before the registers and vary in size, and recordings uhr
+    // makes have none of them.
+    let unsupported = SampleFormat::READ | SampleFormat::RAW | SampleFormat::BRANCH_STACK;
+    if format.intersects(unsupported) {
+        return Err(unexpected(format!(
+            "unexpected sample fields {:?} with a stack copy",
+            format & unsupported
+        )));
+    }
+    let data = record.data.as_slice();
+    let word = |index: usize| {
+        let bytes = data.get(index * 8..index * 8 + 8)?.try_into().ok()?;
+        Some(match info.endian {
+            Endianness::LittleEndian => u64::from_le_bytes(bytes),
+            Endianness::BigEndian => u64::from_be_bytes(bytes),
+        })
+    };
+    let one_word = [
+        SampleFormat::IDENTIFIER,
+        SampleFormat::IP,
+        SampleFormat::TID,
+        SampleFormat::TIME,
+        SampleFormat::ADDR,
+        SampleFormat::ID,
+        SampleFormat::STREAM_ID,
+        SampleFormat::CPU,
+        SampleFormat::PERIOD,
+    ];
+    let at = one_word.iter().filter(|&&f| format.contains(f)).count()
+        + sample.callchain.as_ref().map_or(0, |chain| 1 + chain.len());
+    let abi = word(at);
+    let found = match (abi, &sample.user_regs) {
+        (Some(0), None) => true,
+        (Some(PERF_SAMPLE_REGS_ABI_32 | PERF_SAMPLE_REGS_ABI_64), Some(regs)) => (0..64)
+            .filter(|bit| info.sample_regs_user >> bit & 1 == 1)
+            .enumerate()
+            .all(|(i, register)| word(at + 1 + i) == regs.get(register)),
+        _ => false,
+    };
+    match abi {
+        Some(abi) if found => Ok(abi),
+        _ => Err(unexpected(
+            "the user registers of a sample are not where expected".into(),
+        )),
     }
 }
 
@@ -615,5 +715,68 @@ mod tests {
         );
         let child = &state.threads[&(2, 3)];
         assert_eq!((child.parent_pid, child.parent_tid), (Some(2), Some(2)));
+    }
+
+    /// The ABI perf records for a sample of a recording with a stack copy,
+    /// and the registers BP, SP and IP after it unless the ABI is none.
+    fn user_regs_abi_of(abi: u64) -> Result<u64> {
+        use linux_perf_data::linux_perf_event_reader::constants::{
+            PERF_RECORD_MISC_USER, PERF_REG_X86_BP, PERF_REG_X86_IP, PERF_REG_X86_SP,
+        };
+        use linux_perf_data::linux_perf_event_reader::{
+            BranchSampleFormat, RawData, ReadFormat, RecordIdParseInfo, RecordParseInfo, RecordType,
+        };
+
+        let pid_and_tid = 7 << 32 | 7;
+        let mut words = vec![0x1010, pid_and_tid, 100, 0, 1_000_000];
+        words.extend([2, PERF_CONTEXT_USER, 0x1010]);
+        words.push(abi);
+        if abi != 0 {
+            words.extend([0x7ff0, 0x7fe0, 0x1010]);
+        }
+        words.push(0);
+        let data: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let info = RecordParseInfo {
+            endian: Endianness::LittleEndian,
+            sample_format: SampleFormat::IP
+                | SampleFormat::TID
+                | SampleFormat::TIME
+                | SampleFormat::CPU
+                | SampleFormat::PERIOD
+                | SampleFormat::CALLCHAIN
+                | SampleFormat::REGS_USER
+                | SampleFormat::STACK_USER,
+            branch_sample_format: BranchSampleFormat::empty(),
+            read_format: ReadFormat::empty(),
+            common_data_offset_from_end: None,
+            sample_regs_user: 1 << PERF_REG_X86_BP | 1 << PERF_REG_X86_SP | 1 << PERF_REG_X86_IP,
+            user_regs_count: 3,
+            sample_regs_intr: 0,
+            intr_regs_count: 0,
+            id_parse_info: RecordIdParseInfo {
+                nonsample_record_id_offset_from_end: None,
+                sample_record_id_offset_from_start: None,
+            },
+            nonsample_record_time_offset_from_end: None,
+            sample_record_time_offset_from_start: Some(16),
+        };
+        let record = RawEventRecord::new(
+            RecordType::SAMPLE,
+            PERF_RECORD_MISC_USER,
+            RawData::Single(&data),
+            info,
+        );
+        let EventRecord::Sample(sample) = record.parse().unwrap() else {
+            panic!("not a sample");
+        };
+        user_regs_abi(&record, &sample)
+    }
+
+    #[test]
+    fn reads_the_abi_of_user_registers() {
+        for abi in [0, PERF_SAMPLE_REGS_ABI_32, PERF_SAMPLE_REGS_ABI_64] {
+            assert_eq!(user_regs_abi_of(abi).unwrap(), abi);
+        }
+        assert!(user_regs_abi_of(3).is_err());
     }
 }

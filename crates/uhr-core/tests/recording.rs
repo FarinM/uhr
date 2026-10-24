@@ -29,6 +29,7 @@ fn example() -> Recording {
                     frequency_hz: 999,
                     requested_frequency_hz: 999,
                     unwinding: Unwinding::FramePointers,
+                    stack_copy_bytes: None,
                 },
                 signals: vec![Signal::UserCPUSamples, Signal::UserStacks],
                 missing_signals: [Signal::KernelCPUSamples, Signal::KernelStacks]
@@ -43,6 +44,8 @@ fn example() -> Recording {
                     throttle_events: 0,
                     max_stack_depth: 127,
                     samples_at_stack_limit: 0,
+                    samples_cut_at_stack_copy: None,
+                    samples_not_unwound: None,
                     overhead_ns: None,
                     known_biases: vec!["example bias".into()],
                 },

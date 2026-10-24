@@ -59,6 +59,9 @@ pub enum Collector {
         frequency_hz: u64,
         requested_frequency_hz: u64,
         unwinding: Unwinding,
+        /// Bytes of user stack copied with each sample, as perf used it.
+        /// `None` without DWARF unwinding.
+        stack_copy_bytes: Option<u32>,
     },
 }
 
@@ -66,6 +69,9 @@ pub enum Collector {
 #[serde(rename_all = "snake_case")]
 pub enum Unwinding {
     FramePointers,
+    /// From each sample's copy of the user stack, with the unwind tables of
+    /// the mapped files.
+    Dwarf,
 }
 
 /// CPU samples are split by mode because a sampler can leave one mode out,
@@ -108,6 +114,13 @@ pub struct StreamCoverage {
     /// Stacks longer than this were cut by the kernel.
     pub max_stack_depth: u32,
     pub samples_at_stack_limit: u64,
+    /// Samples whose stack went on past the end of the stack copy, so their
+    /// outer callers are missing. `None` without DWARF unwinding.
+    pub samples_cut_at_stack_copy: Option<u64>,
+    /// Samples of 32-bit code, whose user stacks DWARF unwinding cannot
+    /// walk. They keep only the sampled instruction. `None` without DWARF
+    /// unwinding.
+    pub samples_not_unwound: Option<u64>,
     pub overhead_ns: Option<u64>,
     pub known_biases: Vec<String>,
 }

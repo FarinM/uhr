@@ -65,7 +65,19 @@ Debian and Ubuntu its package must match the running kernel.
 - `--clockid=CLOCK_MONOTONIC` puts samples on the shared clock.
 - `--buildid-mmap` has the kernel record each mapping's build-id, so symbols
   are matched to the exact file that ran.
-- Frame-pointer call graphs only.
+- Frame-pointer call graphs by default. With `--unwind dwarf`, perf copies
+  each sample's user stack (32 KB unless `--stack-size` says otherwise) and
+  compresses it with zstd. Right after recording, while the binaries are at
+  hand, uhr unwinds the copies with `framehop` from the files' unwind tables,
+  and keeps only the frames. perf's dwarf mode leaves the frame-pointer chain
+  out, so stacks deeper than the copy lose their outer callers; coverage
+  counts them. Rules come from `.eh_frame`, and from `.debug_frame` for code
+  only it describes. perf marks the registers of each sample as 32- or
+  64-bit; samples of 32-bit code are not unwound, and coverage counts them.
+  The recording states which unwinding it used. Frame pointers stay the
+  default: with every core of a 32-core host busy, perf's writer fell behind
+  compressing the stack copies and dropped 0.3% of events, where
+  frame-pointer recording dropped none.
 - perf and the target share uhr's stderr. When that is a pipe or socket, uhr
   gives perf a pipe instead and copies it through, so a reader that stops
   early, as `head` does, can't kill perf with SIGPIPE. Terminals and files are
@@ -123,7 +135,7 @@ Most bad profiles come from here, not from the sampler.
 - Inlined frames must be shown, or time gets blamed on the caller.
 - In containers, binaries can have different paths inside the target's mount
   namespace. Resolve by build-id.
-- Candidate building blocks: samply's crates (`framehop` for unwinding,
+- Building blocks: samply's crates (`framehop` for unwinding,
   `wholesym` for symbols) and `linux-perf-data` for perf.data.
 
 ## Targets

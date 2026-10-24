@@ -48,7 +48,7 @@ Each stream has:
 | Field | Meaning |
 |---|---|
 | `id` | Unique within the recording |
-| `collector` | `name` plus the collector's version and settings. For perf: `version`, `event`, `frequency_hz` (what perf sampled at), `requested_frequency_hz`, `unwinding` |
+| `collector` | `name` plus the collector's version and settings. For perf: `version`, `event`, `frequency_hz` (what perf sampled at), `requested_frequency_hz`, `unwinding` (`frame_pointers` or `dwarf`), `stack_copy_bytes` (user stack copied with each sample as perf used it, null without `dwarf`) |
 | `signals` | What was captured: `user_cpu_samples`, `kernel_cpu_samples`, `user_stacks`, `kernel_stacks` |
 | `missing_signals` | Signals requested but not captured, each with a `reason`. Without `kernel_cpu_samples`, CPU time spent in the kernel is not in the samples at all, not merely unnamed |
 | `coverage.samples` | Samples written |
@@ -56,6 +56,8 @@ Each stream has:
 | `coverage.throttle_events` | Times the kernel throttled sampling |
 | `coverage.max_stack_depth` | Stacks deeper than this were cut |
 | `coverage.samples_at_stack_limit` | Samples whose stack reached that depth |
+| `coverage.samples_cut_at_stack_copy` | Samples whose stack went on past the end of their stack copy, so their outer callers are missing. Null without `dwarf` |
+| `coverage.samples_not_unwound` | Samples of 32-bit code, which `dwarf` unwinding cannot walk. They keep only the sampled instruction. Null without `dwarf` |
 | `coverage.overhead_ns` | Profiler overhead. Null until it is measured |
 | `coverage.known_biases` | Biases of this collector, in words |
 

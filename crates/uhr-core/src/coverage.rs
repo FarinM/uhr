@@ -9,10 +9,17 @@ use crate::symbols::{Source, SourceStatus, Symbols};
 /// result carries it.
 #[derive(Debug, Clone, Serialize)]
 pub struct Coverage {
-    /// This and the next two count the whole recording, whatever the filter.
+    /// This and the next four count the whole recording, whatever the
+    /// filter.
     pub lost_events: u64,
     pub throttle_events: u64,
     pub samples_at_stack_limit: u64,
+    /// Samples whose stack went on past the end of their stack copy, so
+    /// their outer callers are missing. `None` without DWARF unwinding.
+    pub samples_cut_at_stack_copy: Option<u64>,
+    /// Samples of 32-bit code, whose user stacks DWARF unwinding cannot
+    /// walk. `None` without DWARF unwinding.
+    pub samples_not_unwound: Option<u64>,
     pub missing_signals: Vec<MissingSignal>,
     /// What this result cannot account for because it was not measured.
     pub unknown: Vec<String>,
@@ -25,6 +32,8 @@ impl Coverage {
             lost_events: 0,
             throttle_events: 0,
             samples_at_stack_limit: 0,
+            samples_cut_at_stack_copy: None,
+            samples_not_unwound: None,
             missing_signals: Vec::new(),
             unknown: Vec::new(),
             known_biases: Vec::new(),
@@ -34,6 +43,19 @@ impl Coverage {
             coverage.lost_events += c.lost_events;
             coverage.throttle_events += c.throttle_events;
             coverage.samples_at_stack_limit += c.samples_at_stack_limit;
+            if let Some(cut) = c.samples_cut_at_stack_copy {
+                *coverage.samples_cut_at_stack_copy.get_or_insert(0) += cut;
+            }
+            if let Some(skipped) = c.samples_not_unwound {
+                *coverage.samples_not_unwound.get_or_insert(0) += skipped;
+                if skipped > 0 {
+                    coverage.unknown.push(format!(
+                        "callers in {skipped} samples of 32-bit code in stream {}, which DWARF \
+                         unwinding cannot walk",
+                        stream.id
+                    ));
+                }
+            }
             coverage
                 .missing_signals
                 .extend(stream.missing_signals.iter().cloned());
@@ -54,12 +76,23 @@ impl Coverage {
                     .unknown
                     .push(format!("profiler overhead of stream {}", stream.id));
             }
-            let Collector::Perf { unwinding, .. } = &stream.collector;
-            if *unwinding == Unwinding::FramePointers {
-                coverage.unknown.push(format!(
+            let Collector::Perf {
+                unwinding,
+                stack_copy_bytes,
+                ..
+            } = &stream.collector;
+            match (unwinding, c.samples_cut_at_stack_copy) {
+                (Unwinding::FramePointers, _) => coverage.unknown.push(format!(
                     "stacks of stream {} cut short where frame pointers are missing",
                     stream.id
-                ));
+                )),
+                (Unwinding::Dwarf, Some(cut)) if cut > 0 => coverage.unknown.push(format!(
+                    "outer callers of {cut} samples of stream {}, whose stacks were deeper \
+                     than their {}-byte stack copy",
+                    stream.id,
+                    stack_copy_bytes.unwrap_or_default()
+                )),
+                (Unwinding::Dwarf, _) => {}
             }
         }
         coverage

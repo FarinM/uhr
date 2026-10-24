@@ -6,7 +6,7 @@ use std::process::Command;
 use linux_perf_data::{PerfFileReader, linux_perf_event_reader::AttrFlags};
 use serde::Serialize;
 
-use crate::perf::{RecordOptions, perf_args};
+use crate::perf::{RecordOptions, Unwind, perf_args};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Report {
@@ -42,17 +42,62 @@ pub fn check_perf() -> Report {
     let mut checks = vec![check_perf_binary()];
     if checks[0].status != Status::Blocked {
         checks.push(check_recording());
+        checks.push(check_dwarf_unwinding());
     }
     Report {
         checks,
         notes: vec![
-            "User stacks are unwound with frame pointers. Build with \
+            "By default, user stacks are unwound with frame pointers. Build with \
              -fno-omit-frame-pointer (C, C++) or -C force-frame-pointers=yes (Rust). \
              GCC still leaves them out of leaf functions that don't use the stack, \
-             so stacks skip the caller of those functions."
+             so stacks skip the caller of those functions. `uhr record --unwind dwarf` \
+             needs no rebuild and finds those callers, at the cost of a stack copy in \
+             every sample."
                 .into(),
         ],
     }
+}
+
+/// What `uhr record --unwind dwarf` needs beyond frame-pointer sampling.
+pub fn check_dwarf_unwinding() -> Check {
+    if std::env::consts::ARCH != "x86_64" {
+        return Check {
+            status: Status::Limited,
+            detail: "DWARF unwinding (--unwind dwarf) is only implemented for x86-64".into(),
+            fix: Some("Record with frame pointers, the default.".into()),
+        };
+    }
+    match perf_has_zstd() {
+        Ok(true) => Check {
+            status: Status::Ok,
+            detail: "perf can compress the stack copies that --unwind dwarf records".into(),
+            fix: None,
+        },
+        Ok(false) => Check {
+            status: Status::Limited,
+            detail: "perf was built without zstd, so --unwind dwarf would write every stack \
+                     copy uncompressed"
+                .into(),
+            fix: Some("Use a perf built with zstd, or record with frame pointers.".into()),
+        },
+        Err(detail) => Check {
+            status: Status::Limited,
+            detail,
+            fix: None,
+        },
+    }
+}
+
+fn perf_has_zstd() -> Result<bool, String> {
+    let output = Command::new("perf")
+        .args(["version", "--build-options"])
+        .output()
+        .map_err(|e| format!("cannot run perf: {e}"))?;
+    let options = String::from_utf8_lossy(&output.stdout);
+    Ok(options.lines().any(|line| {
+        let line = line.trim_start();
+        line.starts_with("zstd:") && line.contains("[ on")
+    }))
 }
 
 /// Runs `perf --version`, which also catches the Debian and Ubuntu wrapper
@@ -126,6 +171,7 @@ fn probe_recording(perf: &Path) -> Result<bool, String> {
     let options = RecordOptions {
         command: vec!["true".into()],
         frequency_hz: 1,
+        unwind: Unwind::FramePointers,
     };
     let mut args = perf_args(&data, &options);
     // Permission errors from perf are suppressed by --quiet.

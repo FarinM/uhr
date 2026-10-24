@@ -12,7 +12,7 @@ use uhr_core::doctor::{self, Report, Status};
 use uhr_core::filter::Filter;
 use uhr_core::functions::Function;
 use uhr_core::overview::{self, CPUTime, Overview};
-use uhr_core::perf::{self, RecordOptions};
+use uhr_core::perf::{self, RecordOptions, Unwind};
 use uhr_core::query::{self, GroupBy, Query, QueryResult};
 use uhr_core::recording::{Exit, Mode};
 use uhr_core::symbols;
@@ -46,6 +46,15 @@ enum Command {
         /// Skip resolving function names. Run `uhr symbolize` later
         #[arg(long)]
         no_symbolize: bool,
+        /// How to walk user stacks. `dwarf` needs no frame pointers and finds
+        /// callers that frame pointers miss, but copies part of the stack
+        /// with every sample
+        #[arg(long, value_enum, default_value_t = UnwindArg::Fp)]
+        unwind: UnwindArg,
+        /// Bytes of user stack to copy with each sample, for `--unwind
+        /// dwarf`. Deeper stacks lose their outer callers [default: 32768]
+        #[arg(long, value_name = "BYTES", value_parser = clap::value_parser!(u32).range(8..=65528))]
+        stack_size: Option<u32>,
         /// Command to profile, after `--`
         #[arg(required = true, last = true)]
         command: Vec<String>,
@@ -100,6 +109,18 @@ enum Command {
         filter: FilterArgs,
     },
 }
+
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum UnwindArg {
+    /// Frame pointers
+    Fp,
+    /// DWARF unwind tables, from a copy of each sample's stack
+    Dwarf,
+}
+
+/// Covers most C, C++ and Rust stacks, including deep async ones, at half
+/// the cost of perf's maximum.
+const STACK_COPY_BYTES: u32 = 32 * 1024;
 
 #[derive(Clone, Copy, ValueEnum)]
 enum GroupByArg {
@@ -195,8 +216,10 @@ fn main() -> ExitCode {
             output,
             frequency,
             no_symbolize,
+            unwind,
+            stack_size,
             command,
-        } => run_record(output, frequency, no_symbolize, command),
+        } => run_record(output, frequency, no_symbolize, unwind, stack_size, command),
         Command::Symbolize { recording } => run_symbolize(&recording),
         Command::Overview {
             recording,
@@ -290,11 +313,21 @@ fn run_record(
     output: PathBuf,
     frequency_hz: u64,
     no_symbolize: bool,
+    unwind: UnwindArg,
+    stack_size: Option<u32>,
     command: Vec<String>,
 ) -> Result<ExitCode> {
+    let unwind = match (unwind, stack_size) {
+        (UnwindArg::Fp, None) => Unwind::FramePointers,
+        (UnwindArg::Fp, Some(_)) => bail!("--stack-size only applies to --unwind dwarf"),
+        (UnwindArg::Dwarf, stack_size) => Unwind::Dwarf {
+            stack_bytes: stack_size.unwrap_or(STACK_COPY_BYTES),
+        },
+    };
     let options = RecordOptions {
         command,
         frequency_hz,
+        unwind,
     };
     perf::record(&options, &output)?;
     if no_symbolize {
@@ -658,6 +691,12 @@ fn write_coverage(out: &mut impl Write, coverage: &Coverage) -> io::Result<()> {
         "  samples with stacks at the depth limit: {}",
         coverage.samples_at_stack_limit
     )?;
+    if let Some(cut) = coverage.samples_cut_at_stack_copy {
+        writeln!(out, "  samples with stacks cut at the stack copy: {cut}")?;
+    }
+    if let Some(skipped) = coverage.samples_not_unwound.filter(|&n| n > 0) {
+        writeln!(out, "  samples of 32-bit code, not unwound: {skipped}")?;
+    }
     for missing in &coverage.missing_signals {
         writeln!(
             out,
