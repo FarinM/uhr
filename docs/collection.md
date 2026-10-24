@@ -71,7 +71,9 @@ Debian and Ubuntu its package must match the running kernel.
   early, as `head` does, can't kill perf with SIGPIPE. Terminals and files are
   passed straight through.
 - Terminal Ctrl-C reaches the whole process group and lets perf finish its
-  recording. PID-directed cancellation of uhr is not yet supported reliably:
+  recording. perf stops collecting then, often before the target exits, so
+  uhr notes when it got the interrupt and counts that as the end of the
+  capture. PID-directed cancellation of uhr is not yet supported reliably:
   SIGINT is not forwarded and SIGTERM can leave perf and the target running.
   The installed SIGINT handler also remains ineffective after perf exits.
   Fixing this requires a supervisor that preserves terminal job control.

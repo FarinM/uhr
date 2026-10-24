@@ -22,6 +22,8 @@ pub(super) struct Input<'a> {
     pub perf_data: &'a Path,
     pub command: &'a [String],
     pub exit: Option<Exit>,
+    /// When the recording was interrupted, on CLOCK_MONOTONIC.
+    pub interrupted_ns: Option<u64>,
     pub perf_version: String,
     pub requested_frequency_hz: u64,
     pub max_stack_depth: u32,
@@ -131,6 +133,12 @@ pub(super) fn convert(input: Input) -> Result<Recording> {
             EventRecord::Throttle(_) => state.throttle_events += 1,
             _ => {}
         }
+    }
+
+    // An interrupt stops perf from collecting, so the capture can end long
+    // after the last event, and the target's exit is never seen.
+    if let (Some(end), Some(interrupted)) = (state.end_ns.as_mut(), input.interrupted_ns) {
+        *end = (*end).max(interrupted);
     }
 
     let mut signals = vec![Signal::UserCPUSamples, Signal::UserStacks];

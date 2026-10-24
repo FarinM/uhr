@@ -10,7 +10,7 @@ use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{ChildStderr, Command, ExitStatus, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
@@ -128,12 +128,13 @@ pub fn record(options: &RecordOptions, out: &Path) -> Result<Recording> {
     let perf_data = staging.join("perf.data");
     let args = perf_args(&perf_data, options);
     debug!(command = %format!("perf {}", join_args(&args)), "running perf");
-    let (status, interrupted) = run_perf(&args)?;
+    let (status, interrupted_ns) = run_perf(&args)?;
 
     let recording = convert::convert(convert::Input {
         perf_data: &perf_data,
         command: &options.command,
-        exit: exit(status, interrupted),
+        exit: exit(status, interrupted_ns.is_some()),
+        interrupted_ns,
         perf_version,
         requested_frequency_hz: options.frequency_hz,
         max_stack_depth,
@@ -248,15 +249,28 @@ fn join_args(args: &[OsString]) -> String {
 /// A handler rather than SIG_IGN, because ignored signals stay ignored in
 /// the target after exec.
 ///
-/// Returns perf's status, and whether this process got SIGINT meanwhile.
-fn run_perf(args: &[OsString]) -> Result<(ExitStatus, bool)> {
-    let interrupted = Arc::new(AtomicBool::new(false));
-    let handler =
-        signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&interrupted))
-            .map_err(Error::SignalHandler)?;
+/// Returns perf's status, and when this process first got SIGINT, if it
+/// did, on CLOCK_MONOTONIC.
+fn run_perf(args: &[OsString]) -> Result<(ExitStatus, Option<u64>)> {
+    let interrupted_ns = Arc::new(AtomicU64::new(0));
+    let first = Arc::clone(&interrupted_ns);
+    let action = move || {
+        let _ = first.compare_exchange(0, monotonic_ns(), Ordering::Relaxed, Ordering::Relaxed);
+    };
+    // SAFETY: the action only reads the clock and swaps an atomic, which
+    // are both async-signal-safe.
+    let handler = unsafe { signal_hook::low_level::register(signal_hook::consts::SIGINT, action) }
+        .map_err(Error::SignalHandler)?;
     let status = spawn_perf(args);
     signal_hook::low_level::unregister(handler);
-    Ok((status?, interrupted.load(Ordering::Relaxed)))
+    let interrupted_ns = interrupted_ns.load(Ordering::Relaxed);
+    Ok((status?, (interrupted_ns != 0).then_some(interrupted_ns)))
+}
+
+/// The clock perf stamps events with, given `--clockid=CLOCK_MONOTONIC`.
+fn monotonic_ns() -> u64 {
+    let now = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
+    now.tv_sec as u64 * 1_000_000_000 + now.tv_nsec as u64
 }
 
 /// Processes the target leaves running can keep its stderr open long after

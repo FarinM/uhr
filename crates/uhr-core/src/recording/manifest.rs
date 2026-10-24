@@ -8,7 +8,8 @@ pub struct Manifest {
     pub format_version: u32,
     pub target: Target,
     pub clock: Clock,
-    /// First and last timestamp seen from any collector.
+    /// When the capture started and stopped: the first and last event from
+    /// any collector, or the interrupt that stopped it if that came later.
     pub start_ns: Option<u64>,
     pub end_ns: Option<u64>,
     pub streams: Vec<Stream>,

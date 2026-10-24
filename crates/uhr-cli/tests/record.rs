@@ -119,6 +119,70 @@ impl Drop for RecordingProcess {
     }
 }
 
+/// Whether perf's child, which is uhr's grandchild, has exec'd `name`.
+fn target_runs(uhr: u32, name: &str) -> bool {
+    let children = |pid: u32| -> Vec<u32> {
+        fs::read_to_string(format!("/proc/{pid}/task/{pid}/children"))
+            .unwrap_or_default()
+            .split_whitespace()
+            .map(|pid| pid.parse().unwrap())
+            .collect()
+    };
+    children(uhr).into_iter().flat_map(children).any(|pid| {
+        fs::read_to_string(format!("/proc/{pid}/comm")).is_ok_and(|comm| comm.trim() == name)
+    })
+}
+
+#[test]
+fn an_interrupt_ends_the_capture_even_while_the_target_sleeps() {
+    let dir = common::scratch("interrupt_ends_the_capture");
+    let recording = dir.join("rec");
+    // Ignored signals stay ignored across exec, so sleep outlives the
+    // interrupt and no exit event marks the end of the capture.
+    let mut uhr = RecordingProcess(
+        Command::new(common::UHR)
+            .arg("record")
+            .arg("-o")
+            .arg(&recording)
+            .arg("--no-symbolize")
+            .args(["--", "sh", "-c", "trap '' INT; exec sleep 30"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    // The capture starts when the target execs.
+    while !target_runs(uhr.0.id(), "sleep") {
+        assert!(
+            uhr.0.try_wait().unwrap().is_none(),
+            "recording exited early"
+        );
+        assert!(Instant::now() < deadline, "target did not start");
+        thread::sleep(Duration::from_millis(10));
+    }
+    thread::sleep(Duration::from_millis(500));
+    let group = format!("-{}", uhr.0.id());
+    assert!(
+        Command::new("kill")
+            .args(["-INT", "--", &group])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(uhr.wait().success());
+
+    let manifest = manifest(&recording);
+    let start = manifest["start_ns"].as_u64().unwrap();
+    let end = manifest["end_ns"].as_u64().unwrap();
+    assert!(
+        end - start >= 500_000_000,
+        "the capture lasted only {} ns",
+        end - start
+    );
+}
+
 #[test]
 fn a_signal_sent_only_to_perf_is_not_the_targets_exit_status() {
     let dir = common::scratch("perf_signal_makes_exit_unknown");
