@@ -113,7 +113,7 @@ fn shares_self_and_total_time() {
         result
             .rows
             .iter()
-            .find(|r| r.function.as_deref() == name && r.origin == origin)
+            .find(|r| r.function.name.as_deref() == name && r.function.origin == origin)
             .unwrap()
     };
 
@@ -132,11 +132,11 @@ fn shares_self_and_total_time() {
     assert_eq!((main.self_cpu_ns, main.total_cpu_ns), (0, 10));
 
     let placeholder = row(None, Origin::Binary);
-    assert_eq!(placeholder.placeholder.as_deref(), Some("fun_40"));
-    assert_eq!(placeholder.module.as_deref(), Some("/bin/app"));
+    assert_eq!(placeholder.function.placeholder.as_deref(), Some("fun_40"));
+    assert_eq!(placeholder.function.module.as_deref(), Some("/bin/app"));
     assert_eq!(placeholder.self_cpu_ns, 1);
 
-    assert_eq!(result.rows[0].function.as_deref(), Some("leaf"));
+    assert_eq!(result.rows[0].function.name.as_deref(), Some("leaf"));
 }
 
 #[test]
@@ -162,7 +162,7 @@ fn works_without_symbols() {
     let result = run(&recording(), None, &query(10));
     assert!(!result.coverage.symbolized);
     assert_eq!(result.coverage.named_share, Some(0.0));
-    assert!(result.rows.iter().all(|r| r.function.is_none()));
+    assert!(result.rows.iter().all(|r| r.function.name.is_none()));
 }
 
 #[test]
@@ -253,10 +253,10 @@ fn separates_distinct_functions_with_the_same_name() {
 
     let result = run(&recording, Some(&symbols), &query(10));
     assert_eq!(result.rows.len(), 2);
-    assert_eq!(result.rows[0].function.as_deref(), Some("worker"));
-    assert_eq!(result.rows[1].function.as_deref(), Some("worker"));
-    assert_eq!(result.rows[0].function_address, Some(0x10));
-    assert_eq!(result.rows[1].function_address, Some(0x20));
+    assert_eq!(result.rows[0].function.name.as_deref(), Some("worker"));
+    assert_eq!(result.rows[1].function.name.as_deref(), Some("worker"));
+    assert_eq!(result.rows[0].function.function_address, Some(0x10));
+    assert_eq!(result.rows[1].function.function_address, Some(0x20));
     assert_eq!(
         (result.rows[0].self_cpu_ns, result.rows[0].total_cpu_ns),
         (6, 6)
@@ -291,8 +291,8 @@ fn merges_the_same_function_across_mappings_and_counts_recursion_once() {
     assert_eq!(result.rows.len(), 1);
     let row = &result.rows[0];
     assert_eq!((row.self_cpu_ns, row.total_cpu_ns), (10, 10));
-    assert_eq!(row.function_address, Some(0x10));
-    assert_eq!(row.build_id.as_deref(), Some("abcd"));
+    assert_eq!(row.function.function_address, Some(0x10));
+    assert_eq!(row.function.build_id.as_deref(), Some("abcd"));
     assert_eq!(result.coverage.named_share, Some(1.0));
 }
 
@@ -314,15 +314,15 @@ fn separates_builds_at_the_same_path_and_function_address() {
 
     let result = run(&recording, Some(&symbols), &query(10));
     assert_eq!(result.rows.len(), 2);
-    assert_eq!(result.rows[0].build_id.as_deref(), Some("abcd"));
-    assert_eq!(result.rows[1].build_id.as_deref(), Some("ef01"));
+    assert_eq!(result.rows[0].function.build_id.as_deref(), Some("abcd"));
+    assert_eq!(result.rows[1].function.build_id.as_deref(), Some("ef01"));
     assert_eq!(result.rows[0].self_cpu_ns, 6);
     assert_eq!(result.rows[1].self_cpu_ns, 4);
     assert!(
         result
             .rows
             .iter()
-            .all(|row| row.function_address == Some(0x10))
+            .all(|row| row.function.function_address == Some(0x10))
     );
     assert_eq!(result.coverage.named_share, Some(0.0));
 }

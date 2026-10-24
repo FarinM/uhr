@@ -1,12 +1,13 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
 use serde::Serialize;
 
 use crate::coverage::Coverage;
 use crate::filter::Filter;
+use crate::functions::{Function, Functions};
 use crate::recording::{self, Origin, Recording};
-use crate::symbols::{FrameName, Source, SourceStatus, Symbols};
+use crate::symbols::{Source, SourceStatus, Symbols};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -35,20 +36,10 @@ pub struct QueryResult {
     pub coverage: QueryCoverage,
 }
 
-/// One function, or the unnamed code of one module.
 #[derive(Debug, Clone, Serialize)]
 pub struct Row {
-    /// `None` for frames without a name.
-    pub function: Option<String>,
-    /// The label wholesym made up from the address when there is no name,
-    /// such as `fun_1200`. Counted as unnamed.
-    pub placeholder: Option<String>,
-    /// Path of the file the code was mapped from.
-    pub module: Option<String>,
-    pub build_id: Option<String>,
-    /// Function start relative to the binary's image base, when known.
-    pub function_address: Option<u32>,
-    pub origin: Origin,
+    #[serde(flatten)]
+    pub function: Function,
     /// CPU time with this function as the leaf.
     pub self_cpu_ns: u64,
     pub self_share: f64,
@@ -84,47 +75,8 @@ pub fn run(recording: &Recording, symbols: Option<&Symbols>, query: &Query) -> Q
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct FunctionKey {
-    origin: Origin,
-    module: Option<u32>,
-    address: Option<u32>,
-}
-
 fn by_function(recording: &Recording, symbols: Option<&Symbols>, query: &Query) -> QueryResult {
-    // Mapping ids change across processes and reloads; build ids distinguish
-    // different binaries that occupied the same path.
-    let mut module_ids: HashMap<(&str, Option<&str>), u32> = HashMap::new();
-    let mut modules: Vec<(&str, Option<&str>)> = Vec::new();
-    let mut key_ids: HashMap<FunctionKey, u32> = HashMap::new();
-    let mut keys: Vec<FunctionKey> = Vec::new();
-    let mut names: Vec<Option<FrameName>> = Vec::new();
-    let frame_keys: Vec<u32> = recording
-        .frames
-        .iter()
-        .enumerate()
-        .map(|(id, frame)| {
-            let module = frame.mapping.map(|m| {
-                let mapping = &recording.mappings[m as usize];
-                let module = (mapping.path.as_str(), mapping.build_id.as_deref());
-                *module_ids.entry(module).or_insert_with(|| {
-                    modules.push(module);
-                    modules.len() as u32 - 1
-                })
-            });
-            let key = FunctionKey {
-                origin: frame.origin,
-                module,
-                address: symbols.and_then(|s| s.function_addresses[id]),
-            };
-            *key_ids.entry(key).or_insert_with_key(|key| {
-                keys.push(key.clone());
-                names.push(symbols.and_then(|s| s.names[id].clone()));
-                keys.len() as u32 - 1
-            })
-        })
-        .collect();
-
+    let functions = Functions::new(recording, symbols);
     let mut stack_cpu_ns = vec![0u64; recording.stacks.len()];
     let mut samples = 0;
     for sample in query.filter.samples(recording) {
@@ -133,19 +85,19 @@ fn by_function(recording: &Recording, symbols: Option<&Symbols>, query: &Query) 
     }
     let cpu_ns: u64 = stack_cpu_ns.iter().sum();
 
-    let mut self_ns = vec![0u64; keys.len()];
-    let mut total_ns = vec![0u64; keys.len()];
+    let mut self_ns = vec![0u64; functions.len()];
+    let mut total_ns = vec![0u64; functions.len()];
     let mut seen = HashSet::new();
     for (stack, &weight) in recording.stacks.iter().zip(&stack_cpu_ns) {
         if weight == 0 {
             continue;
         }
-        self_ns[frame_keys[stack[0] as usize] as usize] += weight;
+        self_ns[functions.of_frame[stack[0] as usize] as usize] += weight;
         seen.clear();
         for &frame in stack {
-            let key = frame_keys[frame as usize];
-            if seen.insert(key) {
-                total_ns[key as usize] += weight;
+            let function = functions.of_frame[frame as usize];
+            if seen.insert(function) {
+                total_ns[function as usize] += weight;
             }
         }
     }
@@ -157,25 +109,10 @@ fn by_function(recording: &Recording, symbols: Option<&Symbols>, query: &Query) 
             ns as f64 / cpu_ns as f64
         }
     };
-    let mut rows: Vec<Row> = keys
-        .iter()
-        .enumerate()
-        .filter(|&(id, _)| total_ns[id] > 0)
-        .map(|(id, key)| Row {
-            function: names[id]
-                .as_ref()
-                .and_then(FrameName::symbol)
-                .map(str::to_owned),
-            placeholder: match &names[id] {
-                Some(FrameName::Placeholder(label)) => Some(label.clone()),
-                _ => None,
-            },
-            module: key.module.map(|m| modules[m as usize].0.to_owned()),
-            build_id: key
-                .module
-                .and_then(|m| modules[m as usize].1.map(str::to_owned)),
-            function_address: key.address,
-            origin: key.origin,
+    let mut rows: Vec<Row> = (0..functions.len())
+        .filter(|&id| total_ns[id] > 0)
+        .map(|id| Row {
+            function: functions.get(id as u32).clone(),
             self_cpu_ns: self_ns[id],
             self_share: share(self_ns[id]),
             total_cpu_ns: total_ns[id],
@@ -185,22 +122,27 @@ fn by_function(recording: &Recording, symbols: Option<&Symbols>, query: &Query) 
     rows.sort_by(|a, b| {
         (b.self_cpu_ns, b.total_cpu_ns)
             .cmp(&(a.self_cpu_ns, a.total_cpu_ns))
-            .then_with(|| a.function.cmp(&b.function))
-            .then_with(|| a.placeholder.cmp(&b.placeholder))
-            .then_with(|| a.module.cmp(&b.module))
-            .then_with(|| a.build_id.cmp(&b.build_id))
-            .then_with(|| a.function_address.cmp(&b.function_address))
+            .then_with(|| a.function.name.cmp(&b.function.name))
+            .then_with(|| a.function.placeholder.cmp(&b.function.placeholder))
+            .then_with(|| a.function.module.cmp(&b.function.module))
+            .then_with(|| a.function.build_id.cmp(&b.function.build_id))
+            .then_with(|| {
+                a.function
+                    .function_address
+                    .cmp(&b.function.function_address)
+            })
     });
     let rows_omitted = rows.len().saturating_sub(query.top);
     rows.truncate(query.top);
 
     let mut unnamed_by_origin = BTreeMap::new();
     let mut named_ns = 0;
-    for (id, key) in keys.iter().enumerate() {
-        if names[id].as_ref().and_then(FrameName::symbol).is_some() {
-            named_ns += self_ns[id];
-        } else if self_ns[id] > 0 {
-            *unnamed_by_origin.entry(key.origin).or_insert(0) += self_ns[id];
+    for (id, &ns) in self_ns.iter().enumerate() {
+        let function = functions.get(id as u32);
+        if function.name.is_some() {
+            named_ns += ns;
+        } else if ns > 0 {
+            *unnamed_by_origin.entry(function.origin).or_insert(0) += ns;
         }
     }
 

@@ -9,9 +9,10 @@ use tracing_subscriber::filter::LevelFilter;
 use uhr_core::coverage::Coverage;
 use uhr_core::doctor::{self, Report, Status};
 use uhr_core::filter::Filter;
+use uhr_core::functions::Function;
 use uhr_core::overview::{self, CPUTime, Overview};
 use uhr_core::perf::{self, RecordOptions};
-use uhr_core::query::{self, GroupBy, Query, QueryResult, Row};
+use uhr_core::query::{self, GroupBy, Query, QueryResult};
 use uhr_core::recording::{Exit, Mode};
 use uhr_core::symbols;
 
@@ -438,8 +439,8 @@ fn write_query(out: &mut impl Write, result: &QueryResult) -> io::Result<()> {
             "{:>6.1}% {:>6.1}%  {}  {}",
             row.self_share * 100.0,
             row.total_share * 100.0,
-            function_name(row),
-            module_name(row),
+            function_name(&row.function),
+            module_name(&row.function),
         )?;
     }
     if result.rows_omitted > 0 {
@@ -529,21 +530,21 @@ fn seconds(ns: u64) -> String {
     format!("{:.3}s", ns as f64 / 1e9)
 }
 
-fn function_name(row: &Row) -> String {
-    let name = match (&row.function, &row.placeholder) {
+fn function_name(function: &Function) -> String {
+    let name = match (&function.name, &function.placeholder) {
         (Some(function), _) => function.clone(),
         (None, Some(placeholder)) => format!("{placeholder} (no symbol)"),
         (None, None) => "<unnamed>".into(),
     };
-    match row.function_address {
+    match function.function_address {
         Some(address) => format!("{name} @0x{address:x}"),
         None => name,
     }
 }
 
-fn module_name(row: &Row) -> &str {
-    match &row.module {
+fn module_name(function: &Function) -> &str {
+    match &function.module {
         Some(path) => path.rsplit('/').next().unwrap_or(path),
-        None => row.origin.as_str(),
+        None => function.origin.as_str(),
     }
 }
