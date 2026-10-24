@@ -48,8 +48,8 @@ Each stream has:
 |---|---|
 | `id` | Unique within the recording |
 | `collector` | `name` plus the collector's version and settings. For perf: `version`, `event`, `frequency_hz` (what perf sampled at), `requested_frequency_hz`, `unwinding` |
-| `signals` | What was captured: `cpu_samples`, `user_stacks`, `kernel_stacks` |
-| `missing_signals` | Signals requested but not captured, each with a `reason` |
+| `signals` | What was captured: `user_cpu_samples`, `kernel_cpu_samples`, `user_stacks`, `kernel_stacks` |
+| `missing_signals` | Signals requested but not captured, each with a `reason`. Without `kernel_cpu_samples`, CPU time spent in the kernel is not in the samples at all, not merely unnamed |
 | `coverage.samples` | Samples written |
 | `coverage.lost_events` | Events the kernel dropped |
 | `coverage.throttle_events` | Times the kernel throttled sampling |

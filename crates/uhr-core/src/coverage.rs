@@ -1,6 +1,6 @@
 use serde::Serialize;
 
-use crate::recording::{Collector, MissingSignal, Recording, Unwinding};
+use crate::recording::{Collector, MissingSignal, Recording, Signal, Unwinding};
 
 /// What a result can't see because of how the recording was made. Every
 /// result carries it.
@@ -33,6 +33,17 @@ impl Coverage {
             coverage
                 .missing_signals
                 .extend(stream.missing_signals.iter().cloned());
+            if stream
+                .missing_signals
+                .iter()
+                .any(|m| m.signal == Signal::KernelCPUSamples)
+            {
+                coverage.unknown.push(format!(
+                    "CPU time in the kernel: stream {} did not sample it, so totals and shares \
+                     leave it out",
+                    stream.id
+                ));
+            }
             coverage.known_biases.extend(c.known_biases.iter().cloned());
             if c.overhead_ns.is_none() {
                 coverage

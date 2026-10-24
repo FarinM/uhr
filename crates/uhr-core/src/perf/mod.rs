@@ -196,7 +196,7 @@ fn log_summary(recording: &Recording, out: &Path) {
             );
         }
         for missing in &stream.missing_signals {
-            warn!(signal = ?missing.signal, reason = %missing.reason, "signal not captured");
+            warn!(signal = missing.signal.as_str(), reason = %missing.reason, "signal not captured");
         }
         let coverage = &stream.coverage;
         if coverage.lost_events > 0 {

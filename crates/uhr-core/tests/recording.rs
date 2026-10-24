@@ -30,11 +30,13 @@ fn example() -> Recording {
                     requested_frequency_hz: 999,
                     unwinding: Unwinding::FramePointers,
                 },
-                signals: vec![Signal::CPUSamples, Signal::UserStacks],
-                missing_signals: vec![MissingSignal {
-                    signal: Signal::KernelStacks,
-                    reason: "perf_event_paranoid is 2".into(),
-                }],
+                signals: vec![Signal::UserCPUSamples, Signal::UserStacks],
+                missing_signals: [Signal::KernelCPUSamples, Signal::KernelStacks]
+                    .map(|signal| MissingSignal {
+                        signal,
+                        reason: "perf_event_paranoid is 2".into(),
+                    })
+                    .to_vec(),
                 coverage: StreamCoverage {
                     samples: 2,
                     lost_events: 0,

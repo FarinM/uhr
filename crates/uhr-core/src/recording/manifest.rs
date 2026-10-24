@@ -67,14 +67,29 @@ pub enum Unwinding {
     FramePointers,
 }
 
+/// CPU samples are split by mode because a sampler can leave one mode out,
+/// and then the time spent in it is missing, not just its frames.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Signal {
-    #[serde(rename = "cpu_samples")]
-    CPUSamples,
+    #[serde(rename = "user_cpu_samples")]
+    UserCPUSamples,
+    #[serde(rename = "kernel_cpu_samples")]
+    KernelCPUSamples,
     #[serde(rename = "user_stacks")]
     UserStacks,
     #[serde(rename = "kernel_stacks")]
     KernelStacks,
+}
+
+impl Signal {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Signal::UserCPUSamples => "user_cpu_samples",
+            Signal::KernelCPUSamples => "kernel_cpu_samples",
+            Signal::UserStacks => "user_stacks",
+            Signal::KernelStacks => "kernel_stacks",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

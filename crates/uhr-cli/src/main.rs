@@ -249,7 +249,12 @@ fn write_coverage(out: &mut impl Write, coverage: &Coverage) -> io::Result<()> {
         coverage.samples_at_stack_limit
     )?;
     for missing in &coverage.missing_signals {
-        writeln!(out, "  missing {:?}: {}", missing.signal, missing.reason)?;
+        writeln!(
+            out,
+            "  missing {}: {}",
+            missing.signal.as_str(),
+            missing.reason
+        )?;
     }
     for unknown in &coverage.unknown {
         writeln!(out, "  unknown: {unknown}")?;

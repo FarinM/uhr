@@ -133,17 +133,20 @@ pub(super) fn convert(input: Input) -> Result<Recording> {
         }
     }
 
-    let mut signals = vec![Signal::CPUSamples, Signal::UserStacks];
+    let mut signals = vec![Signal::UserCPUSamples, Signal::UserStacks];
     let mut missing_signals = Vec::new();
+    let kernel_signals = [Signal::KernelCPUSamples, Signal::KernelStacks];
     if kernel_excluded {
-        missing_signals.push(MissingSignal {
-            signal: Signal::KernelStacks,
-            reason: "perf excluded the kernel, usually because perf_event_paranoid is 2 or \
+        missing_signals.extend(kernel_signals.map(|signal| {
+            MissingSignal {
+                signal,
+                reason: "perf excluded the kernel, usually because perf_event_paranoid is 2 or \
                      higher. Run `uhr doctor`."
-                .into(),
-        });
+                    .into(),
+            }
+        }));
     } else {
-        signals.push(Signal::KernelStacks);
+        signals.extend(kernel_signals);
     }
 
     let stream = Stream {

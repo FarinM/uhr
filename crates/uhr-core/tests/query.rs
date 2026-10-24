@@ -172,10 +172,8 @@ fn has_no_named_share_without_samples() {
     assert_eq!(result.coverage.named_share, None);
 }
 
-#[test]
-fn reports_throttling() {
-    let mut recording = recording();
-    recording.manifest.streams.push(Stream {
+fn perf_stream() -> Stream {
+    Stream {
         id: "perf".into(),
         collector: Collector::Perf {
             version: "6.8".into(),
@@ -184,7 +182,7 @@ fn reports_throttling() {
             requested_frequency_hz: 999,
             unwinding: Unwinding::FramePointers,
         },
-        signals: vec![Signal::CPUSamples],
+        signals: vec![Signal::UserCPUSamples],
         missing_signals: Vec::new(),
         coverage: StreamCoverage {
             samples: 4,
@@ -195,9 +193,48 @@ fn reports_throttling() {
             overhead_ns: None,
             known_biases: Vec::new(),
         },
-    });
+    }
+}
+
+#[test]
+fn reports_throttling() {
+    let mut recording = recording();
+    recording.manifest.streams.push(perf_stream());
     let result = run(&recording, Some(&symbols()), &query(10));
     assert_eq!(result.coverage.recording.throttle_events, 3);
+}
+
+#[test]
+fn says_kernel_time_is_left_out_when_it_was_not_sampled() {
+    let mut recording = recording();
+    let mut stream = perf_stream();
+    stream.missing_signals.push(MissingSignal {
+        signal: Signal::KernelCPUSamples,
+        reason: "excluded".into(),
+    });
+    recording.manifest.streams.push(stream);
+    let result = run(&recording, Some(&symbols()), &query(10));
+    assert!(
+        result
+            .coverage
+            .recording
+            .unknown
+            .iter()
+            .any(|u| u.starts_with("CPU time in the kernel")),
+        "{:?}",
+        result.coverage.recording.unknown
+    );
+
+    recording.manifest.streams = vec![perf_stream()];
+    let result = run(&recording, Some(&symbols()), &query(10));
+    assert!(
+        !result
+            .coverage
+            .recording
+            .unknown
+            .iter()
+            .any(|u| u.starts_with("CPU time in the kernel"))
+    );
 }
 
 #[test]
