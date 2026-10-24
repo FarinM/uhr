@@ -114,6 +114,7 @@ fn symbols() -> Symbols {
     Symbols {
         names,
         function_addresses,
+        inline: vec![Vec::new(); FUNCTIONS.len() + 1],
         sources: Vec::new(),
     }
 }
@@ -345,6 +346,7 @@ fn a_binary_that_ran_from_two_paths_is_one_function() {
         Some(FrameName::Symbol("main".into())),
     ]);
     symbols.function_addresses.extend([Some(0x40), Some(0x10)]);
+    symbols.inline.extend([Vec::new(), Vec::new()]);
     recording.stacks.push(vec![9, 10]);
     recording.samples.push(Sample {
         stack: recording.stacks.len() as u32 - 1,

@@ -17,9 +17,10 @@ A recording is a directory:
 | `samples.parquet` | CPU samples |
 | `symbols.parquet` | Function name per frame, after symbol resolution |
 | `symbol_sources.parquet` | Files the names came from, and why some frames have none |
+| `inline_frames.parquet` | Inlined calls and source lines per frame, from debug info |
 
 A directory without `manifest.json` is a recording that did not finish. The
-two symbol files are the only ones that change: resolving symbols again
+three symbol files are the only ones that change: resolving symbols again
 replaces them.
 
 ## Conventions
@@ -174,3 +175,20 @@ path `[kernel]`.
 | `build_id_mismatch` | The file changed since recording. No names are taken from it |
 | `unsupported` | Kernel, `[vdso]` and other code that is not read from a file |
 | `failed` | Reading the file failed |
+
+`inline_frames`, one row per frame and function at the frame's address, from
+debug info. A frame inside inlined code has a row for each inlined call and
+one for the function the machine code belongs to; a frame without debug info
+has none. uhr reads it from the DWARF with addr2line, and demangles names by
+their source language, so ELF names keep their leading underscores. Symbols
+resolved before this table existed have to be resolved again.
+
+| Column | Type | Meaning |
+|---|---|---|
+| `frame_id` | uint32 | Rows of a frame are together |
+| `depth` | uint32 | 0 for the innermost inlined call, counting up to the function the machine code belongs to |
+| `function` | string, nullable | Null if the debug info has no name |
+| `file` | string, nullable | Source file, as written in the debug info. Null if unknown |
+| `line` | uint32, nullable | Line in `file`. For a caller's frame, the line of the call. Null if unknown |
+| `decl_file` | string, nullable | Source file the function is declared in. Null if the debug info does not say |
+| `decl_line` | uint32, nullable | Line of the declaration in `decl_file`. Null if unknown |

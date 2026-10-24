@@ -5,6 +5,7 @@ edition.workspace = true
 publish.workspace = true
 
 [dependencies]
+addr2line.workspace = true
 arrow-array.workspace = true
 arrow-buffer.workspace = true
 arrow-schema.workspace = true
@@ -13,11 +14,13 @@ linux-perf-data.workspace = true
 memmap2.workspace = true
 lzma-rs.workspace = true
 crc32fast.workspace = true
+gimli.workspace = true
 parquet.workspace = true
 rustix.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 signal-hook.workspace = true
+stable_deref_trait.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

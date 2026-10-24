@@ -8,8 +8,10 @@ version = "0.24.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dfbe277e56a376000877090da837660b4427aad530e3028d44e0bffe4f89a1c1"
 dependencies = [
+ "cpp_demangle",
  "fallible-iterator",
  "gimli",
+ "rustc-demangle",
 ]
 
 [[package]]
@@ -2334,11 +2336,13 @@ dependencies = [
 name = "uhr-core"
 version = "0.1.0"
 dependencies = [
+ "addr2line",
  "arrow-array",
  "arrow-buffer",
  "arrow-schema",
  "arrow-select",
  "crc32fast",
+ "gimli",
  "linux-perf-data 0.13.0",
  "lzma-rs",
  "memmap2",
@@ -2347,6 +2351,7 @@ dependencies = [
  "serde",
  "serde_json",
  "signal-hook",
+ "stable_deref_trait",
  "tempfile",
  "thiserror",
  "tokio",

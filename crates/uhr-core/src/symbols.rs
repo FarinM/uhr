@@ -1,3 +1,4 @@
+mod debug_info;
 mod files;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -5,6 +6,7 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
+use debug_info::DebugInfo;
 use files::{Files, Location};
 use serde::Serialize;
 use tracing::{debug, info, warn};
@@ -27,6 +29,7 @@ pub enum Error {
 
 const NAMES: &str = "symbols.parquet";
 const SOURCES: &str = "symbol_sources.parquet";
+const INLINE: &str = "inline_frames.parquet";
 
 /// Function names resolved after recording. Kept beside the recording,
 /// which itself never changes; resolving again replaces these files.
@@ -37,7 +40,26 @@ pub struct Symbols {
     pub names: Vec<Option<FrameName>>,
     /// Relative function starts in the binary, indexed by frame id.
     pub function_addresses: Vec<Option<u32>>,
+    /// Indexed by frame id: the functions at the frame's address from debug
+    /// info, innermost inlined call first. The last is the function the
+    /// machine code belongs to. Empty without debug info.
+    pub inline: Vec<Vec<InlineFrame>>,
     pub sources: Vec<Source>,
+}
+
+/// One function at an address, and where in its source the address is. For
+/// a caller's frame that is the line of the call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InlineFrame {
+    pub function: Option<String>,
+    /// As written in the debug info, usually absolute.
+    pub file: Option<String>,
+    pub line: Option<u32>,
+    /// Where the function is declared, which stays the same wherever it
+    /// was inlined, unlike `file`: code from macros or `#line` directives
+    /// can sit in other files.
+    pub decl_file: Option<String>,
+    pub decl_line: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -166,6 +188,7 @@ fn log_summary(symbols: &Symbols) {
 async fn resolve(recording: &Recording) -> Symbols {
     let mut names = vec![None; recording.frames.len()];
     let mut function_addresses = vec![None; recording.frames.len()];
+    let mut inline = vec![Vec::new(); recording.frames.len()];
     let mut sources = Vec::new();
 
     let mut by_file: BTreeMap<FileKey, Vec<(u32, u64)>> = BTreeMap::new();
@@ -282,24 +305,42 @@ async fn resolve(recording: &Recording) -> Symbols {
                     .as_ref()
                     .and_then(|frames| frames.last())
                     .and_then(|frame| frame.function.clone());
-                found.push((frame, info.symbol.address, info.symbol.name, debug_name));
+                found.push((
+                    frame,
+                    address,
+                    info.symbol.address,
+                    info.symbol.name,
+                    debug_name,
+                ));
             }
         }
-        let starts: HashSet<u32> = found.iter().map(|&(_, start, _, _)| start).collect();
+        let starts: HashSet<u32> = found.iter().map(|&(_, _, start, _, _)| start).collect();
         let raw: HashMap<u32, String> = map
             .iter_symbols()
             .filter(|(start, _)| starts.contains(start))
             .map(|(start, name)| (start, name.into_owned()))
             .collect();
-        let proper = proper_symbols(
-            &files,
-            Path::new(path),
-            &snapshot,
-            &starts,
-            &map.debug_file_location().0,
-        );
+        let debug_path = map.debug_file_location().0.clone();
+        let proper = proper_symbols(&files, Path::new(path), &snapshot, &starts, &debug_path);
+        // Not needed any more, and the inline lookup below reads the same
+        // debug info again.
+        drop(map);
+        let (debug_info, debug_problem) = match DebugInfo::load(&files, &debug_path) {
+            Ok(debug_info) => (debug_info, None),
+            Err(problem) => (None, Some(problem)),
+        };
+        if let Some(debug_info) = &debug_info {
+            for &(frame, address, ..) in &found {
+                inline[frame as usize] = debug_info.chain(u64::from(address) + segments.base);
+            }
+        }
         let mut placeholders = 0;
-        for (frame, start, demangled, debug_name) in &found {
+        for (frame, _, start, demangled, debug_name) in &found {
+            // wholesym's debug name loses a leading underscore of ELF names.
+            let debug_name = &inline[*frame as usize]
+                .last()
+                .and_then(|outer| outer.function.clone())
+                .or_else(|| debug_name.clone());
             let name = match raw.get(start) {
                 // wholesym strips a leading underscore from names it cannot
                 // demangle, as Mach-O expects. On ELF that turns `_start` into
@@ -331,12 +372,16 @@ async fn resolve(recording: &Recording) -> Symbols {
         if placeholders > 0 {
             detail += &format!(", {placeholders} more with placeholder names");
         }
+        if let Some(problem) = debug_problem {
+            detail += &format!(", inlined calls not read: {problem}");
+        }
         sources.push(source(status, Some(detail)));
     }
 
     Symbols {
         names,
         function_addresses,
+        inline,
         sources,
     }
 }
@@ -493,9 +538,45 @@ impl Symbols {
                 })
             })
             .collect::<Result<_, recording::Error>>()?;
+
+        let path = dir.join(INLINE);
+        if !path.exists() {
+            return Err(recording::Error::Invalid {
+                path,
+                reason: "missing: an older uhr resolved these symbols. Run `uhr symbolize` again"
+                    .into(),
+            });
+        }
+        let table = Table::read(&path)?;
+        let frame_id = table.u32("frame_id")?;
+        let depth = table.u32("depth")?;
+        let mut function = table.optional_string("function")?;
+        let mut file = table.optional_string("file")?;
+        let line = table.optional_u32("line")?;
+        let mut decl_file = table.optional_string("decl_file")?;
+        let decl_line = table.optional_u32("decl_line")?;
+        let mut inline = vec![Vec::new(); recording.frames.len()];
+        for i in 0..table.len() {
+            let Some(chain) = inline.get_mut(frame_id[i] as usize) else {
+                return Err(table.invalid(format!("frame {} does not exist", frame_id[i])));
+            };
+            if depth[i] as usize != chain.len() {
+                return Err(table.invalid(
+                    "the rows of a frame must be together, with depths counting up from 0",
+                ));
+            }
+            chain.push(InlineFrame {
+                function: function[i].take(),
+                file: file[i].take(),
+                line: line[i],
+                decl_file: decl_file[i].take(),
+                decl_line: decl_line[i],
+            });
+        }
         Ok(Some(Self {
             names,
             function_addresses,
+            inline,
             sources,
         }))
     }
@@ -548,6 +629,39 @@ impl Symbols {
                 ),
             ],
         )?;
+        let inline_partial = dir.join(format!("{INLINE}.partial"));
+        let rows = || {
+            self.inline
+                .iter()
+                .enumerate()
+                .flat_map(|(frame, chain)| chain.iter().enumerate().map(move |row| (frame, row)))
+        };
+        table::write(
+            &inline_partial,
+            vec![
+                Column::u32("frame_id", rows().map(|(frame, _)| frame as u32).collect()),
+                Column::u32(
+                    "depth",
+                    rows().map(|(_, (depth, _))| depth as u32).collect(),
+                ),
+                Column::optional_string(
+                    "function",
+                    rows().map(|(_, (_, f))| f.function.as_deref()).collect(),
+                ),
+                Column::optional_string(
+                    "file",
+                    rows().map(|(_, (_, f))| f.file.as_deref()).collect(),
+                ),
+                Column::optional_u32("line", rows().map(|(_, (_, f))| f.line).collect()),
+                Column::optional_string(
+                    "decl_file",
+                    rows().map(|(_, (_, f))| f.decl_file.as_deref()).collect(),
+                ),
+                Column::optional_u32("decl_line", rows().map(|(_, (_, f))| f.decl_line).collect()),
+            ],
+        )?;
+        let inline = dir.join(INLINE);
+        fs::rename(&inline_partial, &inline).map_err(recording::Error::io("replacing", &inline))?;
         let sources = dir.join(SOURCES);
         fs::rename(&sources_partial, &sources)
             .map_err(recording::Error::io("replacing", &sources))?;
@@ -833,6 +947,85 @@ mod tests {
                     .contains(&(address, "EntryPoint".into())),
                 "{filename}"
             );
+        }
+    }
+
+    fn recording(frames: usize) -> Recording {
+        use crate::recording::{Clock, FORMAT_VERSION, Frame, Manifest, Target};
+        Recording {
+            manifest: Manifest {
+                format_version: FORMAT_VERSION,
+                target: Target {
+                    command: vec!["app".into()],
+                    launched: true,
+                    exit: None,
+                },
+                clock: Clock::Monotonic,
+                start_ns: None,
+                end_ns: None,
+                streams: Vec::new(),
+            },
+            threads: Vec::new(),
+            thread_names: Vec::new(),
+            mappings: Vec::new(),
+            frames: vec![
+                Frame {
+                    origin: Origin::Unresolved,
+                    address: 0x10,
+                    mapping: None,
+                    file_offset: None,
+                    return_address: false,
+                };
+                frames
+            ],
+            stacks: Vec::new(),
+            samples: Vec::new(),
+        }
+    }
+
+    fn symbols_with_inline_calls() -> Symbols {
+        let frame = |function: &str, line| InlineFrame {
+            function: Some(function.into()),
+            file: Some("/src/app.c".into()),
+            line: Some(line),
+            decl_file: Some("/src/app.c".into()),
+            decl_line: Some(line - 2),
+        };
+        Symbols {
+            names: vec![
+                Some(FrameName::Symbol("from_a".into())),
+                None,
+                Some(FrameName::Symbol("main".into())),
+            ],
+            function_addresses: vec![Some(0x10), None, Some(0x40)],
+            inline: vec![
+                vec![frame("mix", 37), frame("from_a", 47)],
+                Vec::new(),
+                vec![frame("main", 66)],
+            ],
+            sources: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn reads_back_the_inline_calls_it_wrote() {
+        let dir = tempfile::tempdir().unwrap();
+        let symbols = symbols_with_inline_calls();
+        symbols.write(dir.path()).unwrap();
+        let read = Symbols::read(dir.path(), &recording(3)).unwrap();
+        assert_eq!(read, Some(symbols));
+    }
+
+    #[test]
+    fn symbols_from_before_inline_calls_must_be_resolved_again() {
+        let dir = tempfile::tempdir().unwrap();
+        symbols_with_inline_calls().write(dir.path()).unwrap();
+        fs::remove_file(dir.path().join(INLINE)).unwrap();
+        match Symbols::read(dir.path(), &recording(3)) {
+            Err(recording::Error::Invalid { reason, .. }) => {
+                assert!(reason.contains("uhr symbolize"), "{reason}");
+            }
+            other => panic!("{other:?}"),
         }
     }
 }

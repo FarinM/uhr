@@ -89,6 +89,7 @@ fn symbols() -> Symbols {
             Some(FrameName::Placeholder("fun_40".into())),
             None,
         ],
+        inline: vec![Vec::new(); 6],
         sources: vec![Source {
             path: "[kernel]".into(),
             build_id: None,
@@ -257,6 +258,7 @@ fn separates_distinct_functions_with_the_same_name() {
     let symbols = Symbols {
         names: vec![Some(FrameName::Symbol("worker".into())); 2],
         function_addresses: vec![Some(0x10), Some(0x20)],
+        inline: vec![Vec::new(); 2],
         sources: Vec::new(),
     };
 
@@ -293,6 +295,7 @@ fn merges_the_same_function_across_mappings_and_counts_recursion_once() {
             Some(FrameName::Symbol("worker_alias".into())),
         ],
         function_addresses: vec![Some(0x10); 2],
+        inline: vec![Vec::new(); 2],
         sources: Vec::new(),
     };
 
@@ -319,6 +322,7 @@ fn separates_builds_at_the_same_path_and_function_address() {
     let symbols = Symbols {
         names: vec![Some(FrameName::Placeholder("fun_10".into())); 2],
         function_addresses: vec![Some(0x10); 2],
+        inline: vec![Vec::new(); 2],
         sources: Vec::new(),
     };
 
@@ -352,6 +356,7 @@ fn combines_copies_of_one_binary_at_different_paths() {
     let symbols = Symbols {
         names: vec![Some(FrameName::Symbol("worker".into())); 2],
         function_addresses: vec![Some(0x10); 2],
+        inline: vec![Vec::new(); 2],
         sources: Vec::new(),
     };
 
@@ -375,6 +380,7 @@ fn the_entry_point_range_of_a_stripped_binary_has_no_id() {
             Some(FrameName::Placeholder("fun_40".into())),
         ],
         function_addresses: vec![Some(0x10), Some(0x40)],
+        inline: vec![Vec::new(); 2],
         sources: Vec::new(),
     };
 
