@@ -30,8 +30,9 @@ pub(super) struct Input<'a> {
     /// first exec it still runs uhr's code, so that is left out.
     pub launched_pid: Option<u32>,
     pub exit: Option<Exit>,
-    /// When the recording was interrupted, on CLOCK_MONOTONIC.
-    pub interrupted_ns: Option<u64>,
+    /// When uhr stopped the capture before the target exited, at an
+    /// interrupt or the end of a duration, on CLOCK_MONOTONIC.
+    pub stopped_ns: Option<u64>,
     pub perf_version: String,
     pub requested_frequency_hz: u64,
     pub max_stack_depth: u32,
@@ -219,10 +220,10 @@ pub(super) fn convert(input: Input) -> Result<Recording> {
         }
     }
 
-    // An interrupt stops perf from collecting, so the capture can end long
-    // after the last event, and the target's exit is never seen.
-    if let (Some(end), Some(interrupted)) = (state.end_ns.as_mut(), input.interrupted_ns) {
-        *end = (*end).max(interrupted);
+    // Stopping perf ends the capture, which can be long after the last
+    // event, and before the target's exit.
+    if let (Some(end), Some(stopped)) = (state.end_ns.as_mut(), input.stopped_ns) {
+        *end = (*end).max(stopped);
     }
     state.finish_off_cpu();
 

@@ -38,11 +38,11 @@ replaces them.
 | Field | Meaning |
 |---|---|
 | `format_version` | `0` |
-| `target.command` | Command and arguments |
+| `target.command` | Command and arguments. Empty for an attached process without a command line, such as a kernel thread |
 | `target.launched` | True if the recording started the target, false if it attached |
-| `target.exit` | `{"code": n}`, `{"signal": n}`, `{"unknown": reason}` when uhr could not see the status, or null if it was still running |
+| `target.exit` | `{"code": n}`, `{"signal": n}`, `{"unknown": reason}` when uhr could not see the status, as for a process it attached to, or null if it was still running |
 | `clock` | `CLOCK_MONOTONIC` |
-| `start_ns`, `end_ns` | When the capture started and stopped: the first and last event, or the interrupt that stopped the recording if that came later. Null if nothing was recorded |
+| `start_ns`, `end_ns` | When the capture started and stopped: the first and last event, or when uhr stopped the recording if that came later, at an interrupt or the end of `--duration`. Null if nothing was recorded |
 | `streams` | One per collector that ran |
 | `kernel_symbols` | `{"status": "saved"}` if the kernel's symbols were read while recording, or `{"status": "unavailable", "reason": ...}` if not, and then kernel frames have no names |
 

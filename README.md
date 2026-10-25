@@ -27,6 +27,8 @@ Linux only for now, with perf installed. Build with `cargo build`, then:
 uhr doctor                                 # what this host is missing, and the fix
 uhr record -o rec -- ./my-program args     # record CPU samples and context switches,
                                            # and resolve names
+uhr record -o rec --pid 4312 --duration 10s
+                                           # the same for a running process
 uhr overview rec                           # computing or waiting? CPU time by mode
                                            # and time off CPU, runnable or blocked,
                                            # by process and thread, against time alive

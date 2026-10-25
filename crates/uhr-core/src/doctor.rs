@@ -8,7 +8,7 @@ use serde::Serialize;
 
 use crate::kallsyms;
 use crate::launch::Held;
-use crate::perf::{Perf, RecordOptions, Unwind, finished, is_dummy, perf_args};
+use crate::perf::{Perf, RecordOptions, Target, Unwind, finished, is_dummy, perf_args};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Report {
@@ -228,12 +228,12 @@ fn probe_recording(perf: &Path) -> Result<bool, String> {
     let dir = tempfile::tempdir().map_err(|e| format!("creating perf probe directory: {e}"))?;
     let data = dir.path().join("perf.data");
     let options = RecordOptions {
-        command: vec!["true".into()],
+        target: Target::Launch(vec!["true".into()]),
         frequency_hz: 1,
         unwind: Unwind::FramePointers,
         off_cpu: true,
     };
-    let held = Held::spawn(&options.command).map_err(|e| format!("starting `true`: {e}"))?;
+    let held = Held::spawn(&["true".into()]).map_err(|e| format!("starting `true`: {e}"))?;
     let mut args = perf_args(&data, &options);
     // Permission errors from perf are suppressed by --quiet.
     args.retain(|arg| arg != "--quiet");

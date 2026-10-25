@@ -3,6 +3,7 @@ mod signals;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -15,7 +16,7 @@ use uhr_core::filter::Filter;
 use uhr_core::functions::Function;
 use uhr_core::metric::Metric;
 use uhr_core::overview::{self, CPUTime, Overview};
-use uhr_core::perf::{self, RecordOptions, Unwind};
+use uhr_core::perf::{self, RecordOptions, Target, Unwind};
 use uhr_core::query::{
     self, FunctionRow, GroupBy, ModuleRow, Query, QueryResult, Rows, SyscallRow,
 };
@@ -42,7 +43,8 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Run a command under perf and write a recording
+    /// Record a command, or a running process, with perf and write a
+    /// recording
     Record {
         /// Directory for the recording. Must not exist
         #[arg(short, long)]
@@ -66,8 +68,16 @@ enum Command {
         /// switch often, but then nothing says why threads were off CPU
         #[arg(long)]
         no_off_cpu: bool,
+        /// Record this running process, and the threads and processes it
+        /// starts, rather than a command. It is not signalled
+        #[arg(long, conflicts_with = "command")]
+        pid: Option<u32>,
+        /// With --pid, stop after this long, such as 10s or 500ms, rather
+        /// than at Ctrl-C or when the process exits
+        #[arg(long, value_name = "DURATION", requires = "pid", value_parser = parse_offset)]
+        duration: Option<u64>,
         /// Command to profile, after `--`
-        #[arg(required = true, last = true)]
+        #[arg(required_unless_present = "pid", last = true)]
         command: Vec<String>,
     },
     /// Resolve function names in a recording against the files on this machine
@@ -267,16 +277,27 @@ fn main() -> ExitCode {
             unwind,
             stack_size,
             no_off_cpu,
+            pid,
+            duration,
             command,
-        } => run_record(
-            output,
-            frequency,
-            no_symbolize,
-            unwind,
-            stack_size,
-            !no_off_cpu,
-            command,
-        ),
+        } => {
+            let target = match pid {
+                Some(pid) => Target::Attach {
+                    pid,
+                    duration: duration.map(Duration::from_nanos),
+                },
+                None => Target::Launch(command),
+            };
+            run_record(
+                output,
+                frequency,
+                no_symbolize,
+                unwind,
+                stack_size,
+                !no_off_cpu,
+                target,
+            )
+        }
         Command::Symbolize { recording } => run_symbolize(&recording),
         Command::Overview {
             recording,
@@ -383,7 +404,7 @@ fn run_record(
     unwind: UnwindArg,
     stack_size: Option<u32>,
     off_cpu: bool,
-    command: Vec<String>,
+    target: Target,
 ) -> Result<ExitCode> {
     let unwind = match (unwind, stack_size) {
         (UnwindArg::Fp, None) => Unwind::FramePointers,
@@ -393,7 +414,7 @@ fn run_record(
         },
     };
     let options = RecordOptions {
-        command,
+        target,
         frequency_hz,
         unwind,
         off_cpu,
@@ -431,7 +452,11 @@ fn write_overview(out: &mut impl Write, result: &Overview) -> io::Result<()> {
         Some(Exit::Unknown(reason)) => format!("exit status unknown: {reason}"),
         None => "still running when the recording stopped".into(),
     };
-    writeln!(out, "{}, {exit}", result.command.join(" "))?;
+    let command = match &result.command[..] {
+        [] => "(no command line)".to_owned(),
+        command => command.join(" "),
+    };
+    writeln!(out, "{command}, {exit}")?;
     let window = &result.window;
     write!(out, "{} recorded", seconds(result.recording_duration_ns))?;
     if !result.filter.is_empty() {

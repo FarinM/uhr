@@ -132,6 +132,11 @@ Debian and Ubuntu its package must match the running kernel.
   uhr lets the target run, so the recording starts at its first instruction.
   Until then perf follows the target with a dummy event, and the held
   process still runs uhr's code, which the recording leaves out.
+- With `--pid`, uhr attaches perf the same way to a running process, and
+  follows the threads and processes it starts. It never signals the
+  process: the capture ends at an interrupt, at the end of `--duration`, or
+  when the process and all it started exit. uhr is not its parent, so its
+  exit status is unknown.
 - perf shares uhr's stderr. When that is a pipe or socket, uhr gives perf a
   pipe instead and copies it through, so a reader that stops early, as
   `head` does, can't kill perf with SIGPIPE. Terminals and files are passed

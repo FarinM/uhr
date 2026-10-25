@@ -7,9 +7,10 @@ use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
 
+use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use rustix::io::Errno;
 use rustix::pipe::{PipeFlags, pipe_with};
-use rustix::process::Signal;
+use rustix::process::{Pid, PidfdFlags, Signal, pidfd_open};
 
 /// Why a target could not be started.
 #[derive(Debug, thiserror::Error)]
@@ -148,6 +149,27 @@ impl Held {
             child,
             _starter: starter,
         })
+    }
+}
+
+/// A running process uhr did not start, by a pidfd, which unlike its pid
+/// can't come to mean another process.
+pub(crate) struct Process(OwnedFd);
+
+impl Process {
+    pub(crate) fn open(pid: u32) -> io::Result<Self> {
+        let pid = i32::try_from(pid)
+            .ok()
+            .and_then(Pid::from_raw)
+            .ok_or(Errno::SRCH)?;
+        Ok(Self(pidfd_open(pid, PidfdFlags::empty())?))
+    }
+
+    pub(crate) fn exited(&self) -> io::Result<bool> {
+        // A pidfd is readable once its process has exited.
+        let mut fds = [PollFd::new(&self.0, PollFlags::IN)];
+        poll(&mut fds, Some(&Timespec::default()))?;
+        Ok(fds[0].revents().contains(PollFlags::IN))
     }
 }
 

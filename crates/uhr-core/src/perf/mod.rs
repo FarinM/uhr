@@ -14,16 +14,16 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, Command, ExitStatus, Stdio};
 use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use rustix::io::{FdFlags, fcntl_setfd};
+use rustix::io::{Errno, FdFlags, fcntl_setfd};
 use rustix::pipe::{PipeFlags, pipe_with};
 use rustix::process::{Pid, Signal, kill_process, set_parent_process_death_signal};
 use tracing::{debug, info, warn};
 
 use crate::doctor;
 use crate::kallsyms::Kallsyms;
-use crate::launch::{self, Held, Interrupts};
+use crate::launch::{self, Held, Interrupts, Process, monotonic_ns};
 use crate::recording::{self, Collector, Exit, Recording};
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -41,6 +41,8 @@ pub enum Error {
     NoCommand,
     #[error("command not found or not executable: {0}")]
     CommandNotFound(String),
+    #[error("no process has the pid {0}")]
+    NoProcess(u32),
     #[error("{} already exists", .0.display())]
     OutputExists(PathBuf),
     /// The staging directory of a recording that did not finish.
@@ -101,12 +103,26 @@ fn io_error(action: &'static str, path: &Path) -> impl FnOnce(io::Error) -> Erro
 }
 
 pub struct RecordOptions {
-    pub command: Vec<String>,
+    pub target: Target,
     pub frequency_hz: u64,
     pub unwind: Unwind,
     /// Record every context switch, with the stack of each thread going
     /// off CPU.
     pub off_cpu: bool,
+}
+
+/// What to record.
+#[derive(Debug, Clone)]
+pub enum Target {
+    /// Start the command, and record it from its first instruction until it
+    /// exits.
+    Launch(Vec<String>),
+    /// Record a running process, and the threads and processes it starts,
+    /// until uhr is interrupted, `duration` ends, or they all exit.
+    Attach {
+        pid: u32,
+        duration: Option<Duration>,
+    },
 }
 
 /// How user stacks are walked.
@@ -120,7 +136,7 @@ pub enum Unwind {
     },
 }
 
-/// Records `options.command` with perf and writes the recording to `out`,
+/// Records `options.target` with perf and writes the recording to `out`,
 /// which must not exist. The recording is built in a sibling
 /// `.partial` directory and renamed into place once complete. The first of
 /// `interrupts` ends the capture, and a second kills the target.
@@ -141,10 +157,25 @@ pub fn record(options: &RecordOptions, interrupts: &Interrupts, out: &Path) -> R
             });
         }
     }
-    let Some(program) = options.command.first() else {
-        return Err(Error::NoCommand);
+    let (ready, command) = match &options.target {
+        Target::Launch(command) => {
+            let Some(program) = command.first() else {
+                return Err(Error::NoCommand);
+            };
+            check_program(program)?;
+            (Ready::Launch(command), command.clone())
+        }
+        &Target::Attach { pid, duration } => {
+            let process = Process::open(pid).map_err(|e| no_process(pid, e))?;
+            let command = command_line(pid, &process)?;
+            let ready = Ready::Attach {
+                pid,
+                duration,
+                process,
+            };
+            (ready, command)
+        }
     };
-    check_program(program)?;
     if out.exists() {
         return Err(Error::OutputExists(out.to_owned()));
     }
@@ -163,7 +194,7 @@ pub fn record(options: &RecordOptions, interrupts: &Interrupts, out: &Path) -> R
     let perf_version = doctor::perf_version().map_err(Error::PerfVersion)?;
     let max_stack_depth = read_max_stack_depth()?;
     let perf_data = staging.join("perf.data");
-    let ended = match run(&perf_data, options, interrupts) {
+    let ended = match run(&perf_data, options, interrupts, &ready) {
         Ok(ended) => ended,
         Err(error) => {
             remove_staging(&staging);
@@ -175,10 +206,10 @@ pub fn record(options: &RecordOptions, interrupts: &Interrupts, out: &Path) -> R
 
     let recording = convert::convert(convert::Input {
         perf_data: &perf_data,
-        command: &options.command,
-        launched_pid: Some(ended.pid),
-        exit: exit(ended.target),
-        interrupted_ns: ended.interrupted_ns,
+        command: &command,
+        launched_pid: ended.launched_pid,
+        exit: ended.exit,
+        stopped_ns: ended.stopped_ns,
         perf_version,
         requested_frequency_hz: options.frequency_hz,
         max_stack_depth,
@@ -299,12 +330,17 @@ pub(crate) fn perf_args(perf_data: &Path, options: &RecordOptions) -> Vec<OsStri
 }
 
 /// A perf command a person can run to see the error perf printed to
-/// itself: the same flags without --quiet, launching the command itself.
+/// itself: the same flags without --quiet, launching a command itself.
 fn diagnosis(options: &RecordOptions) -> String {
     let mut args = perf_args(Path::new("perf.data"), options);
     args.retain(|a| a != "--quiet");
-    args.push("--".into());
-    args.extend(options.command.iter().map(OsString::from));
+    match &options.target {
+        Target::Launch(command) => {
+            args.push("--".into());
+            args.extend(command.iter().map(OsString::from));
+        }
+        Target::Attach { pid, .. } => args.extend(["--pid".into(), pid.to_string().into()]),
+    }
     join_args(&args)
 }
 
@@ -323,18 +359,105 @@ fn remove_staging(staging: &Path) {
 
 /// How a capture ended.
 struct Ended {
-    pid: u32,
-    target: ExitStatus,
+    /// The process uhr started, when it launched the target.
+    launched_pid: Option<u32>,
+    exit: Option<Exit>,
     perf: ExitStatus,
-    /// When uhr first got SIGINT, if it did, on CLOCK_MONOTONIC.
-    interrupted_ns: Option<u64>,
+    /// When uhr stopped the capture before the target exited, on
+    /// CLOCK_MONOTONIC.
+    stopped_ns: Option<u64>,
 }
 
-/// Starts the target held, attaches perf to it, and lets it run once perf
-/// samples, so perf sees it from its first instruction.
-fn run(perf_data: &Path, options: &RecordOptions, interrupts: &Interrupts) -> Result<Ended> {
-    let held = Held::spawn(&options.command)?;
-    let pid = held.pid();
+/// A target checked and ready to record.
+enum Ready<'a> {
+    Launch(&'a [String]),
+    /// Opened before its command line was read, so that both and its exit
+    /// are of the same process.
+    Attach {
+        pid: u32,
+        duration: Option<Duration>,
+        process: Process,
+    },
+}
+
+fn run(
+    perf_data: &Path,
+    options: &RecordOptions,
+    interrupts: &Interrupts,
+    ready: &Ready,
+) -> Result<Ended> {
+    match ready {
+        // Held until perf samples, so perf sees it from its first
+        // instruction.
+        Ready::Launch(command) => {
+            let held = Held::spawn(command)?;
+            let pid = held.pid();
+            let mut sampling = sample(perf_data, options, pid)?;
+            let mut target = held.release()?;
+            let program = Path::new(&command[0]);
+            let (target, perf) =
+                supervise(program, &mut target.child, &mut sampling.perf, interrupts)?;
+            sampling.finish_relay();
+            Ok(Ended {
+                launched_pid: Some(pid),
+                exit: exit(target),
+                perf,
+                stopped_ns: interrupts.first_ns(),
+            })
+        }
+        Ready::Attach {
+            pid,
+            duration,
+            process,
+        } => {
+            let mut sampling = sample(perf_data, options, *pid)?;
+            match duration {
+                Some(duration) => info!(
+                    pid,
+                    seconds = duration.as_secs_f64(),
+                    "attached, recording for that long or until interrupted"
+                ),
+                None => info!(pid, "attached, recording until interrupted"),
+            }
+            let (perf, stopped_ns) = watch(&mut sampling.perf, interrupts, *duration)?;
+            sampling.finish_relay();
+            let exited = process.exited().map_err(|e| no_process(*pid, e))?;
+            if stopped_ns.is_none() && !exited {
+                warn!(pid, "perf stopped before the process exited");
+            }
+            // Only the process's parent sees its exit status.
+            let exit = exited.then(|| {
+                Exit::Unknown(
+                    "it exited while uhr was attached, and only its parent sees its exit status"
+                        .into(),
+                )
+            });
+            Ok(Ended {
+                launched_pid: None,
+                exit,
+                perf,
+                stopped_ns,
+            })
+        }
+    }
+}
+
+/// perf sampling a process, and the copy of its stderr if uhr relays it.
+struct Sampling {
+    perf: Perf,
+    relay: Option<mpsc::Receiver<()>>,
+}
+
+impl Sampling {
+    fn finish_relay(&self) {
+        if let Some(done) = &self.relay {
+            let _ = done.recv_timeout(RELAY_GRACE);
+        }
+    }
+}
+
+/// Attaches perf to `pid` and returns once it samples.
+fn sample(perf_data: &Path, options: &RecordOptions, pid: u32) -> Result<Sampling> {
     let mut args = perf_args(perf_data, options);
     args.extend(["--pid".into(), pid.to_string().into(), "--delay=-1".into()]);
     debug!(command = %format!("perf {}", join_args(&args)), "running perf");
@@ -346,28 +469,19 @@ fn run(perf_data: &Path, options: &RecordOptions, interrupts: &Interrupts) -> Re
     let perf_path = Path::new("perf");
     let mut perf = Perf::attach(perf_path, args, stderr).map_err(io_error("running", perf_path))?;
     let relay = perf.child.stderr.take().map(relay_stderr);
-    let finish_relay = || {
-        if let Some(done) = &relay {
-            let _ = done.recv_timeout(RELAY_GRACE);
-        }
-    };
-    if let Some(status) = perf.enable().map_err(io_error("waiting for", perf_path))? {
-        finish_relay();
+    let mut sampling = Sampling { perf, relay };
+    let exited = sampling
+        .perf
+        .enable()
+        .map_err(io_error("waiting for", perf_path))?;
+    if let Some(status) = exited {
+        sampling.finish_relay();
         return Err(Error::PerfStart {
             status,
             command: diagnosis(options),
         });
     }
-    let program = Path::new(&options.command[0]);
-    let mut target = held.release()?;
-    let (target, perf_status) = supervise(program, &mut target.child, &mut perf, interrupts)?;
-    finish_relay();
-    Ok(Ended {
-        pid,
-        target,
-        perf: perf_status,
-        interrupted_ns: interrupts.first_ns(),
-    })
+    Ok(sampling)
 }
 
 /// perf attached to a process with sampling off.
@@ -510,6 +624,34 @@ fn supervise(
     }
 }
 
+/// Waits for an interrupt or the end of `duration`, then stops perf, or
+/// for perf to stop by itself once the process and all it started exit. A
+/// process uhr attached to is never signalled. Returns perf's status, and
+/// when uhr stopped it.
+fn watch(
+    perf: &mut Perf,
+    interrupts: &Interrupts,
+    duration: Option<Duration>,
+) -> Result<(ExitStatus, Option<u64>)> {
+    let started = Instant::now();
+    let mut stopped_ns = None;
+    loop {
+        let status = perf
+            .child
+            .try_wait()
+            .map_err(io_error("waiting for", Path::new("perf")))?;
+        if let Some(status) = status {
+            return Ok((status, stopped_ns));
+        }
+        let ended = duration.is_some_and(|d| started.elapsed() >= d);
+        if stopped_ns.is_none() && (interrupts.count() > 0 || ended) {
+            stopped_ns = Some(interrupts.first_ns().unwrap_or_else(monotonic_ns));
+            perf.stop();
+        }
+        thread::sleep(POLL);
+    }
+}
+
 /// Processes the target leaves running can keep its stderr open long after
 /// perf exits, so the relay gets this long to copy what perf wrote.
 const RELAY_GRACE: Duration = Duration::from_millis(200);
@@ -554,6 +696,43 @@ fn exit(status: ExitStatus) -> Option<Exit> {
         .code()
         .map(Exit::Code)
         .or_else(|| status.signal().map(Exit::Signal))
+}
+
+fn no_process(pid: u32, error: io::Error) -> Error {
+    match Errno::from_io_error(&error) {
+        Some(Errno::SRCH) => Error::NoProcess(pid),
+        _ => Error::Io {
+            action: "watching",
+            path: PathBuf::from(format!("/proc/{pid}")),
+            source: error,
+        },
+    }
+}
+
+/// The command line of `process`, whose pid is `pid`.
+fn command_line(pid: u32, process: &Process) -> Result<Vec<String>> {
+    let path = PathBuf::from(format!("/proc/{pid}/cmdline"));
+    let bytes = fs::read(&path);
+    // Gone, its pid may already be another process's.
+    if process.exited().map_err(|e| no_process(pid, e))? {
+        return Err(Error::NoProcess(pid));
+    }
+    let bytes = bytes.map_err(io_error("reading", &path))?;
+    Ok(arguments(&bytes))
+}
+
+/// Each argument in /proc/<pid>/cmdline ends with a NUL, so an empty one is
+/// a NUL alone. A kernel thread has none at all.
+fn arguments(cmdline: &[u8]) -> Vec<String> {
+    if cmdline.is_empty() {
+        return Vec::new();
+    }
+    cmdline
+        .strip_suffix(&[0])
+        .unwrap_or(cmdline)
+        .split(|&b| b == 0)
+        .map(|arg| String::from_utf8_lossy(arg).into_owned())
+        .collect()
 }
 
 /// perf is quiet about a missing command and just exits with 255.
@@ -608,5 +787,18 @@ mod tests {
         drop(attached);
         let gone = fs::read_to_string(format!("/proc/{pid}/stat")).is_err();
         assert!(gone, "perf {pid} was left behind");
+    }
+
+    #[test]
+    fn keeps_empty_arguments() {
+        assert_eq!(
+            arguments(b"python3\0-c\0x\0\0last\0\0"),
+            ["python3", "-c", "x", "", "last", ""]
+        );
+        assert_eq!(arguments(b"\0"), [""]);
+        assert!(arguments(b"").is_empty());
+        // A process that rewrote its command line can leave out the last
+        // NUL.
+        assert_eq!(arguments(b"worker: idle"), ["worker: idle"]);
     }
 }
