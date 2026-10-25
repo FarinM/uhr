@@ -149,7 +149,8 @@ Debian and Ubuntu its package must match the running kernel.
   target itself, and uhr passes on a signal another process sent it. That
   includes one sent to uhr's whole process group, which the target then gets
   twice. A second interrupt kills the target. If perf stops first, uhr asks
-  the target to stop with SIGTERM.
+  the target to stop with SIGTERM. An interrupt before the capture starts
+  ends uhr without a recording, and a target to launch never runs.
 
 ### eBPF on Linux
 

@@ -43,6 +43,8 @@ pub enum Error {
     CommandNotFound(String),
     #[error("no process has the pid {0}")]
     NoProcess(u32),
+    #[error("interrupted before the capture started")]
+    Interrupted,
     #[error("{} already exists", .0.display())]
     OutputExists(PathBuf),
     /// The staging directory of a recording that did not finish.
@@ -139,7 +141,9 @@ pub enum Unwind {
 /// Records `options.target` with perf and writes the recording to `out`,
 /// which must not exist. The recording is built in a sibling
 /// `.partial` directory and renamed into place once complete. The first of
-/// `interrupts` ends the capture, and a second kills the target.
+/// `interrupts` ends the capture, and a second kills the target. One that
+/// comes before the capture starts ends it with nothing recorded, so
+/// callers can count interrupts from before they call.
 pub fn record(options: &RecordOptions, interrupts: &Interrupts, out: &Path) -> Result<Recording> {
     let report = doctor::check_perf();
     if let Some(check) = report.blocked().next() {
@@ -178,6 +182,9 @@ pub fn record(options: &RecordOptions, interrupts: &Interrupts, out: &Path) -> R
     };
     if out.exists() {
         return Err(Error::OutputExists(out.to_owned()));
+    }
+    if interrupts.count() > 0 {
+        return Err(Error::Interrupted);
     }
     let staging = staging_dir(out)?;
     if let Some(parent) = staging.parent().filter(|p| !p.as_os_str().is_empty()) {
@@ -393,6 +400,7 @@ fn run(
             let held = Held::spawn(command)?;
             let pid = held.pid();
             let mut sampling = sample(perf_data, options, pid)?;
+            sampling.stop_if_interrupted(interrupts)?;
             let mut target = held.release()?;
             let program = Path::new(&command[0]);
             let (target, perf) =
@@ -411,6 +419,7 @@ fn run(
             process,
         } => {
             let mut sampling = sample(perf_data, options, *pid)?;
+            sampling.stop_if_interrupted(interrupts)?;
             match duration {
                 Some(duration) => info!(
                     pid,
@@ -449,6 +458,17 @@ struct Sampling {
 }
 
 impl Sampling {
+    /// An interrupt that came before the capture started ends uhr there.
+    fn stop_if_interrupted(&mut self, interrupts: &Interrupts) -> Result<()> {
+        if interrupts.count() == 0 {
+            return Ok(());
+        }
+        self.perf.stop();
+        let _ = self.perf.wait();
+        self.finish_relay();
+        Err(Error::Interrupted)
+    }
+
     fn finish_relay(&self) {
         if let Some(done) = &self.relay {
             let _ = done.recv_timeout(RELAY_GRACE);
