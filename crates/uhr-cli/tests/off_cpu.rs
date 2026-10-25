@@ -164,6 +164,35 @@ fn tells_computing_from_waiting_and_why() {
         number(&futex["time_ns"]) > 0.95 * number(&paths["total_ns"]),
         "{futex}"
     );
+
+    let syscall_share = |thread: &str, syscall: &str| {
+        let result = json(&[
+            "query",
+            &recording,
+            "--group-by",
+            "syscall",
+            "--metric",
+            "off-cpu",
+            "--thread",
+            thread,
+        ]);
+        result["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["syscall"] == syscall)
+            .map_or(0.0, |r| number(&r["share"]))
+    };
+    let napping = syscall_share("napper", "clock_nanosleep");
+    assert!(napping > 0.95, "napper is {napping} in clock_nanosleep");
+    let locking = syscall_share("locker", "futex");
+    assert!(locking > 0.95, "locker is {locking} in futex");
+    let in_futex = off_cpu(
+        &recording,
+        &["--under", "wait_for_lock", "--syscall", "futex"],
+    );
+    let share = number(&in_futex["time_ns"]) / number(&locked["time_ns"]);
+    assert!(share > 0.95, "{share} of the lock wait is in futex");
 }
 
 #[test]

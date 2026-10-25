@@ -3,6 +3,9 @@
 
 mod common;
 
+use std::fs;
+use std::path::Path;
+
 use serde_json::Value;
 
 use common::{compile, scratch, uhr};
@@ -120,5 +123,52 @@ fn the_time_is_in_the_kernel_on_behalf_of_read_zero() {
             .iter()
             .all(|r| r["origin"] == "kernel" || r["self_ns"] == 0),
         "only kernel code runs in kernel mode"
+    );
+
+    let modules = json(&["query", recording, "--group-by", "module"]);
+    let module = |path: &dyn Fn(&str) -> bool| {
+        modules["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["module"].as_str().is_some_and(path))
+            .unwrap_or_else(|| panic!("no such module in {modules}"))
+    };
+    let in_kernel = module(&|path| path == "[kernel]")["self_share"]
+        .as_f64()
+        .unwrap();
+    assert!(
+        (in_kernel - kernel).abs() <= 0.05,
+        "{in_kernel} of the time in kernel code, {kernel} in kernel mode"
+    );
+    let under_program = module(&|path| path.ends_with("/syscalls"))["total_share"]
+        .as_f64()
+        .unwrap();
+    assert!(under_program > 0.95, "{under_program}");
+
+    let manifest: Value =
+        serde_json::from_slice(&fs::read(Path::new(recording).join("manifest.json")).unwrap())
+            .unwrap();
+    if manifest["kernel_symbols"]["status"] != "saved" {
+        return;
+    }
+    let syscalls = json(&["query", recording, "--group-by", "syscall"]);
+    let share = |wanted: &dyn Fn(&Value) -> bool| {
+        syscalls["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| wanted(r))
+            .map_or(0.0, |r| r["share"].as_f64().unwrap())
+    };
+    let read = share(&|r| r["syscall"] == "read");
+    assert!(
+        read > kernel - 0.05,
+        "{read} of the time in read, {kernel} in the kernel: {syscalls}"
+    );
+    let outside = share(&|r| r["in_syscall"] == false);
+    assert!(
+        (outside - (1.0 - kernel)).abs() <= 0.05,
+        "{outside} of the time not in a syscall, {kernel} in the kernel: {syscalls}"
     );
 }
