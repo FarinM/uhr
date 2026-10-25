@@ -1,12 +1,13 @@
 use std::ffi::OsString;
-use std::fs::File;
-use std::io::{self, Read};
+use std::fs::{self, File};
+use std::io::{self, ErrorKind, Read};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command};
 use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use rustix::io::Errno;
@@ -168,6 +169,43 @@ impl Process {
             .and_then(Pid::from_raw)
             .ok_or(Errno::SRCH)?;
         Ok(Self(pidfd_open(pid, PidfdFlags::empty())?))
+    }
+
+    /// When the process with the pid `pid` started.
+    pub(crate) fn started(pid: u32) -> io::Result<SystemTime> {
+        let stat = fs::read_to_string(format!("/proc/{pid}/stat"))?;
+        let unreadable = || io::Error::new(ErrorKind::InvalidData, "unreadable /proc/<pid>/stat");
+        // Its name, in parentheses, can hold spaces. The start comes 20
+        // fields after it, in clock ticks since boot.
+        let (_, after_name) = stat.rsplit_once(')').ok_or_else(unreadable)?;
+        let ticks: u64 = after_name
+            .split_whitespace()
+            .nth(19)
+            .and_then(|t| t.parse().ok())
+            .ok_or_else(unreadable)?;
+        let boot: u64 = fs::read_to_string("/proc/stat")?
+            .lines()
+            .find_map(|line| line.strip_prefix("btime ")?.trim().parse().ok())
+            .ok_or_else(unreadable)?;
+        let per_second = rustix::param::clock_ticks_per_second();
+        let since_boot = Duration::from_secs_f64(ticks as f64 / per_second as f64);
+        Ok(UNIX_EPOCH + Duration::from_secs(boot) + since_boot)
+    }
+
+    /// The user that files the process with the pid `pid` creates belong to.
+    pub(crate) fn file_owner(pid: u32) -> io::Result<u32> {
+        let status = fs::read_to_string(format!("/proc/{pid}/status"))?;
+        // Its real, effective, saved and filesystem user ids.
+        status
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("Uid:")?
+                    .split_whitespace()
+                    .nth(3)?
+                    .parse()
+                    .ok()
+            })
+            .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "unreadable /proc/<pid>/status"))
     }
 
     pub(crate) fn exited(&self) -> io::Result<bool> {

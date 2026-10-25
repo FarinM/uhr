@@ -20,6 +20,7 @@ const FRAMES: &str = "frames.parquet";
 const STACKS: &str = "stacks.parquet";
 const SAMPLES: &str = "samples.parquet";
 const KERNEL_SYMBOLS: &str = "kernel_symbols.parquet";
+const JIT_SYMBOLS: &str = "jit_symbols.parquet";
 const OFF_CPU: &str = "off_cpu.parquet";
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -122,6 +123,8 @@ pub struct Recording {
     pub off_cpu: Vec<OffCPUInterval>,
     /// Sorted by start, and not overlapping.
     pub kernel_symbols: Vec<KernelSymbol>,
+    /// Sorted by pid and start, and not overlapping in a process.
+    pub jit_symbols: Vec<JitSymbol>,
 }
 
 /// One lifetime of a thread. The kernel reuses ids, so `(pid, tid)` can
@@ -153,6 +156,9 @@ pub struct ThreadName {
 /// brackets, as in `[ext4]`.
 pub const KERNEL: &str = "[kernel]";
 
+/// The source of the names of code runtimes compiled.
+pub const JIT: &str = "[jit]";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Mapping {
     /// `None` for kernel mappings.
@@ -183,6 +189,9 @@ pub struct Frame {
 pub enum Origin {
     Binary,
     Kernel,
+    /// Code a runtime compiled as it ran, which the runtime named in its
+    /// perf map.
+    Jit,
     /// No known code mapping contains the address.
     Unresolved,
 }
@@ -192,6 +201,7 @@ impl Origin {
         match self {
             Origin::Binary => "binary",
             Origin::Kernel => "kernel",
+            Origin::Jit => "jit",
             Origin::Unresolved => "unresolved",
         }
     }
@@ -200,10 +210,23 @@ impl Origin {
         Ok(match value {
             "binary" => Origin::Binary,
             "kernel" => Origin::Kernel,
+            "jit" => Origin::Jit,
             "unresolved" => Origin::Unresolved,
             _ => return Err(format!("unknown frame origin {value:?}")),
         })
     }
+}
+
+/// Code a runtime compiled, as its perf map named it while recording. Only
+/// the code frames fall in is kept: the map can be gone later, or belong to
+/// a later process with the same pid.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JitSymbol {
+    pub pid: u32,
+    pub start: u64,
+    /// Exclusive.
+    pub end: u64,
+    pub name: String,
 }
 
 /// A kernel function or BPF program, as the kernel listed it while
@@ -337,6 +360,7 @@ impl Recording {
             samples: read_samples(dir)?,
             off_cpu: read_off_cpu(dir)?,
             kernel_symbols: read_kernel_symbols(dir)?,
+            jit_symbols: read_jit_symbols(dir)?,
         };
         recording
             .check_references()
@@ -360,6 +384,22 @@ impl Recording {
             .partition_point(|s| s.start <= address)
             .checked_sub(1)?;
         Some(&symbols[index]).filter(|s| address < s.end)
+    }
+
+    /// The saved runtime code a JIT frame falls in.
+    pub fn jit_symbol(&self, frame: &Frame) -> Option<&JitSymbol> {
+        if frame.origin != Origin::Jit {
+            return None;
+        }
+        let pid = self.mappings[frame.mapping? as usize].pid?;
+        let address = frame
+            .address
+            .saturating_sub(u64::from(frame.return_address));
+        let symbols = &self.jit_symbols;
+        let index = symbols
+            .partition_point(|s| (s.pid, s.start) <= (pid, address))
+            .checked_sub(1)?;
+        Some(&symbols[index]).filter(|s| s.pid == pid && address < s.end)
     }
 
     fn write_tables(&self, dir: &Path) -> Result<()> {
@@ -474,6 +514,17 @@ impl Recording {
                     symbols.iter().map(|s| s.module.as_deref()).collect(),
                 ),
             ],
+        )?;
+
+        let symbols = &self.jit_symbols;
+        table::write(
+            &dir.join(JIT_SYMBOLS),
+            vec![
+                Column::u32("pid", symbols.iter().map(|s| s.pid).collect()),
+                Column::u64("start", symbols.iter().map(|s| s.start).collect()),
+                Column::u64("end", symbols.iter().map(|s| s.end).collect()),
+                Column::string("name", symbols.iter().map(|s| s.name.as_str()).collect()),
+            ],
         )
     }
 
@@ -514,6 +565,18 @@ impl Recording {
             if index > 0 && self.kernel_symbols[index - 1].end > symbol.start {
                 return Err(format!(
                     "kernel symbol {index} starts before the one before it ends"
+                ));
+            }
+        }
+        for (index, symbol) in self.jit_symbols.iter().enumerate() {
+            if symbol.start >= symbol.end {
+                return Err(format!("JIT symbol {index} has start >= end"));
+            }
+            if let Some(before) = index.checked_sub(1).map(|i| &self.jit_symbols[i])
+                && (before.pid, before.end) > (symbol.pid, symbol.start)
+            {
+                return Err(format!(
+                    "JIT symbol {index} is not after the one before it in pid and address"
                 ));
             }
         }
@@ -690,6 +753,22 @@ fn read_kernel_symbols(dir: &Path) -> Result<Vec<KernelSymbol>> {
             end: end[i],
             name: std::mem::take(&mut name[i]),
             module: module[i].take(),
+        })
+        .collect())
+}
+
+fn read_jit_symbols(dir: &Path) -> Result<Vec<JitSymbol>> {
+    let table = Table::read(&dir.join(JIT_SYMBOLS))?;
+    let pid = table.u32("pid")?;
+    let start = table.u64("start")?;
+    let end = table.u64("end")?;
+    let mut name = table.string("name")?;
+    Ok((0..table.len())
+        .map(|i| JitSymbol {
+            pid: pid[i],
+            start: start[i],
+            end: end[i],
+            name: std::mem::take(&mut name[i]),
         })
         .collect())
 }

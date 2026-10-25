@@ -340,6 +340,7 @@ pub(super) fn convert(input: Input) -> Result<Recording> {
         samples: state.samples,
         off_cpu: state.off_cpu,
         kernel_symbols,
+        jit_symbols: Vec::new(),
     })
 }
 
@@ -414,6 +415,9 @@ struct State {
     /// Mapping ids live in each process, oldest first. A later mapping
     /// shadows an earlier one at the same address.
     processes: HashMap<u32, Vec<u32>>,
+    /// A process's own copy of a mapping it inherited, by the mapping and
+    /// the process.
+    own_mappings: HashMap<(u32, u32), u32>,
     kernel_mappings: Vec<u32>,
     frames: Vec<Frame>,
     frame_ids: HashMap<Frame, u32>,
@@ -458,6 +462,7 @@ impl State {
             thread_names: Vec::new(),
             mappings: Vec::new(),
             processes: HashMap::new(),
+            own_mappings: HashMap::new(),
             kernel_mappings: Vec::new(),
             frames: Vec::new(),
             frame_ids: HashMap::new(),
@@ -838,7 +843,7 @@ impl State {
                     _ => Frame {
                         origin: Origin::Unresolved,
                         address,
-                        mapping,
+                        mapping: mapping.map(|id| self.own_mapping(id, pid)),
                         file_offset: None,
                         return_address,
                     },
@@ -853,6 +858,27 @@ impl State {
             },
         };
         intern(&mut self.frames, &mut self.frame_ids, frame)
+    }
+
+    /// The mapping `id` as the process `pid`'s own. A child shares the files
+    /// it inherited, but fills memory that is not a file, such as a JIT's,
+    /// in its own way, so its frames there are its own.
+    fn own_mapping(&mut self, id: u32, pid: u32) -> u32 {
+        let mapping = &self.mappings[id as usize];
+        if mapping.pid == Some(pid) {
+            return id;
+        }
+        if let Some(&copy) = self.own_mappings.get(&(id, pid)) {
+            return copy;
+        }
+        let copy = Mapping {
+            pid: Some(pid),
+            ..mapping.clone()
+        };
+        self.mappings.push(copy);
+        let copy = self.mappings.len() as u32 - 1;
+        self.own_mappings.insert((id, pid), copy);
+        copy
     }
 
     fn find_mapping(&self, ids: &[u32], address: u64) -> Option<u32> {
@@ -994,6 +1020,29 @@ mod tests {
             build_id: None,
             time: None,
         }
+    }
+
+    #[test]
+    fn gives_a_child_its_own_copy_of_memory_that_is_not_a_file() {
+        let mut state = State::new(127);
+        state.mmap(mmap(1, 0x1000, "/app", false, true)).unwrap();
+        state.mmap(mmap(1, 0x8000, "//anon", false, true)).unwrap();
+        state.fork(2, 2, Some((1, 1)), Some(10));
+        let frames = |state: &mut State, pid| {
+            [0x1010, 0x8010].map(|address| state.frame(pid, ChainContext::User, address, false))
+        };
+        let parent = frames(&mut state, 1);
+        let child = frames(&mut state, 2);
+        assert_eq!(parent[0], child[0]);
+        assert_ne!(parent[1], child[1]);
+        let pid = |frame: u32| {
+            let mapping = state.frames[frame as usize].mapping.unwrap();
+            state.mappings[mapping as usize].pid
+        };
+        assert_eq!(pid(child[0]), Some(1));
+        assert_eq!(pid(child[1]), Some(2));
+        assert_eq!(frames(&mut state, 2), child);
+        assert_eq!(state.mappings.len(), 3);
     }
 
     #[test]

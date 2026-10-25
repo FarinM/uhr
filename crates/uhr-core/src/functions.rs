@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use serde::Serialize;
 
 use crate::recording::{KERNEL, Origin, Recording};
+use crate::runtimes::{JitCode, jit_code};
 use crate::symbols::{FrameName, InlineFrame, Symbols};
 
 /// One function, or the unnamed code of one module.
@@ -92,6 +93,24 @@ enum Code<'a> {
         file: Option<&'a str>,
         line: Option<u32>,
     },
+    /// Code a runtime compiled, which moves from run to run, by what the
+    /// runtime called it.
+    Jit(Jit<'a>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Jit<'a> {
+    /// One of the program's functions, as its id names it.
+    Function {
+        runtime: &'static str,
+        file: &'a str,
+        name: Option<&'a str>,
+        /// Only for an anonymous function.
+        start: Option<&'a str>,
+    },
+    /// The runtime's own code, or code of a runtime uhr can't read the
+    /// names of, by its name in the map.
+    Named(&'a str),
 }
 
 type Key<'a> = (Origin, Option<Module<'a>>, Code<'a>);
@@ -160,11 +179,34 @@ impl Functions {
                 });
                 let inline = symbols.map_or(&[][..], |s| &s.inline[frame_id]);
                 let mut function = |code: Code<'a>, make: &dyn Fn() -> Function| {
+                    // The same runtime code in other processes, or other
+                    // copies of it, is one function.
+                    let module = module.filter(|_| !matches!(code, Code::Jit(_)));
                     *ids.entry((frame.origin, module, code)).or_insert_with(|| {
                         functions.push(make());
                         functions.len() as u32 - 1
                     })
                 };
+                if let Some(symbol) = symbols.and(recording.jit_symbol(frame)) {
+                    let code = jit_code(&symbol.name);
+                    let key = match code {
+                        Some(JitCode {
+                            runtime,
+                            function: Some(f),
+                        }) => Jit::Function {
+                            runtime,
+                            file: f.file,
+                            name: f.name,
+                            start: f.start.filter(|_| f.name.is_none()),
+                        },
+                        _ => Jit::Named(&symbol.name),
+                    };
+                    let id = function(Code::Jit(key), &|| jit_function(&symbol.name, code));
+                    return vec![Step {
+                        function: id,
+                        line: None,
+                    }];
+                }
                 if frame.mapping.is_none()
                     && let Some(symbol) = symbols.and(recording.kernel_symbol(frame))
                 {
@@ -328,6 +370,57 @@ impl Functions {
     }
 }
 
+/// A function of code a runtime compiled. One of the program's functions is
+/// in the runtime's module, as in `[python]`, and has an id from its name
+/// and file, which stays the same from run to run. An anonymous one has
+/// where it starts in place of a name. Code the map names in another way
+/// keeps that name.
+fn jit_function(name: &str, code: Option<JitCode>) -> Function {
+    let (id, display, file) = match code {
+        Some(JitCode {
+            runtime,
+            function: Some(function),
+        }) => {
+            let named = match (function.name, function.start) {
+                (Some(name), _) => escape(name),
+                (None, start) => format!("@{}", escape(start.unwrap_or_default())),
+            };
+            (
+                format!("jit+{runtime}:{named}:{}", function.file),
+                function.name.unwrap_or("(anonymous)").to_owned(),
+                Some(function.file.to_owned()),
+            )
+        }
+        Some(JitCode { runtime, .. }) => (format!("jit+{runtime}+{name}"), name.to_owned(), None),
+        None => (format!("jit:{name}"), name.to_owned(), None),
+    };
+    Function {
+        id: Some(id),
+        name: Some(display),
+        placeholder: None,
+        inlined: false,
+        module: code.map(|code| format!("[{}]", code.runtime)),
+        build_id: None,
+        function_address: None,
+        file,
+        origin: Origin::Jit,
+    }
+}
+
+/// Escapes what ends a name in a JIT id, so that no two functions share one.
+fn escape(name: &str) -> String {
+    let mut escaped = String::with_capacity(name.len());
+    for c in name.chars() {
+        match c {
+            '%' => escaped.push_str("%25"),
+            ':' => escaped.push_str("%3A"),
+            '@' => escaped.push_str("%40"),
+            c => escaped.push(c),
+        }
+    }
+    escaped
+}
+
 /// The tag and name of a BPF program, from its kernel symbol
 /// `bpf_prog_<tag>` or `bpf_prog_<tag>_<name>`. The name tells apart
 /// functions with the same instructions.
@@ -348,4 +441,37 @@ fn fnv1a(parts: &[&str]) -> u64 {
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
     hash
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtimes::JitFunction;
+
+    fn id(name: Option<&str>, file: &str, start: Option<&str>) -> String {
+        let code = JitCode {
+            runtime: "node",
+            function: Some(JitFunction { name, file, start }),
+        };
+        jit_function("", Some(code)).id.unwrap()
+    }
+
+    #[test]
+    fn gives_every_jit_function_its_own_id() {
+        assert_eq!(id(Some("hot"), "/a.js", None), "jit+node:hot:/a.js");
+        assert_ne!(
+            id(Some("b:hot"), "/a.js", None),
+            id(Some("hot"), "/a.js:b", None)
+        );
+        assert_eq!(id(None, "/a.js", Some("6:15")), "jit+node:@6%3A15:/a.js");
+        assert_ne!(id(None, "/a.js", Some("6")), id(Some("@6"), "/a.js", None));
+        assert_ne!(
+            jit_function("Builtin:X", jit_code("Builtin:X")).id,
+            id(Some("Builtin"), "X", None).into()
+        );
+        assert_ne!(
+            jit_function("node+Builtin:X", None).id,
+            jit_function("Builtin:X", jit_code("Builtin:X")).id
+        );
+    }
 }

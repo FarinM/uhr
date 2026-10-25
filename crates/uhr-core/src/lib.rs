@@ -8,6 +8,7 @@ pub mod launch;
 pub mod metric;
 pub mod overview;
 pub mod perf;
+mod perf_map;
 pub mod query;
 pub mod recording;
 mod runtimes;

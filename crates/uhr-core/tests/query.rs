@@ -74,6 +74,7 @@ fn recording() -> Recording {
         samples: vec![sample(0, 6), sample(0, 2), sample(1, 1), sample(2, 1)],
         off_cpu: Vec::new(),
         kernel_symbols: Vec::new(),
+        jit_symbols: Vec::new(),
     }
 }
 
@@ -1091,4 +1092,98 @@ fn off_cpu_time_without_a_stack_is_in_no_syscall() {
     };
     let result = run(&recording, Some(&symbols), &query).unwrap();
     assert_eq!((result.off_cpu_intervals, result.time_ns), (1, 5));
+}
+
+/// Code runtimes compiled in two processes: `inner` in each, then one of
+/// V8's builtins, and code no runtime uhr reads the names of. Each is
+/// sampled for 1, called from main.
+fn with_jit() -> (Recording, Symbols) {
+    let (mut recording, mut symbols) = (recording(), symbols());
+    let names = [
+        (1, "py::inner:/app/spin.py"),
+        (2, "py::inner:/app/spin.py"),
+        (2, "Builtin:ArrayPrototypePush"),
+        (2, "[OptimizedTier1] Program::Main()"),
+    ];
+    for (i, (pid, name)) in names.into_iter().enumerate() {
+        let start = 0x7f00_0000_0000 + 0x1000 * i as u64;
+        recording.mappings.push(Mapping {
+            pid: Some(pid),
+            start,
+            end: start + 0x1000,
+            file_offset: 0,
+            path: "//anon".into(),
+            build_id: None,
+            time_ns: None,
+        });
+        recording.frames.push(Frame {
+            origin: Origin::Jit,
+            address: start + 0x10,
+            mapping: Some(recording.mappings.len() as u32 - 1),
+            file_offset: None,
+            return_address: false,
+        });
+        recording.jit_symbols.push(JitSymbol {
+            pid,
+            start,
+            end: start + 0x20,
+            name: name.into(),
+        });
+        symbols.function_addresses.push(None);
+        symbols.names.push(Some(FrameName::Symbol(name.into())));
+        symbols.inline.push(Vec::new());
+        recording
+            .stacks
+            .push(vec![recording.frames.len() as u32 - 1, 3]);
+        recording
+            .samples
+            .push(sample(recording.stacks.len() as u32 - 1, 1));
+    }
+    recording.jit_symbols.sort_by_key(|s| (s.pid, s.start));
+    (recording, symbols)
+}
+
+#[test]
+fn groups_code_runtimes_compiled_by_their_names() {
+    let (recording, symbols) = with_jit();
+    let result = run(&recording, Some(&symbols), &query(20)).unwrap();
+    let jit: Vec<_> = function_rows(&result)
+        .iter()
+        .filter(|r| r.function.origin == Origin::Jit)
+        .map(|r| {
+            (
+                r.function.name.as_deref().unwrap(),
+                r.function.id.as_deref().unwrap(),
+                r.function.module.as_deref(),
+                r.function.file.as_deref(),
+                r.self_ns,
+            )
+        })
+        .collect();
+    assert_eq!(
+        jit,
+        [
+            (
+                "inner",
+                "jit+python:inner:/app/spin.py",
+                Some("[python]"),
+                Some("/app/spin.py"),
+                2
+            ),
+            (
+                "Builtin:ArrayPrototypePush",
+                "jit+node+Builtin:ArrayPrototypePush",
+                Some("[node]"),
+                None,
+                1
+            ),
+            (
+                "[OptimizedTier1] Program::Main()",
+                "jit:[OptimizedTier1] Program::Main()",
+                None,
+                None,
+                1
+            ),
+        ]
+    );
 }

@@ -140,7 +140,16 @@ Debian and Ubuntu its package must match the running kernel.
   and programs that don't read them ignore them. A variable the user set is
   left alone, except that each of Node's flags is added to the options
   already there, unless they hold it or turn it off. It makes those
-  runtimes a little slower.
+  runtimes a little slower. uhr reads the maps right after recording, if
+  they belong to root, to the user the target started as, or to one the
+  process ran as when its map appeared or still runs as. A process can
+  change user first, as one `sudo -u` runs does, so uhr watches `/tmp`
+  while recording. Once the recording is written, uhr removes the maps of
+  the processes it launched. Node also writes V8's log,
+  `isolate-0x<isolate>-<pid>-v8.log`, in its working directory, which no
+  option in its environment can move. uhr removes those it finds in the
+  directory the target started in, and says when a Node process left its
+  log elsewhere.
 - With `--pid`, uhr attaches perf the same way to a running process, and
   follows the threads and processes it starts. It never signals the
   process: the capture ends at an interrupt, at the end of `--duration`, or
@@ -192,7 +201,7 @@ Resolution decides what kind of memory the address is in and how to name it.
 | Binary or library | ELF/Mach-O/PE symbols and DWARF/dSYM/PDB, matched by build-id. debuginfod when local debug info is missing |
 | Kernel and modules | `kallsyms`, vmlinux BTF/DWARF |
 | eBPF programs | `bpf_prog_<tag>_<name>` symbols in `kallsyms` (needs `net.core.bpf_jit_kallsyms=1`). BTF line info maps back to program source. `kernel.bpf_stats_enabled` gives per-program run time and run count |
-| JIT code with a map | perf map files or jitdump: Node `--perf-basic-prof`/`--perf-prof`, Python 3.12+ `-X perf`, JVM through async-profiler, .NET `DOTNET_PerfMapEnabled=1`, Wasmtime `--profile` |
+| JIT code with a map | perf map files, read right after recording: Python 3.12+ and Node, which uhr turns on at launch. Candidates: jitdump (Node `--perf-prof`, Python 3.13+ `-X perf_jit`), JVM through async-profiler, .NET `DOTNET_PerfMapEnabled=1`, Wasmtime `--profile` |
 | JIT code without a map | Name the region (address range, thread, likely runtime), copy its code bytes so instruction views still work, and count it as unresolved |
 | Interpreted frames | A collector that reads the interpreter's frames, or the runtime's own profiler. See [runtimes](#runtimes) |
 
@@ -210,7 +219,8 @@ matter are the program's, not the interpreter's. A runtime can name its code
 for a native sampler, in perf map files or jitdump; a collector can read the
 interpreter's frames from its memory; or the runtime's own profiler can
 record them. Which way a runtime uses is decided when it is supported, and
-each supported runtime gets a test program. uhr detects the runtimes in a
+each supported runtime gets a test program. Python 3.12 and later and Node
+name their code in perf maps. uhr detects the runtimes in a
 target and records their versions. What it knows about a runtime's frames is
 kept apart from how it reads memory, so other platforms can use it too.
 

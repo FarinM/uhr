@@ -29,6 +29,8 @@ uhr record -o rec -- ./my-program args     # record CPU samples and context swit
                                            # and resolve names
 uhr record -o rec --pid 4312 --duration 10s
                                            # the same for a running process
+uhr record -o rec -- python3 app.py        # Python 3.12+ and Node functions get
+                                           # names too
 uhr overview rec                           # computing or waiting? CPU time by mode
                                            # and time off CPU, runnable or blocked,
                                            # by process and thread, against time alive

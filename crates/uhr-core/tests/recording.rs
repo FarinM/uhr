@@ -162,6 +162,20 @@ fn example() -> Recording {
                 module: Some("ext4".into()),
             },
         ],
+        jit_symbols: vec![
+            JitSymbol {
+                pid: 7,
+                start: 0x7f00_0000_1000,
+                end: 0x7f00_0000_1080,
+                name: "py::inner:/app/spin.py".into(),
+            },
+            JitSymbol {
+                pid: 7,
+                start: 0x7f00_0000_1080,
+                end: 0x7f00_0000_10c0,
+                name: "py::outer:/app/spin.py".into(),
+            },
+        ],
     }
 }
 
@@ -233,6 +247,19 @@ fn rejects_overlapping_kernel_symbols() {
     match recording.write(&dir).unwrap_err() {
         Error::Invalid { reason, .. } => {
             assert!(reason.contains("kernel symbol 1 starts before"), "{reason}");
+        }
+        error => panic!("{error}"),
+    }
+}
+
+#[test]
+fn rejects_overlapping_jit_symbols() {
+    let dir = scratch("overlapping_jit_symbols");
+    let mut recording = example();
+    recording.jit_symbols[0].end = 0x7f00_0000_1081;
+    match recording.write(&dir).unwrap_err() {
+        Error::Invalid { reason, .. } => {
+            assert!(reason.contains("JIT symbol 1 is not after"), "{reason}");
         }
         error => panic!("{error}"),
     }

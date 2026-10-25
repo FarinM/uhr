@@ -17,6 +17,7 @@ A recording is a directory:
 | `samples.parquet` | CPU samples |
 | `off_cpu.parquet` | Times threads spent off CPU, with why and where |
 | `kernel_symbols.parquet` | The kernel functions kernel frames fall in, read while recording |
+| `jit_symbols.parquet` | The code runtimes compiled that frames fall in, named in the runtimes' perf maps while recording |
 | `symbols.parquet` | Function name per frame, after symbol resolution |
 | `symbol_sources.parquet` | Files the names came from, and why some frames have none |
 | `inline_frames.parquet` | Inlined calls and source lines per frame, from debug info |
@@ -91,7 +92,7 @@ Each stream has:
 | Column | Type | Meaning |
 |---|---|---|
 | `mapping_id` | uint32 | |
-| `pid` | uint32, nullable | Null for kernel mappings |
+| `pid` | uint32, nullable | Null for kernel mappings. A forked process shares its parent's mappings of files, but has its own copy of other memory its frames fall in, such as a JIT's, which each process fills in its own way |
 | `start`, `end` | uint64 | Address range, end exclusive. Kernel mappings end where the next one starts: perf gives a module the start of its code and its total size, but its data can lie elsewhere |
 | `file_offset` | uint64 | File offset of `start` |
 | `path` | string | File path, or a name such as `[vdso]` or `//anon`. `[kernel]` for the kernel, and the module name in brackets for a kernel module, as in `[ext4]` |
@@ -103,7 +104,7 @@ Each stream has:
 | Column | Type | Meaning |
 |---|---|---|
 | `frame_id` | uint32 | |
-| `origin` | string | `binary`, `kernel` or `unresolved`. See [frames](model.md#frames) |
+| `origin` | string | `binary`, `kernel`, `jit` or `unresolved`. See [frames](model.md#frames). `jit` is code a runtime compiled in anonymous memory, which its perf map names |
 | `address` | uint64 | Address in the process, or in the kernel |
 | `mapping_id` | uint32, nullable | Region containing the address. Null if none is known |
 | `file_offset` | uint64, nullable | Offset in the mapped file. Null without a file mapping |
@@ -158,12 +159,27 @@ them.
 | `name` | string | |
 | `module` | string, nullable | The module, as in `ext4`, or `bpf` for a BPF program. Null for the kernel itself |
 
+`jit_symbols`, sorted by `pid` and `start`, with ranges that don't overlap
+in a process. A runtime that compiles code as it runs, such as Python 3.12
+and later or Node, can name it in a perf map, `/tmp/perf-<pid>.map`, which
+uhr reads right after recording and keeps the code frames fall in from. A
+map written before its process started belongs to an earlier process with
+the pid, and is left out. Where code took the place of older code, the
+newer name holds, so samples of the older code there get the newer name.
+
+| Column | Type | Meaning |
+|---|---|---|
+| `pid` | uint32 | The process the code ran in |
+| `start`, `end` | uint64 | Address range, end exclusive |
+| `name` | string | As the runtime wrote it, as in `py::inner:/app/spin.py` or `JS:*parse /app/x.js:42:7` |
+
 ## Symbols
 
 Written by `uhr symbolize`, which `uhr record` runs unless told not to. Names
 are matched to files by build-id, and come from the binary or from a separate
 debug file found by build-id or debug link. Kernel frames are named from
-`kernel_symbols`, which the recording saved.
+`kernel_symbols`, and JIT frames from `jit_symbols`, which the recording
+saved.
 
 Each file is copied to a private temporary snapshot before reading its identity
 or symbols. Subsequent reads use that snapshot while debug-file lookup retains
@@ -182,6 +198,21 @@ and name in its kernel symbol, `bpf_prog_<tag>_<name>`, and has the id
 `bpf+<tag>_<name>`: the tag hashes its instructions, so loading the program
 again keeps the id. Other such code, like BPF trampolines, groups by its
 kernel symbol and has no id.
+
+Code a runtime compiled moves from run to run, so it groups by what the
+runtime called it. One of the program's functions, from a name uhr can read,
+groups by its runtime, file and name across processes, and has the id
+`jit+<runtime>:<name>:<file>`, as in `jit+python:inner:/app/spin.py`. The
+name has `%`, `:` and `@` escaped as `%25`, `%3A` and `%40`, so no two
+functions share an id. An anonymous one has `@` and where it starts, escaped
+the same way, in place of the name, as in `jit+node:@12%3A7:/app/x.js`. Its
+module is its runtime in brackets, as in `[python]` or `[node]`, and its
+file is the source file. Other code, such as V8's builtins, groups by its
+name in the map, with the id `jit+<runtime>+<name>`, as in
+`jit+node+Builtin:ArrayPrototypePush`, or `jit:<name>` for a runtime uhr
+does not know. V8 inlines functions into
+the code it optimizes, and its map cannot say so, so their time counts for
+the function they were inlined into.
 
 Queries expand each frame's inlined calls from `inline_frames`, so time in
 inlined code counts for the inlined function. An inlined function has no
@@ -212,7 +243,7 @@ a placeholder still counts as named; rejected debug candidates supply no names.
 
 `symbol_sources`, one row per file. A frame's source is the row whose `path`
 and `build_id` match the frame's mapping. Kernel frames share one row with
-path `[kernel]`.
+path `[kernel]`, and JIT frames one with path `[jit]`.
 
 | Column | Type | Meaning |
 |---|---|---|

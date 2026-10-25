@@ -3,6 +3,7 @@ mod unwind;
 
 pub(crate) use convert::is_dummy;
 
+use std::collections::BTreeSet;
 use std::env;
 use std::ffi::OsString;
 use std::fs;
@@ -14,16 +15,17 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, Command, ExitStatus, Stdio};
 use std::sync::mpsc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use rustix::io::{Errno, FdFlags, fcntl_setfd};
 use rustix::pipe::{PipeFlags, pipe_with};
-use rustix::process::{Pid, Signal, kill_process, set_parent_process_death_signal};
+use rustix::process::{Pid, Signal, geteuid, kill_process, set_parent_process_death_signal};
 use tracing::{debug, info, warn};
 
 use crate::doctor;
 use crate::kallsyms::Kallsyms;
 use crate::launch::{self, Held, Interrupts, Process, monotonic_ns};
+use crate::perf_map;
 use crate::recording::{self, Collector, Exit, Recording};
 use crate::runtimes;
 
@@ -149,6 +151,9 @@ pub enum Unwind {
 /// comes before the capture starts ends it with nothing recorded, so
 /// callers can count interrupts from before they call.
 pub fn record(options: &RecordOptions, interrupts: &Interrupts, out: &Path) -> Result<Recording> {
+    // A perf map older than this, or than an attached process, belongs to
+    // an earlier process with its pid.
+    let since = SystemTime::now();
     let report = doctor::check_perf();
     if let Some(check) = report.blocked().next() {
         return Err(Error::Blocked {
@@ -176,10 +181,14 @@ pub fn record(options: &RecordOptions, interrupts: &Interrupts, out: &Path) -> R
         &Target::Attach { pid, duration } => {
             let process = Process::open(pid).map_err(|e| no_process(pid, e))?;
             let command = command_line(pid, &process)?;
+            let started = Process::started(pid).map_err(|e| no_process(pid, e))?;
+            let owner = Process::file_owner(pid).map_err(|e| no_process(pid, e))?;
             let ready = Ready::Attach {
                 pid,
                 duration,
                 process,
+                started,
+                owner,
             };
             (ready, command)
         }
@@ -205,7 +214,14 @@ pub fn record(options: &RecordOptions, interrupts: &Interrupts, out: &Path) -> R
     let perf_version = doctor::perf_version().map_err(Error::PerfVersion)?;
     let max_stack_depth = read_max_stack_depth()?;
     let perf_data = staging.join("perf.data");
-    let ended = match run(&perf_data, options, interrupts, &ready) {
+    // Without the watch, a map counts only if it belongs to root or the
+    // user the target started as.
+    let watch = perf_map::watch(Path::new(perf_map::DIR))
+        .inspect_err(|error| warn!(%error, "watching for perf maps"))
+        .ok();
+    let ended = run(&perf_data, options, interrupts, &ready);
+    let map_owners = watch.map(perf_map::Watch::stop).unwrap_or_default();
+    let ended = match ended {
         Ok(ended) => ended,
         Err(error) => {
             remove_staging(&staging);
@@ -228,7 +244,7 @@ pub fn record(options: &RecordOptions, interrupts: &Interrupts, out: &Path) -> R
         max_stack_depth,
         kallsyms: kallsyms.as_ref(),
     });
-    let recording = match recording {
+    let mut recording = match recording {
         Ok(recording) => recording,
         Err(error) if !finished(ended.perf) => {
             remove_staging(&staging);
@@ -246,20 +262,84 @@ pub fn record(options: &RecordOptions, interrupts: &Interrupts, out: &Path) -> R
         }
     };
 
-    match recording.write(&staging) {
-        // What it was converted from is all there is to look into.
-        Err(error @ recording::Error::Invalid { .. }) => {
-            return Err(Error::Convert {
+    // While the maps are still there and the processes' own.
+    let since_for = |pid| match ready {
+        Ready::Attach {
+            pid: attached,
+            started,
+            ..
+        } if attached == pid => started,
+        _ => since,
+    };
+    let started_as = match ready {
+        Ready::Launch(_) => geteuid().as_raw(),
+        Ready::Attach { owner, .. } => owner,
+    };
+    let owners = |pid| map_owners.of(pid, started_as);
+    let named = perf_map::name_jit_frames(&mut recording, since_for, owners);
+    if !named.is_empty() {
+        info!(
+            processes = named.len(),
+            "named JIT code from the runtimes' perf maps"
+        );
+    }
+
+    // uhr made the runtimes it launched write them, so it cleans them up
+    // once the recording holds the names.
+    let clean_up = matches!(ready, Ready::Launch(_)) && options.runtime_support;
+    if let Err(error) = recording.write(&staging) {
+        if clean_up && !named.is_empty() {
+            let maps: Vec<_> = named
+                .iter()
+                .map(|&pid| perf_map::path(pid).display().to_string())
+                .collect();
+            warn!(
+                maps = maps.join(" "),
+                "kept the perf maps that name the JIT code in {}",
+                perf_data.display()
+            );
+        }
+        return Err(match error {
+            // What it was converted from is all there is to look into.
+            error @ recording::Error::Invalid { .. } => Error::Convert {
                 path: perf_data,
                 source: Box::new(error.into()),
-            });
-        }
-        result => result?,
+            },
+            error => error.into(),
+        });
+    }
+    if clean_up {
+        let pids: BTreeSet<u32> = recording.threads.iter().map(|t| t.pid).collect();
+        remove_runtime_files(pids, since, owners);
     }
     fs::remove_file(&perf_data).map_err(io_error("removing", &perf_data))?;
     fs::rename(&staging, out).map_err(io_error("renaming into place", out))?;
     log_summary(&recording, out);
     Ok(recording)
+}
+
+/// Removes the perf maps the processes `pids` wrote since `since`, and the
+/// logs V8 writes beside them.
+fn remove_runtime_files(pids: BTreeSet<u32>, since: SystemTime, owners: impl Fn(u32) -> Vec<u32>) {
+    let started_in = env::current_dir();
+    for pid in pids {
+        match (perf_map::remove(pid, since, &owners(pid)), &started_in) {
+            (Ok(Some("node")), Ok(dir)) => match runtimes::remove_v8_logs(dir, pid, since) {
+                Ok(0) => warn!(
+                    pid,
+                    "a Node process left V8's log outside {}",
+                    dir.display()
+                ),
+                Ok(_) => {}
+                Err(error) => warn!(pid, %error, "removing V8's logs"),
+            },
+            (Ok(Some("node")), Err(error)) => {
+                warn!(pid, %error, "finding V8's logs: reading the working directory")
+            }
+            (Ok(_), _) => {}
+            (Err(error), _) => warn!(pid, %error, "removing the perf map"),
+        }
+    }
 }
 
 fn log_summary(recording: &Recording, out: &Path) {
@@ -394,6 +474,9 @@ enum Ready<'a> {
         pid: u32,
         duration: Option<Duration>,
         process: Process,
+        started: SystemTime,
+        /// The user its files belong to.
+        owner: u32,
     },
 }
 
@@ -431,6 +514,7 @@ fn run(
             pid,
             duration,
             process,
+            ..
         } => {
             let mut sampling = sample(perf_data, options, *pid)?;
             let attached_ns = monotonic_ns();

@@ -15,7 +15,7 @@ use wholesym::samply_symbols::relative_address_base;
 use wholesym::samply_symbols::{LookupAddress, SymbolManager};
 
 use crate::recording::table::{self, Column, Table};
-use crate::recording::{self, KERNEL, KernelSymbols, Origin, Recording};
+use crate::recording::{self, JIT, KERNEL, KernelSymbols, Origin, Recording};
 
 /// Why symbolizing failed. Files that can't be read only leave their frames
 /// unnamed, with the reason in their source.
@@ -206,6 +206,7 @@ async fn resolve(recording: &Recording) -> Symbols {
 
     let mut by_file: BTreeMap<FileKey, Vec<(u32, u64)>> = BTreeMap::new();
     let mut kernel_frames = Vec::new();
+    let mut jit_frames = Vec::new();
     for (id, frame) in recording.frames.iter().enumerate() {
         match (frame.origin, frame.mapping, frame.file_offset) {
             (Origin::Binary, Some(mapping), Some(offset)) => {
@@ -217,8 +218,12 @@ async fn resolve(recording: &Recording) -> Symbols {
                     .push((id as u32, lookup));
             }
             (Origin::Kernel, ..) => kernel_frames.push(id),
+            (Origin::Jit, ..) => jit_frames.push(id),
             _ => {}
         }
+    }
+    if !jit_frames.is_empty() {
+        sources.push(resolve_jit(recording, &jit_frames, &mut names));
     }
 
     if !kernel_frames.is_empty() {
@@ -436,6 +441,24 @@ fn resolve_kernel(
         SourceStatus::Resolved,
         format!("named {named} of {} frames", frames.len()),
     )
+}
+
+/// The names the runtimes' perf maps gave the code they compiled, which the
+/// recording saved.
+fn resolve_jit(recording: &Recording, frames: &[usize], names: &mut [Option<FrameName>]) -> Source {
+    let mut named = 0;
+    for &id in frames {
+        if let Some(symbol) = recording.jit_symbol(&recording.frames[id]) {
+            names[id] = Some(FrameName::Symbol(symbol.name.clone()));
+            named += 1;
+        }
+    }
+    Source {
+        path: JIT.into(),
+        build_id: None,
+        status: SourceStatus::Resolved,
+        detail: Some(format!("named {named} of {} frames", frames.len())),
+    }
 }
 
 /// Only names from the binary or a matching debug artifact are evidence.
@@ -1036,6 +1059,7 @@ mod tests {
             samples: Vec::new(),
             off_cpu: Vec::new(),
             kernel_symbols: Vec::new(),
+            jit_symbols: Vec::new(),
         }
     }
 
