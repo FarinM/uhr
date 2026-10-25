@@ -1,7 +1,7 @@
 use uhr_core::filter::Filter;
 use uhr_core::functions;
 use uhr_core::metric::{self, Metric};
-use uhr_core::query::{Error, GroupBy, Query, QueryResult, Row, run};
+use uhr_core::query::{Error, FunctionRow, GroupBy, Query, QueryResult, Rows, run};
 use uhr_core::recording::*;
 use uhr_core::symbols::{FrameName, InlineFrame, Source, SourceStatus, Symbols};
 
@@ -103,6 +103,11 @@ fn symbols() -> Symbols {
     }
 }
 
+fn function_rows(result: &QueryResult) -> &[FunctionRow] {
+    let Rows::Functions(rows) = &result.rows;
+    rows
+}
+
 fn query(top: usize) -> Query {
     Query {
         group_by: GroupBy::Function,
@@ -117,8 +122,7 @@ fn shares_self_and_total_time() {
     let result = run(&recording(), Some(&symbols()), &query(10)).unwrap();
     assert_eq!(result.time_ns, 10);
     let row = |name: Option<&str>, origin: Origin| {
-        result
-            .rows
+        function_rows(&result)
             .iter()
             .find(|r| r.function.name.as_deref() == name && r.function.origin == origin)
             .unwrap()
@@ -144,7 +148,10 @@ fn shares_self_and_total_time() {
     assert_eq!(placeholder.function.module.as_deref(), Some("/bin/app"));
     assert_eq!(placeholder.self_ns, 1);
 
-    assert_eq!(result.rows[0].function.name.as_deref(), Some("leaf"));
+    assert_eq!(
+        function_rows(&result)[0].function.name.as_deref(),
+        Some("leaf")
+    );
 
     let kernel = row(None, Origin::Kernel);
     assert_eq!(
@@ -167,7 +174,7 @@ fn reports_named_share_and_symbol_problems() {
 #[test]
 fn reports_cut_rows() {
     let result = run(&recording(), Some(&symbols()), &query(2)).unwrap();
-    assert_eq!(result.rows.len(), 2);
+    assert_eq!(function_rows(&result).len(), 2);
     assert_eq!(result.rows_omitted, 3);
 }
 
@@ -176,8 +183,16 @@ fn works_without_symbols() {
     let result = run(&recording(), None, &query(10)).unwrap();
     assert!(!result.coverage.symbols.symbolized);
     assert_eq!(result.coverage.named_share, Some(0.0));
-    assert!(result.rows.iter().all(|r| r.function.name.is_none()));
-    assert!(result.rows.iter().all(|r| r.function.id.is_none()));
+    assert!(
+        function_rows(&result)
+            .iter()
+            .all(|r| r.function.name.is_none())
+    );
+    assert!(
+        function_rows(&result)
+            .iter()
+            .all(|r| r.function.id.is_none())
+    );
 }
 
 #[test]
@@ -185,7 +200,7 @@ fn has_no_named_share_without_samples() {
     let mut recording = recording();
     recording.samples.clear();
     let result = run(&recording, Some(&symbols()), &query(10)).unwrap();
-    assert!(result.rows.is_empty());
+    assert!(function_rows(&result).is_empty());
     assert_eq!(result.coverage.named_share, None);
 }
 
@@ -273,13 +288,37 @@ fn separates_distinct_functions_with_the_same_name() {
     };
 
     let result = run(&recording, Some(&symbols), &query(10)).unwrap();
-    assert_eq!(result.rows.len(), 2);
-    assert_eq!(result.rows[0].function.name.as_deref(), Some("worker"));
-    assert_eq!(result.rows[1].function.name.as_deref(), Some("worker"));
-    assert_eq!(result.rows[0].function.function_address, Some(0x10));
-    assert_eq!(result.rows[1].function.function_address, Some(0x20));
-    assert_eq!((result.rows[0].self_ns, result.rows[0].total_ns), (6, 6));
-    assert_eq!((result.rows[1].self_ns, result.rows[1].total_ns), (4, 10));
+    assert_eq!(function_rows(&result).len(), 2);
+    assert_eq!(
+        function_rows(&result)[0].function.name.as_deref(),
+        Some("worker")
+    );
+    assert_eq!(
+        function_rows(&result)[1].function.name.as_deref(),
+        Some("worker")
+    );
+    assert_eq!(
+        function_rows(&result)[0].function.function_address,
+        Some(0x10)
+    );
+    assert_eq!(
+        function_rows(&result)[1].function.function_address,
+        Some(0x20)
+    );
+    assert_eq!(
+        (
+            function_rows(&result)[0].self_ns,
+            function_rows(&result)[0].total_ns
+        ),
+        (6, 6)
+    );
+    assert_eq!(
+        (
+            function_rows(&result)[1].self_ns,
+            function_rows(&result)[1].total_ns
+        ),
+        (4, 10)
+    );
 }
 
 #[test]
@@ -324,8 +363,7 @@ fn keeps_kernel_code_outside_mappings_apart() {
     };
 
     let result = run(&recording, Some(&symbols), &query(10)).unwrap();
-    let rows: Vec<_> = result
-        .rows
+    let rows: Vec<_> = function_rows(&result)
         .iter()
         .map(|r| {
             let f = &r.function;
@@ -385,8 +423,8 @@ fn merges_the_same_function_across_mappings_and_counts_recursion_once() {
     };
 
     let result = run(&recording, Some(&symbols), &query(10)).unwrap();
-    assert_eq!(result.rows.len(), 1);
-    let row = &result.rows[0];
+    assert_eq!(function_rows(&result).len(), 1);
+    let row = &function_rows(&result)[0];
     assert_eq!((row.self_ns, row.total_ns), (10, 10));
     assert_eq!(row.function.function_address, Some(0x10));
     assert_eq!(row.function.build_id.as_deref(), Some("abcd"));
@@ -412,14 +450,19 @@ fn separates_builds_at_the_same_path_and_function_address() {
     };
 
     let result = run(&recording, Some(&symbols), &query(10)).unwrap();
-    assert_eq!(result.rows.len(), 2);
-    assert_eq!(result.rows[0].function.build_id.as_deref(), Some("abcd"));
-    assert_eq!(result.rows[1].function.build_id.as_deref(), Some("ef01"));
-    assert_eq!(result.rows[0].self_ns, 6);
-    assert_eq!(result.rows[1].self_ns, 4);
+    assert_eq!(function_rows(&result).len(), 2);
+    assert_eq!(
+        function_rows(&result)[0].function.build_id.as_deref(),
+        Some("abcd")
+    );
+    assert_eq!(
+        function_rows(&result)[1].function.build_id.as_deref(),
+        Some("ef01")
+    );
+    assert_eq!(function_rows(&result)[0].self_ns, 6);
+    assert_eq!(function_rows(&result)[1].self_ns, 4);
     assert!(
-        result
-            .rows
+        function_rows(&result)
             .iter()
             .all(|row| row.function.function_address == Some(0x10))
     );
@@ -446,8 +489,8 @@ fn combines_copies_of_one_binary_at_different_paths() {
     };
 
     let result = run(&recording, Some(&symbols), &query(10)).unwrap();
-    assert_eq!(result.rows.len(), 1, "one function, one id");
-    let row = &result.rows[0];
+    assert_eq!(function_rows(&result).len(), 1, "one function, one id");
+    let row = &function_rows(&result)[0];
     assert_eq!(row.function.id.as_deref(), Some("abcd+0x10"));
     assert_eq!(row.function.module.as_deref(), Some("/bin/app"));
     assert_eq!(row.self_ns, 10);
@@ -471,8 +514,7 @@ fn the_entry_point_range_of_a_stripped_binary_has_no_id() {
 
     let result = run(&recording, Some(&symbols), &query(10)).unwrap();
     let id = |placeholder: &str| {
-        let row = result
-            .rows
+        let row = function_rows(&result)
             .iter()
             .find(|r| r.function.placeholder.as_deref() == Some(placeholder))
             .unwrap();
@@ -501,8 +543,11 @@ fn keeps_only_samples_under_a_function() {
     assert_eq!(cpu_ns(&["leaf", "/bin/app+0x40"]), 9);
 
     let result = run(&recording(), Some(&symbols()), &under(&["recurse"])).unwrap();
-    assert_eq!(result.rows[0].function.name.as_deref(), Some("leaf"));
-    assert_eq!(result.rows[0].self_share, 1.0);
+    assert_eq!(
+        function_rows(&result)[0].function.name.as_deref(),
+        Some("leaf")
+    );
+    assert_eq!(function_rows(&result)[0].self_share, 1.0);
 }
 
 #[test]
@@ -541,9 +586,8 @@ fn symbols_with_inlining() -> Symbols {
     symbols
 }
 
-fn row<'a>(result: &'a QueryResult, name: &str) -> &'a Row {
-    result
-        .rows
+fn row<'a>(result: &'a QueryResult, name: &str) -> &'a FunctionRow {
+    function_rows(result)
         .iter()
         .find(|r| r.function.name.as_deref() == Some(name))
         .unwrap_or_else(|| panic!("no row for {name}"))
@@ -587,8 +631,7 @@ fn an_inlined_function_is_one_function_per_declaration() {
         call("fun_40", "/src/app.c", 40),
     ];
     let result = run(&recording(), Some(&symbols), &query(10)).unwrap();
-    let helpers: Vec<_> = result
-        .rows
+    let helpers: Vec<_> = function_rows(&result)
         .iter()
         .filter(|r| r.function.name.as_deref() == Some("helper"))
         .collect();
@@ -599,8 +642,7 @@ fn an_inlined_function_is_one_function_per_declaration() {
     // as is one whose name differs only by a leading underscore.
     symbols.inline[4][0].decl_file = Some("/src/other.c".into());
     let result = run(&recording(), Some(&symbols), &query(10)).unwrap();
-    let ids: Vec<_> = result
-        .rows
+    let ids: Vec<_> = function_rows(&result)
         .iter()
         .filter(|r| r.function.name.as_deref() == Some("helper"))
         .map(|r| r.function.id.clone().unwrap())
@@ -611,14 +653,12 @@ fn an_inlined_function_is_one_function_per_declaration() {
     symbols.inline[4][0] = call("_helper", "/src/app.c", 6);
     let result = run(&recording(), Some(&symbols), &query(10)).unwrap();
     assert!(
-        result
-            .rows
+        function_rows(&result)
             .iter()
             .any(|r| r.function.name.as_deref() == Some("_helper"))
     );
     assert!(
-        result
-            .rows
+        function_rows(&result)
             .iter()
             .any(|r| r.function.name.as_deref() == Some("helper"))
     );
@@ -645,8 +685,7 @@ fn groups_by_source_line() {
     let result = run(&recording(), Some(&symbols_with_inlining()), &query).unwrap();
     assert_eq!(result.group_by, GroupBy::Line);
     let at = |function: &str, line: Option<u32>| {
-        result
-            .rows
+        function_rows(&result)
             .iter()
             .find(|r| {
                 r.function.name.as_deref() == Some(function)
@@ -662,7 +701,7 @@ fn groups_by_source_line() {
     assert_eq!(at("recurse", Some(30)).total_ns, 8);
     // Code without line info keeps its time in a row with no line.
     assert_eq!(at("main", None).total_ns, 10);
-    let rows: u64 = result.rows.iter().map(|r| r.self_ns).sum();
+    let rows: u64 = function_rows(&result).iter().map(|r| r.self_ns).sum();
     assert_eq!(rows, result.time_ns);
 
     let by_function = run(
@@ -671,7 +710,7 @@ fn groups_by_source_line() {
         &self::query(10),
     )
     .unwrap();
-    assert!(by_function.rows.iter().all(|r| r.line.is_none()));
+    assert!(function_rows(&by_function).iter().all(|r| r.line.is_none()));
 }
 
 /// Context switches: blocked for 20 under leaf, preempted for 5 under the
@@ -706,8 +745,7 @@ fn by(metric: Metric) -> Query {
 }
 
 fn times(result: &QueryResult, name: &str) -> (u64, u64) {
-    let row = result
-        .rows
+    let row = function_rows(result)
         .iter()
         .find(|r| r.function.name.as_deref() == Some(name))
         .unwrap_or_else(|| panic!("no row {name}"));

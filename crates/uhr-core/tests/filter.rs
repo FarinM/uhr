@@ -1,6 +1,6 @@
 use uhr_core::filter::Filter;
 use uhr_core::metric::Metric;
-use uhr_core::query::{GroupBy, Query, run};
+use uhr_core::query::{GroupBy, Query, Rows, run};
 use uhr_core::recording::*;
 
 fn sample(pid: u32, tid: u32, time_ns: u64, mode: Mode, cpu_ns: u64) -> Sample {
@@ -76,8 +76,9 @@ fn cpu_ns(recording: &Recording, filter: Filter) -> u64 {
         filter,
     };
     let result = run(recording, None, &query).unwrap();
-    let rows: u64 = result.rows.iter().map(|r| r.self_ns).sum();
-    assert_eq!(rows, result.time_ns);
+    let Rows::Functions(rows) = &result.rows;
+    let self_ns: u64 = rows.iter().map(|r| r.self_ns).sum();
+    assert_eq!(self_ns, result.time_ns);
     result.time_ns
 }
 

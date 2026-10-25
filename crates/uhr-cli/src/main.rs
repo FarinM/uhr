@@ -14,7 +14,7 @@ use uhr_core::functions::Function;
 use uhr_core::metric::Metric;
 use uhr_core::overview::{self, CPUTime, Overview};
 use uhr_core::perf::{self, RecordOptions, Unwind};
-use uhr_core::query::{self, GroupBy, Query, QueryResult};
+use uhr_core::query::{self, FunctionRow, GroupBy, Query, QueryResult, Rows};
 use uhr_core::recording::{Exit, Mode};
 use uhr_core::symbols;
 
@@ -701,24 +701,8 @@ fn write_query(out: &mut impl Write, result: &QueryResult) -> io::Result<()> {
     if !result.filter.is_empty() {
         writeln!(out, "filter: {}\n", describe_filter(&result.filter))?;
     }
-    writeln!(out, "{:>7} {:>7}  {by}", "self", "total")?;
-    for row in &result.rows {
-        let line = match (&result.group_by, &row.line) {
-            (GroupBy::Function, _) => String::new(),
-            (GroupBy::Line, Some(line)) => {
-                let file = line.file.rsplit('/').next().unwrap_or(&line.file);
-                format!("  {file}:{}", line.line)
-            }
-            (GroupBy::Line, None) => "  (no line)".into(),
-        };
-        writeln!(
-            out,
-            "{:>6.1}% {:>6.1}%  {}{line}  {}",
-            row.self_share * 100.0,
-            row.total_share * 100.0,
-            function_name(&row.function),
-            module_name(&row.function),
-        )?;
+    match &result.rows {
+        Rows::Functions(rows) => write_function_rows(out, result.group_by == GroupBy::Line, rows)?,
     }
     if result.rows_omitted > 0 {
         writeln!(
@@ -740,6 +724,34 @@ fn write_query(out: &mut impl Write, result: &QueryResult) -> io::Result<()> {
     write_no_stack(out, coverage.no_stack_share)?;
     write_symbol_coverage(out, &coverage.symbols)?;
     write_coverage(out, &coverage.recording)
+}
+
+fn write_function_rows(
+    out: &mut impl Write,
+    by_line: bool,
+    rows: &[FunctionRow],
+) -> io::Result<()> {
+    let by = if by_line { "line" } else { "function" };
+    writeln!(out, "{:>7} {:>7}  {by}", "self", "total")?;
+    for row in rows {
+        let line = match (by_line, &row.line) {
+            (false, _) => String::new(),
+            (true, Some(line)) => {
+                let file = line.file.rsplit('/').next().unwrap_or(&line.file);
+                format!("  {file}:{}", line.line)
+            }
+            (true, None) => "  (no line)".into(),
+        };
+        writeln!(
+            out,
+            "{:>6.1}% {:>6.1}%  {}{line}  {}",
+            row.self_share * 100.0,
+            row.total_share * 100.0,
+            function_name(&row.function),
+            module_name(&row.function),
+        )?;
+    }
+    Ok(())
 }
 
 fn describe_time(metric: Metric, samples: u64, intervals: u64, time_ns: u64) -> String {

@@ -38,15 +38,22 @@ pub struct QueryResult {
     pub off_cpu_intervals: u64,
     /// Time of the metric that passed. Shares are of this.
     pub time_ns: u64,
-    /// Sorted by self time, then total time.
-    pub rows: Vec<Row>,
+    pub rows: Rows,
     /// Rows cut by `top`.
     pub rows_omitted: usize,
     pub coverage: QueryCoverage,
 }
 
+/// The rows of one grouping.
 #[derive(Debug, Clone, Serialize)]
-pub struct Row {
+#[serde(untagged)]
+pub enum Rows {
+    /// Grouped by function or line. Sorted by self time, then total time.
+    Functions(Vec<FunctionRow>),
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FunctionRow {
     #[serde(flatten)]
     pub function: Function,
     /// Grouped by line, the line in the function. `None` there for code
@@ -112,48 +119,16 @@ pub fn run(
             ns as f64 / time_ns as f64
         }
     };
-    let row = |function: u32, line: Option<u32>, (self_ns, total_ns): (u64, u64)| Row {
-        function: functions.get(function).clone(),
-        line: line.map(|line| functions.line(line).clone()),
-        self_ns,
-        self_share: share(self_ns),
-        total_ns,
-        total_share: share(total_ns),
+    let mut rows = match query.group_by {
+        GroupBy::Function | GroupBy::Line => Rows::Functions(function_rows(
+            recording,
+            &functions,
+            query.group_by == GroupBy::Line,
+            &times.ns,
+            &share,
+        )),
     };
-    let mut rows: Vec<Row> = match query.group_by {
-        GroupBy::Function => tally(recording, &times.ns, |stack, keys| {
-            keys.extend(functions.expand(stack))
-        })
-        .into_iter()
-        .map(|(function, times)| row(function, None, times))
-        .collect(),
-        GroupBy::Line => tally(recording, &times.ns, |stack, keys| {
-            keys.extend(functions.steps(stack))
-        })
-        .into_iter()
-        .map(|(step, times)| row(step.function, step.line, times))
-        .collect(),
-    };
-    rows.sort_by(|a, b| {
-        (b.self_ns, b.total_ns)
-            .cmp(&(a.self_ns, a.total_ns))
-            .then_with(|| a.function.name.cmp(&b.function.name))
-            .then_with(|| a.function.placeholder.cmp(&b.function.placeholder))
-            .then_with(|| a.function.module.cmp(&b.function.module))
-            .then_with(|| a.function.build_id.cmp(&b.function.build_id))
-            .then_with(|| {
-                a.function
-                    .function_address
-                    .cmp(&b.function.function_address)
-            })
-            .then_with(|| a.function.id.cmp(&b.function.id))
-            .then_with(|| {
-                let place = |row: &Row| row.line.as_ref().map(|l| (l.file.clone(), l.line));
-                place(a).cmp(&place(b))
-            })
-    });
-    let rows_omitted = rows.len().saturating_sub(query.top);
-    rows.truncate(query.top);
+    let rows_omitted = rows.truncate(query.top);
 
     let mut unnamed_by_origin = BTreeMap::new();
     let mut named_ns = 0;
@@ -188,6 +163,72 @@ pub fn run(
         rows_omitted,
         coverage,
     })
+}
+
+impl Rows {
+    /// Keeps the first `top` rows, and returns how many it cut.
+    fn truncate(&mut self, top: usize) -> usize {
+        match self {
+            Rows::Functions(rows) => truncate(rows, top),
+        }
+    }
+}
+
+fn truncate<T>(rows: &mut Vec<T>, top: usize) -> usize {
+    let cut = rows.len().saturating_sub(top);
+    rows.truncate(top);
+    cut
+}
+
+fn function_rows(
+    recording: &Recording,
+    functions: &Functions,
+    by_line: bool,
+    stack_ns: &[u64],
+    share: &impl Fn(u64) -> f64,
+) -> Vec<FunctionRow> {
+    let row = |function: u32, line: Option<u32>, (self_ns, total_ns): (u64, u64)| FunctionRow {
+        function: functions.get(function).clone(),
+        line: line.map(|line| functions.line(line).clone()),
+        self_ns,
+        self_share: share(self_ns),
+        total_ns,
+        total_share: share(total_ns),
+    };
+    let mut rows: Vec<FunctionRow> = if by_line {
+        tally(recording, stack_ns, |stack, keys| {
+            keys.extend(functions.steps(stack))
+        })
+        .into_iter()
+        .map(|(step, times)| row(step.function, step.line, times))
+        .collect()
+    } else {
+        tally(recording, stack_ns, |stack, keys| {
+            keys.extend(functions.expand(stack))
+        })
+        .into_iter()
+        .map(|(function, times)| row(function, None, times))
+        .collect()
+    };
+    rows.sort_by(|a, b| {
+        (b.self_ns, b.total_ns)
+            .cmp(&(a.self_ns, a.total_ns))
+            .then_with(|| a.function.name.cmp(&b.function.name))
+            .then_with(|| a.function.placeholder.cmp(&b.function.placeholder))
+            .then_with(|| a.function.module.cmp(&b.function.module))
+            .then_with(|| a.function.build_id.cmp(&b.function.build_id))
+            .then_with(|| {
+                a.function
+                    .function_address
+                    .cmp(&b.function.function_address)
+            })
+            .then_with(|| a.function.id.cmp(&b.function.id))
+            .then_with(|| {
+                let place = |row: &FunctionRow| row.line.as_ref().map(|l| (l.file.clone(), l.line));
+                place(a).cmp(&place(b))
+            })
+    });
+    rows
 }
 
 /// Self and total time of each key. `keys` lists the keys of a stack, leaf
