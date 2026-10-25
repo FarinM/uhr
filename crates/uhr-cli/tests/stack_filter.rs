@@ -35,7 +35,7 @@ fn splits_one_recording_by_the_function_that_led_to_the_time() {
         all.extend(args);
         json("query", &recording, &all)
     };
-    let cpu_ns = |result: &Value| result["cpu_ns"].as_f64().unwrap();
+    let cpu_ns = |result: &Value| result["time_ns"].as_f64().unwrap();
     let all = query(&[]);
     let a = query(&["--under", "from_a"]);
     let b = query(&["--under", "from_b"]);

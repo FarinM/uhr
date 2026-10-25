@@ -1,4 +1,5 @@
 use uhr_core::filter::Filter;
+use uhr_core::metric::Metric;
 use uhr_core::query::{GroupBy, Query, run};
 use uhr_core::recording::*;
 
@@ -71,12 +72,13 @@ fn cpu_ns(recording: &Recording, filter: Filter) -> u64 {
     let query = Query {
         group_by: GroupBy::Function,
         top: 10,
+        metric: Metric::OnCPU,
         filter,
     };
     let result = run(recording, None, &query).unwrap();
-    let rows: u64 = result.rows.iter().map(|r| r.self_cpu_ns).sum();
-    assert_eq!(rows, result.cpu_ns);
-    result.cpu_ns
+    let rows: u64 = result.rows.iter().map(|r| r.self_ns).sum();
+    assert_eq!(rows, result.time_ns);
+    result.time_ns
 }
 
 #[test]

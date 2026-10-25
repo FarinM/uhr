@@ -64,7 +64,7 @@ fn finds_which_callers_make_a_function_expensive() {
     assert!((0.2..=0.3).contains(&b_share), "from_b has {b_share}");
     for caller in [a, b] {
         let main = node(&caller["children"], "main");
-        assert_eq!(main["cpu_ns"], caller["cpu_ns"]);
+        assert_eq!(main["time_ns"], caller["time_ns"]);
     }
     // spin's only callee runs for nanoseconds and is rarely sampled.
     assert!(
@@ -90,8 +90,8 @@ fn finds_which_callers_make_a_function_expensive() {
     let query: Value = serde_json::from_slice(&output.stdout).unwrap();
     let row = node(&query["rows"], "spin");
     let by_id = call_paths(&recording, row["id"].as_str().unwrap());
-    assert_eq!(by_id["total_cpu_ns"], spin["total_cpu_ns"]);
-    assert_eq!(by_id["total_cpu_ns"], row["total_cpu_ns"]);
+    assert_eq!(by_id["total_ns"], spin["total_ns"]);
+    assert_eq!(by_id["total_ns"], row["total_ns"]);
 }
 
 #[test]
@@ -101,9 +101,9 @@ fn follows_callees_down_to_where_the_time_is_spent() {
     for caller in ["from_a", "from_b"] {
         let caller = node(&main["callees"], caller);
         let spin = node(&caller["children"], "spin");
-        let leaf = spin["self_cpu_ns"].as_f64().unwrap();
+        let leaf = spin["self_ns"].as_f64().unwrap();
         assert!(
-            leaf > 0.99 * caller["cpu_ns"].as_f64().unwrap(),
+            leaf > 0.99 * caller["time_ns"].as_f64().unwrap(),
             "{caller:#}"
         );
     }
@@ -118,5 +118,5 @@ fn follows_callees_down_to_where_the_time_is_spent() {
         .output()
         .unwrap();
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("no function in the samples"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("no function in the recorded stacks"));
 }

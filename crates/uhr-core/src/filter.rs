@@ -35,7 +35,7 @@ impl Filter {
         *self == Self::default()
     }
 
-    /// Fails if `under` names a function that is not in the samples, or a
+    /// Fails if `under` names a function that is not in the stacks, or a
     /// name several functions share.
     pub(crate) fn samples<'a>(
         &'a self,

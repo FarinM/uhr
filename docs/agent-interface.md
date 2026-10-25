@@ -52,6 +52,12 @@ stop at a depth limit and keep the top children of each node, and they report
 the time of what they cut. Where a function recurses, each sample counts from
 its outermost call, so the callers show where the function is entered.
 
+`query` and `call_paths` weigh stacks by a metric: CPU time from the CPU
+samples, time off CPU from the context switches, or both, which is the
+time threads were alive. A thread goes off CPU in the scheduler, so off-CPU
+stacks all end in it and their self time says little; their total time
+shows what the threads waited in.
+
 A function picked the same way also works as a filter: `under` keeps the
 samples whose stack contains it. One recording can then be split by the code
 that led to the time, such as one benchmark of several in a run.

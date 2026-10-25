@@ -101,7 +101,7 @@ type Key<'a> = (Origin, Option<Module<'a>>, Code<'a>);
 pub enum Error {
     #[error("the recording has no function names or ids yet: run `uhr symbolize`")]
     NotSymbolized,
-    #[error("no function in the samples has the id or name {0:?}")]
+    #[error("no function in the recorded stacks has the id or name {0:?}")]
     NotFound(String),
     #[error(
         "{} functions are named {name:?}. Pass one of their ids: {}",

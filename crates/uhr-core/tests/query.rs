@@ -1,5 +1,6 @@
 use uhr_core::filter::Filter;
 use uhr_core::functions;
+use uhr_core::metric::{self, Metric};
 use uhr_core::query::{Error, GroupBy, Query, QueryResult, Row, run};
 use uhr_core::recording::*;
 use uhr_core::symbols::{FrameName, InlineFrame, Source, SourceStatus, Symbols};
@@ -106,6 +107,7 @@ fn query(top: usize) -> Query {
     Query {
         group_by: GroupBy::Function,
         top,
+        metric: Metric::OnCPU,
         filter: Filter::default(),
     }
 }
@@ -113,7 +115,7 @@ fn query(top: usize) -> Query {
 #[test]
 fn shares_self_and_total_time() {
     let result = run(&recording(), Some(&symbols()), &query(10)).unwrap();
-    assert_eq!(result.cpu_ns, 10);
+    assert_eq!(result.time_ns, 10);
     let row = |name: Option<&str>, origin: Origin| {
         result
             .rows
@@ -124,23 +126,23 @@ fn shares_self_and_total_time() {
 
     let leaf = row(Some("leaf"), Origin::Binary);
     assert_eq!(leaf.function.id.as_deref(), Some("/bin/app+0x10"));
-    assert_eq!((leaf.self_cpu_ns, leaf.total_cpu_ns), (8, 8));
+    assert_eq!((leaf.self_ns, leaf.total_ns), (8, 8));
     assert_eq!(leaf.self_share, 0.8);
 
     let recurse = row(Some("recurse"), Origin::Binary);
     assert_eq!(
-        (recurse.self_cpu_ns, recurse.total_cpu_ns),
+        (recurse.self_ns, recurse.total_ns),
         (0, 8),
         "recursion counts once"
     );
 
     let main = row(Some("main"), Origin::Binary);
-    assert_eq!((main.self_cpu_ns, main.total_cpu_ns), (0, 10));
+    assert_eq!((main.self_ns, main.total_ns), (0, 10));
 
     let placeholder = row(None, Origin::Binary);
     assert_eq!(placeholder.function.placeholder.as_deref(), Some("fun_40"));
     assert_eq!(placeholder.function.module.as_deref(), Some("/bin/app"));
-    assert_eq!(placeholder.self_cpu_ns, 1);
+    assert_eq!(placeholder.self_ns, 1);
 
     assert_eq!(result.rows[0].function.name.as_deref(), Some("leaf"));
 
@@ -276,14 +278,8 @@ fn separates_distinct_functions_with_the_same_name() {
     assert_eq!(result.rows[1].function.name.as_deref(), Some("worker"));
     assert_eq!(result.rows[0].function.function_address, Some(0x10));
     assert_eq!(result.rows[1].function.function_address, Some(0x20));
-    assert_eq!(
-        (result.rows[0].self_cpu_ns, result.rows[0].total_cpu_ns),
-        (6, 6)
-    );
-    assert_eq!(
-        (result.rows[1].self_cpu_ns, result.rows[1].total_cpu_ns),
-        (4, 10)
-    );
+    assert_eq!((result.rows[0].self_ns, result.rows[0].total_ns), (6, 6));
+    assert_eq!((result.rows[1].self_ns, result.rows[1].total_ns), (4, 10));
 }
 
 #[test]
@@ -337,7 +333,7 @@ fn keeps_kernel_code_outside_mappings_apart() {
                 f.name.as_deref(),
                 f.id.as_deref(),
                 f.module.as_deref(),
-                r.self_cpu_ns,
+                r.self_ns,
             )
         })
         .collect();
@@ -363,7 +359,7 @@ fn keeps_kernel_code_outside_mappings_apart() {
     assert_eq!(result.coverage.named_share, Some(27.0 / 31.0));
     for wanted in [INGRESS, "bpf+ee0e253c78993a24_sd_fw_ingress"] {
         let under = run(&recording, Some(&symbols), &under(&[wanted])).unwrap();
-        assert_eq!(under.cpu_ns, 2, "{wanted}");
+        assert_eq!(under.time_ns, 2, "{wanted}");
     }
 }
 
@@ -391,7 +387,7 @@ fn merges_the_same_function_across_mappings_and_counts_recursion_once() {
     let result = run(&recording, Some(&symbols), &query(10)).unwrap();
     assert_eq!(result.rows.len(), 1);
     let row = &result.rows[0];
-    assert_eq!((row.self_cpu_ns, row.total_cpu_ns), (10, 10));
+    assert_eq!((row.self_ns, row.total_ns), (10, 10));
     assert_eq!(row.function.function_address, Some(0x10));
     assert_eq!(row.function.build_id.as_deref(), Some("abcd"));
     assert_eq!(row.function.id.as_deref(), Some("abcd+0x10"));
@@ -419,8 +415,8 @@ fn separates_builds_at_the_same_path_and_function_address() {
     assert_eq!(result.rows.len(), 2);
     assert_eq!(result.rows[0].function.build_id.as_deref(), Some("abcd"));
     assert_eq!(result.rows[1].function.build_id.as_deref(), Some("ef01"));
-    assert_eq!(result.rows[0].self_cpu_ns, 6);
-    assert_eq!(result.rows[1].self_cpu_ns, 4);
+    assert_eq!(result.rows[0].self_ns, 6);
+    assert_eq!(result.rows[1].self_ns, 4);
     assert!(
         result
             .rows
@@ -454,7 +450,7 @@ fn combines_copies_of_one_binary_at_different_paths() {
     let row = &result.rows[0];
     assert_eq!(row.function.id.as_deref(), Some("abcd+0x10"));
     assert_eq!(row.function.module.as_deref(), Some("/bin/app"));
-    assert_eq!(row.self_cpu_ns, 10);
+    assert_eq!(row.self_ns, 10);
 }
 
 #[test]
@@ -497,7 +493,7 @@ fn keeps_only_samples_under_a_function() {
     let cpu_ns = |functions: &[&str]| {
         run(&recording(), Some(&symbols()), &under(functions))
             .unwrap()
-            .cpu_ns
+            .time_ns
     };
     assert_eq!(cpu_ns(&["main"]), 10);
     assert_eq!(cpu_ns(&["recurse"]), 8);
@@ -568,11 +564,11 @@ fn credits_inlined_code_to_the_inlined_function() {
             .unwrap()
             .starts_with("/bin/app+inline:")
     );
-    assert_eq!((helper.self_cpu_ns, helper.total_cpu_ns), (8, 8));
+    assert_eq!((helper.self_ns, helper.total_ns), (8, 8));
 
     let leaf = row(&result, "leaf");
     assert!(!leaf.function.inlined);
-    assert_eq!((leaf.self_cpu_ns, leaf.total_cpu_ns), (0, 8));
+    assert_eq!((leaf.self_ns, leaf.total_ns), (0, 8));
     assert_eq!(leaf.function.file.as_deref(), Some("/src/app.c"));
     assert_eq!(result.coverage.named_share, Some(0.8));
     assert!(result.coverage.symbols.without_debug_info.is_empty());
@@ -597,7 +593,7 @@ fn an_inlined_function_is_one_function_per_declaration() {
         .filter(|r| r.function.name.as_deref() == Some("helper"))
         .collect();
     assert_eq!(helpers.len(), 1);
-    assert_eq!(helpers[0].self_cpu_ns, 9);
+    assert_eq!(helpers[0].self_ns, 9);
 
     // A function of the same name declared elsewhere is another function,
     // as is one whose name differs only by a leading underscore.
@@ -633,7 +629,7 @@ fn filters_by_an_inlined_function_on_the_stack() {
     let mut query = under(&["helper"]);
     query.top = 10;
     let result = run(&recording(), Some(&symbols_with_inlining()), &query).unwrap();
-    assert_eq!(result.cpu_ns, 8);
+    assert_eq!(result.time_ns, 8);
 }
 
 #[test]
@@ -660,14 +656,14 @@ fn groups_by_source_line() {
     };
     let helper = at("helper", Some(5));
     assert_eq!(helper.line.as_ref().unwrap().file, "/src/app.c");
-    assert_eq!((helper.self_cpu_ns, helper.total_cpu_ns), (8, 8));
+    assert_eq!((helper.self_ns, helper.total_ns), (8, 8));
     // The leaf frame's caller is at the line of the call.
-    assert_eq!(at("leaf", Some(20)).total_cpu_ns, 8);
-    assert_eq!(at("recurse", Some(30)).total_cpu_ns, 8);
+    assert_eq!(at("leaf", Some(20)).total_ns, 8);
+    assert_eq!(at("recurse", Some(30)).total_ns, 8);
     // Code without line info keeps its time in a row with no line.
-    assert_eq!(at("main", None).total_cpu_ns, 10);
-    let rows: u64 = result.rows.iter().map(|r| r.self_cpu_ns).sum();
-    assert_eq!(rows, result.cpu_ns);
+    assert_eq!(at("main", None).total_ns, 10);
+    let rows: u64 = result.rows.iter().map(|r| r.self_ns).sum();
+    assert_eq!(rows, result.time_ns);
 
     let by_function = run(
         &recording(),
@@ -676,4 +672,101 @@ fn groups_by_source_line() {
     )
     .unwrap();
     assert!(by_function.rows.iter().all(|r| r.line.is_none()));
+}
+
+/// Context switches: blocked for 20 under leaf, preempted for 5 under the
+/// placeholder, and blocked for 15 without a stack.
+fn with_off_cpu(mut recording: Recording) -> Recording {
+    let mut stream = perf_stream();
+    stream
+        .signals
+        .extend([Signal::OffCPUTime, Signal::OffCPUStacks]);
+    recording.manifest.streams.push(stream);
+    let interval = |start_ns, end_ns, state, stack| OffCPUInterval {
+        start_ns,
+        end_ns,
+        pid: 1,
+        tid: 1,
+        state,
+        stack,
+    };
+    recording.off_cpu = vec![
+        interval(10, 30, ThreadState::Blocked, Some(0)),
+        interval(40, 45, ThreadState::Runnable, Some(1)),
+        interval(50, 65, ThreadState::Blocked, None),
+    ];
+    recording
+}
+
+fn by(metric: Metric) -> Query {
+    Query {
+        metric,
+        ..query(10)
+    }
+}
+
+fn times(result: &QueryResult, name: &str) -> (u64, u64) {
+    let row = result
+        .rows
+        .iter()
+        .find(|r| r.function.name.as_deref() == Some(name))
+        .unwrap_or_else(|| panic!("no row {name}"));
+    (row.self_ns, row.total_ns)
+}
+
+#[test]
+fn weighs_stacks_by_the_metric() {
+    let recording = with_off_cpu(recording());
+    let run = |metric| run(&recording, Some(&symbols()), &by(metric)).unwrap();
+
+    let cpu = run(Metric::OnCPU);
+    assert_eq!(
+        (cpu.samples, cpu.off_cpu_intervals, cpu.time_ns),
+        (4, 0, 10)
+    );
+    assert_eq!(times(&cpu, "leaf"), (8, 8));
+    assert_eq!(cpu.coverage.no_stack_share, 0.0);
+
+    let off = run(Metric::OffCPU);
+    assert_eq!(
+        (off.samples, off.off_cpu_intervals, off.time_ns),
+        (0, 3, 40)
+    );
+    assert_eq!(times(&off, "leaf"), (20, 20));
+    assert_eq!(times(&off, "main"), (0, 25));
+    assert_eq!(off.coverage.named_share, Some(0.5));
+    assert_eq!(off.coverage.unnamed_by_origin[&Origin::Binary], 0.125);
+    assert_eq!(off.coverage.no_stack_share, 0.375);
+
+    let wall = run(Metric::Wall);
+    assert_eq!(
+        (wall.samples, wall.off_cpu_intervals, wall.time_ns),
+        (4, 3, 50)
+    );
+    assert_eq!(times(&wall, "leaf"), (28, 28));
+    assert_eq!(times(&wall, "main"), (0, 35));
+}
+
+#[test]
+fn off_cpu_time_without_a_stack_is_under_no_function() {
+    let query = Query {
+        filter: Filter {
+            under: vec!["main".into()],
+            ..Filter::default()
+        },
+        ..by(Metric::OffCPU)
+    };
+    let result = run(&with_off_cpu(recording()), Some(&symbols()), &query).unwrap();
+    assert_eq!(result.time_ns, 25);
+    assert_eq!(result.coverage.no_stack_share, 0.0);
+}
+
+#[test]
+fn needs_context_switches_for_off_cpu_time() {
+    for metric in [Metric::OffCPU, Metric::Wall] {
+        assert!(matches!(
+            run(&recording(), Some(&symbols()), &by(metric)),
+            Err(Error::Metric(metric::Error::NoContextSwitches))
+        ));
+    }
 }

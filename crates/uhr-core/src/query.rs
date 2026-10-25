@@ -7,6 +7,7 @@ use serde::Serialize;
 use crate::coverage::{Coverage, SymbolCoverage};
 use crate::filter::Filter;
 use crate::functions::{self, Function, Functions, SourceLine};
+use crate::metric::{self, Metric, stack_times};
 use crate::recording::{self, Origin, Recording};
 use crate::symbols::Symbols;
 
@@ -21,6 +22,7 @@ pub enum GroupBy {
 #[derive(Debug, Clone)]
 pub struct Query {
     pub group_by: GroupBy,
+    pub metric: Metric,
     pub top: usize,
     pub filter: Filter,
 }
@@ -28,10 +30,14 @@ pub struct Query {
 #[derive(Debug, Clone, Serialize)]
 pub struct QueryResult {
     pub group_by: GroupBy,
+    pub metric: Metric,
     pub filter: Filter,
-    /// Samples that passed the filter.
+    /// CPU samples that passed the filter, if the metric counts them.
     pub samples: u64,
-    pub cpu_ns: u64,
+    /// Off-CPU intervals that passed the filter, if the metric counts them.
+    pub off_cpu_intervals: u64,
+    /// Time of the metric that passed. Shares are of this.
+    pub time_ns: u64,
     /// Sorted by self time, then total time.
     pub rows: Vec<Row>,
     /// Rows cut by `top`.
@@ -46,22 +52,26 @@ pub struct Row {
     /// Grouped by line, the line in the function. `None` there for code
     /// without line info, and always `None` grouped by function.
     pub line: Option<SourceLine>,
-    /// CPU time with this row as the leaf.
-    pub self_cpu_ns: u64,
+    /// Time with this row as the leaf.
+    pub self_ns: u64,
     pub self_share: f64,
-    /// CPU time with this row anywhere on the stack, counted once per sample
-    /// even when it recurses. For a caller's line, the line of the call.
-    pub total_cpu_ns: u64,
+    /// Time with this row anywhere on the stack, counted once per sample or
+    /// interval even when it recurses. For a caller's line, the line of the
+    /// call.
+    pub total_ns: u64,
     pub total_share: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct QueryCoverage {
-    /// Share of CPU time whose leaf frame has a name. Placeholders don't
-    /// count. `None` without samples.
+    /// Share of the time whose leaf frame has a name. Placeholders don't
+    /// count. `None` without any time.
     pub named_share: Option<f64>,
-    /// Share of CPU time whose leaf frame has no name, by origin.
+    /// Share of the time whose leaf frame has no name, by origin.
     pub unnamed_by_origin: BTreeMap<Origin, f64>,
+    /// Share of the time with no stack: off-CPU time whose stack was not
+    /// recorded. It is in no row.
+    pub no_stack_share: f64,
     #[serde(flatten)]
     pub symbols: SymbolCoverage,
     #[serde(flatten)]
@@ -75,6 +85,8 @@ pub enum Error {
     /// The filter names a function that is not there, or not only once.
     #[error(transparent)]
     Function(#[from] functions::Error),
+    #[error(transparent)]
+    Metric(#[from] metric::Error),
 }
 
 pub fn query(dir: &Path, query: &Query) -> Result<QueryResult, Error> {
@@ -88,38 +100,34 @@ pub fn run(
     symbols: Option<&Symbols>,
     query: &Query,
 ) -> Result<QueryResult, Error> {
+    query.metric.check(recording)?;
     let functions = Functions::new(recording, symbols);
-    let mut stack_cpu_ns = vec![0u64; recording.stacks.len()];
-    let mut samples = 0;
-    for sample in query.filter.samples(recording, &functions)? {
-        stack_cpu_ns[sample.stack as usize] += sample.cpu_ns;
-        samples += 1;
-    }
-    let cpu_ns: u64 = stack_cpu_ns.iter().sum();
+    let times = stack_times(recording, &functions, &query.filter, query.metric)?;
+    let time_ns = times.total_ns();
 
     let share = |ns: u64| {
-        if cpu_ns == 0 {
+        if time_ns == 0 {
             0.0
         } else {
-            ns as f64 / cpu_ns as f64
+            ns as f64 / time_ns as f64
         }
     };
     let row = |function: u32, line: Option<u32>, (self_ns, total_ns): (u64, u64)| Row {
         function: functions.get(function).clone(),
         line: line.map(|line| functions.line(line).clone()),
-        self_cpu_ns: self_ns,
+        self_ns,
         self_share: share(self_ns),
-        total_cpu_ns: total_ns,
+        total_ns,
         total_share: share(total_ns),
     };
     let mut rows: Vec<Row> = match query.group_by {
-        GroupBy::Function => tally(recording, &stack_cpu_ns, |stack, keys| {
+        GroupBy::Function => tally(recording, &times.ns, |stack, keys| {
             keys.extend(functions.expand(stack))
         })
         .into_iter()
         .map(|(function, times)| row(function, None, times))
         .collect(),
-        GroupBy::Line => tally(recording, &stack_cpu_ns, |stack, keys| {
+        GroupBy::Line => tally(recording, &times.ns, |stack, keys| {
             keys.extend(functions.steps(stack))
         })
         .into_iter()
@@ -127,8 +135,8 @@ pub fn run(
         .collect(),
     };
     rows.sort_by(|a, b| {
-        (b.self_cpu_ns, b.total_cpu_ns)
-            .cmp(&(a.self_cpu_ns, a.total_cpu_ns))
+        (b.self_ns, b.total_ns)
+            .cmp(&(a.self_ns, a.total_ns))
             .then_with(|| a.function.name.cmp(&b.function.name))
             .then_with(|| a.function.placeholder.cmp(&b.function.placeholder))
             .then_with(|| a.function.module.cmp(&b.function.module))
@@ -149,7 +157,7 @@ pub fn run(
 
     let mut unnamed_by_origin = BTreeMap::new();
     let mut named_ns = 0;
-    for (stack, &weight) in recording.stacks.iter().zip(&stack_cpu_ns) {
+    for (stack, &weight) in recording.stacks.iter().zip(&times.ns) {
         let leaf = functions.get(functions.leaf(stack));
         if leaf.name.is_some() {
             named_ns += weight;
@@ -159,38 +167,41 @@ pub fn run(
     }
 
     let coverage = QueryCoverage {
-        named_share: (cpu_ns > 0).then(|| share(named_ns)),
+        named_share: (time_ns > 0).then(|| share(named_ns)),
         unnamed_by_origin: unnamed_by_origin
             .into_iter()
             .map(|(origin, ns)| (origin, share(ns)))
             .collect(),
+        no_stack_share: share(times.no_stack_ns),
         symbols: SymbolCoverage::of(recording, symbols),
         recording: Coverage::of(recording),
     };
 
     Ok(QueryResult {
         group_by: query.group_by,
+        metric: query.metric,
         filter: query.filter.clone(),
-        samples,
-        cpu_ns,
+        samples: times.samples,
+        off_cpu_intervals: times.off_cpu_intervals,
+        time_ns,
         rows,
         rows_omitted,
         coverage,
     })
 }
 
-/// Self and total CPU time of each key. `keys` lists the keys of a stack,
-/// leaf first. A sample counts once for each key, however often the key
-/// repeats on its stack.
+/// Self and total time of each key. `keys` lists the keys of a stack, leaf
+/// first. A stack's time counts once for each key, however often the key
+/// repeats on it.
 fn tally<K: Copy + Eq + Hash>(
     recording: &Recording,
-    stack_cpu_ns: &[u64],
+    stack_ns: &[u64],
     mut keys: impl FnMut(&[u32], &mut Vec<K>),
 ) -> HashMap<K, (u64, u64)> {
     let mut times: HashMap<K, (u64, u64)> = HashMap::new();
     let mut stack_keys = Vec::new();
     let mut seen = HashSet::new();
-    for (stack, &weight) in recording.stacks.iter().zip(stack_cpu_ns) {
+    for (stack, &weight) in recording.stacks.iter().zip(stack_ns) {
         if weight == 0 {
             continue;
         }

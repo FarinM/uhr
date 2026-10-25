@@ -118,7 +118,7 @@ fn the_time_is_in_the_kernel_on_behalf_of_read_zero() {
             .as_array()
             .unwrap()
             .iter()
-            .all(|r| r["origin"] == "kernel" || r["self_cpu_ns"] == 0),
+            .all(|r| r["origin"] == "kernel" || r["self_ns"] == 0),
         "only kernel code runs in kernel mode"
     );
 }

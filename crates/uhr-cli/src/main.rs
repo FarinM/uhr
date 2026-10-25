@@ -11,6 +11,7 @@ use uhr_core::coverage::{Coverage, SymbolCoverage};
 use uhr_core::doctor::{self, Report, Status};
 use uhr_core::filter::Filter;
 use uhr_core::functions::Function;
+use uhr_core::metric::Metric;
 use uhr_core::overview::{self, CPUTime, Overview};
 use uhr_core::perf::{self, RecordOptions, Unwind};
 use uhr_core::query::{self, GroupBy, Query, QueryResult};
@@ -77,11 +78,15 @@ enum Command {
         #[command(flatten)]
         filter: FilterArgs,
     },
-    /// Group a recording's CPU time and print the top rows, with coverage
+    /// Group a recording's CPU or off-CPU time and print the top rows, with
+    /// coverage
     Query {
         recording: PathBuf,
         #[arg(long, value_enum)]
         group_by: GroupByArg,
+        /// The time to weigh stacks by
+        #[arg(long, value_enum, default_value_t = MetricArg::Cpu)]
+        metric: MetricArg,
         /// Rows to print
         #[arg(long, default_value_t = 20)]
         top: usize,
@@ -90,13 +95,17 @@ enum Command {
         #[command(flatten)]
         filter: FilterArgs,
     },
-    /// Show who calls a function and what it calls, with their CPU time
+    /// Show who calls a function and what it calls, with their CPU or off-CPU
+    /// time
     CallPaths {
         recording: PathBuf,
         /// A function id from `uhr query --json`, or a name only one function
         /// has
         #[arg(long)]
         function: String,
+        /// The time to weigh stacks by
+        #[arg(long, value_enum, default_value_t = MetricArg::Cpu)]
+        metric: MetricArg,
         /// Levels of callers and of callees to show
         #[arg(
             long,
@@ -131,6 +140,26 @@ enum GroupByArg {
     Function,
     /// Function and source line, from debug info
     Line,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum MetricArg {
+    /// CPU time, from CPU samples
+    Cpu,
+    /// Time threads spent off CPU, runnable or blocked, from context switches
+    OffCpu,
+    /// Both, all the time threads were alive
+    Wall,
+}
+
+impl From<MetricArg> for Metric {
+    fn from(metric: MetricArg) -> Self {
+        match metric {
+            MetricArg::Cpu => Metric::OnCPU,
+            MetricArg::OffCpu => Metric::OffCPU,
+            MetricArg::Wall => Metric::Wall,
+        }
+    }
 }
 
 #[derive(Args)]
@@ -243,18 +272,28 @@ fn main() -> ExitCode {
         Command::Query {
             recording,
             group_by,
+            metric,
             top,
             filter,
             json,
-        } => run_query(&recording, group_by, top, filter, json),
+        } => run_query(&recording, group_by, metric.into(), top, filter, json),
         Command::CallPaths {
             recording,
             function,
+            metric,
             depth,
             top,
             json,
             filter,
-        } => run_call_paths(&recording, function, depth, top, filter, json),
+        } => run_call_paths(
+            &recording,
+            function,
+            metric.into(),
+            depth,
+            top,
+            filter,
+            json,
+        ),
     };
     result.unwrap_or_else(|error| {
         tracing::error!("{error:#}");
@@ -498,6 +537,7 @@ fn kernel_share(cpu: &CPUTime) -> String {
 fn run_call_paths(
     recording: &Path,
     function: String,
+    metric: Metric,
     depth: usize,
     top: usize,
     filter: FilterArgs,
@@ -507,6 +547,7 @@ fn run_call_paths(
         function,
         depth,
         top,
+        metric,
         filter: filter.into_filter()?,
     };
     let result = call_paths::call_paths(recording, &query)?;
@@ -521,10 +562,10 @@ fn run_call_paths(
 
 fn write_call_paths(out: &mut impl Write, result: &CallPaths) -> io::Result<()> {
     let percent = |ns: u64| {
-        if result.cpu_ns == 0 {
+        if result.time_ns == 0 {
             0.0
         } else {
-            ns as f64 / result.cpu_ns as f64 * 100.0
+            ns as f64 / result.time_ns as f64 * 100.0
         }
     };
     writeln!(
@@ -535,9 +576,13 @@ fn write_call_paths(out: &mut impl Write, result: &CallPaths) -> io::Result<()> 
     )?;
     writeln!(
         out,
-        "{} samples, {:.2} s of CPU time. On the stack for {:.1}% of it, the leaf for {:.1}%",
-        result.samples,
-        result.cpu_ns as f64 / 1e9,
+        "{}. On the stack for {:.1}% of it, the leaf for {:.1}%",
+        describe_time(
+            result.metric,
+            result.samples,
+            result.off_cpu_intervals,
+            result.time_ns
+        ),
         result.total_share * 100.0,
         result.self_share * 100.0
     )?;
@@ -547,11 +592,11 @@ fn write_call_paths(out: &mut impl Write, result: &CallPaths) -> io::Result<()> 
 
     writeln!(out, "\ncallers")?;
     write_nodes(out, &result.callers, &result.callers_omitted, 0, &percent)?;
-    if result.no_caller_cpu_ns > 0 {
+    if result.no_caller_ns > 0 {
         writeln!(
             out,
             "{:>6.1}%  (no caller: where the thread started, or the stack was cut short)",
-            percent(result.no_caller_cpu_ns)
+            percent(result.no_caller_ns)
         )?;
     }
     writeln!(out, "\ncallees")?;
@@ -565,11 +610,12 @@ fn write_call_paths(out: &mut impl Write, result: &CallPaths) -> io::Result<()> 
             "  function time with every frame named, within the depth: {:.1}%",
             share * 100.0
         ),
-        None => writeln!(out, "  named frames: unknown, no samples of the function"),
+        None => writeln!(out, "  named frames: unknown, no time in the function"),
     }?;
     for (origin, share) in &coverage.unnamed_by_origin {
         writeln!(out, "  unnamed {}: {:.1}%", origin.as_str(), share * 100.0)?;
     }
+    write_no_stack(out, coverage.no_stack_share)?;
     write_symbol_coverage(out, &coverage.symbols)?;
     write_coverage(out, &coverage.recording)
 }
@@ -586,14 +632,14 @@ fn write_nodes(
         writeln!(out, "  none")?;
     }
     for node in nodes {
-        let leaf = match node.self_cpu_ns {
+        let leaf = match node.self_ns {
             Some(ns) if ns > 0 => format!("  (leaf {:.1}%)", percent(ns)),
             _ => String::new(),
         };
         writeln!(
             out,
             "{:>6.1}%  {indent}{}  {}{leaf}",
-            percent(node.cpu_ns),
+            percent(node.time_ns),
             function_name(&node.function),
             module_name(&node.function)
         )?;
@@ -603,7 +649,7 @@ fn write_nodes(
         writeln!(
             out,
             "{:>6.1}%  {indent}({} more)",
-            percent(omitted.cpu_ns),
+            percent(omitted.time_ns),
             omitted.nodes
         )?;
     }
@@ -613,6 +659,7 @@ fn write_nodes(
 fn run_query(
     recording: &Path,
     group_by: GroupByArg,
+    metric: Metric,
     top: usize,
     filter: FilterArgs,
     json: bool,
@@ -622,6 +669,7 @@ fn run_query(
             GroupByArg::Function => GroupBy::Function,
             GroupByArg::Line => GroupBy::Line,
         },
+        metric,
         top,
         filter: filter.into_filter()?,
     };
@@ -642,9 +690,13 @@ fn write_query(out: &mut impl Write, result: &QueryResult) -> io::Result<()> {
     };
     writeln!(
         out,
-        "{} samples, {:.2} s of CPU time, by {by}\n",
-        result.samples,
-        result.cpu_ns as f64 / 1e9
+        "{}, by {by}\n",
+        describe_time(
+            result.metric,
+            result.samples,
+            result.off_cpu_intervals,
+            result.time_ns
+        )
     )?;
     if !result.filter.is_empty() {
         writeln!(out, "filter: {}\n", describe_filter(&result.filter))?;
@@ -680,13 +732,32 @@ fn write_query(out: &mut impl Write, result: &QueryResult) -> io::Result<()> {
     writeln!(out, "\ncoverage")?;
     match coverage.named_share {
         Some(share) => writeln!(out, "  self time in named functions: {:.1}%", share * 100.0),
-        None => writeln!(out, "  self time in named functions: unknown, no samples"),
+        None => writeln!(out, "  self time in named functions: unknown, no time"),
     }?;
     for (origin, share) in &coverage.unnamed_by_origin {
         writeln!(out, "  unnamed {}: {:.1}%", origin.as_str(), share * 100.0)?;
     }
+    write_no_stack(out, coverage.no_stack_share)?;
     write_symbol_coverage(out, &coverage.symbols)?;
     write_coverage(out, &coverage.recording)
+}
+
+fn describe_time(metric: Metric, samples: u64, intervals: u64, time_ns: u64) -> String {
+    let seconds = time_ns as f64 / 1e9;
+    match metric {
+        Metric::OnCPU => format!("{samples} samples, {seconds:.2} s of CPU time"),
+        Metric::OffCPU => format!("{intervals} off-CPU intervals, {seconds:.2} s off CPU"),
+        Metric::Wall => format!(
+            "{samples} samples and {intervals} off-CPU intervals, {seconds:.2} s of thread time"
+        ),
+    }
+}
+
+fn write_no_stack(out: &mut impl Write, share: f64) -> io::Result<()> {
+    if share > 0.0 {
+        writeln!(out, "  off-CPU time without a stack: {:.1}%", share * 100.0)?;
+    }
+    Ok(())
 }
 
 fn write_symbol_coverage(out: &mut impl Write, coverage: &SymbolCoverage) -> io::Result<()> {

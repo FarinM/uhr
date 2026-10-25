@@ -1,6 +1,7 @@
 use uhr_core::call_paths::{CallPaths, Error, Node, Omitted, Query, run};
 use uhr_core::filter::Filter;
 use uhr_core::functions;
+use uhr_core::metric::Metric;
 use uhr_core::recording::*;
 use uhr_core::symbols::{FrameName, InlineFrame, Symbols};
 
@@ -127,6 +128,7 @@ fn query(function: &str, depth: usize, top: usize) -> Query {
         function: function.into(),
         depth,
         top,
+        metric: Metric::OnCPU,
         filter: Filter::default(),
     }
 }
@@ -140,7 +142,7 @@ fn tree(nodes: &[Node]) -> Vec<String> {
     fn walk(nodes: &[Node], level: usize, out: &mut Vec<String>) {
         for node in nodes {
             let name = node.function.name.as_deref().unwrap_or("<unnamed>");
-            out.push(format!("{}{name} {}", "  ".repeat(level), node.cpu_ns));
+            out.push(format!("{}{name} {}", "  ".repeat(level), node.time_ns));
             walk(&node.children, level + 1, out);
         }
     }
@@ -154,21 +156,21 @@ fn follows_the_paths_through_a_function() {
     let result = paths(&query("spin", 3, 5));
     assert_eq!(result.function.name.as_deref(), Some("spin"));
     assert_eq!(result.function.id.as_deref(), Some("/bin/app+0x40"));
-    assert_eq!(result.cpu_ns, 15);
-    assert_eq!((result.total_cpu_ns, result.self_cpu_ns), (12, 10));
+    assert_eq!(result.time_ns, 15);
+    assert_eq!((result.total_ns, result.self_ns), (12, 10));
     assert_eq!(result.total_share, 0.8);
-    assert_eq!(result.no_caller_cpu_ns, 1);
+    assert_eq!(result.no_caller_ns, 1);
 
     assert_eq!(
         tree(&result.callers),
         ["a 9", "  main 9", "b 2", "  main 2"]
     );
-    assert!(result.callers.iter().all(|n| n.self_cpu_ns.is_none()));
+    assert!(result.callers.iter().all(|n| n.self_ns.is_none()));
     assert_eq!(
         result.callers_omitted,
         Omitted {
             nodes: 0,
-            cpu_ns: 0
+            time_ns: 0
         }
     );
 }
@@ -187,10 +189,10 @@ fn counts_a_recursive_call_from_its_outermost_call() {
         .iter()
         .find(|n| n.function.name.as_deref() == Some("rec"))
         .unwrap();
-    assert_eq!((rec.cpu_ns, rec.self_cpu_ns), (1, Some(0)));
+    assert_eq!((rec.time_ns, rec.self_ns), (1, Some(0)));
     let inner = &rec.children[0];
     assert_eq!(inner.function.name.as_deref(), Some("spin"));
-    assert_eq!(inner.self_cpu_ns, Some(1));
+    assert_eq!(inner.self_ns, Some(1));
 }
 
 #[test]
@@ -203,10 +205,10 @@ fn lists_callees_with_their_leaf_time() {
             .find(|n| n.function.name.as_deref() == name)
             .unwrap()
     };
-    assert_eq!(callee(Some("keep")).self_cpu_ns, Some(1));
+    assert_eq!(callee(Some("keep")).self_ns, Some(1));
     let kernel = callee(None);
     assert_eq!(kernel.function.origin, Origin::Kernel);
-    assert_eq!((kernel.cpu_ns, kernel.self_cpu_ns), (1, Some(1)));
+    assert_eq!((kernel.time_ns, kernel.self_ns), (1, Some(1)));
     assert_eq!(result.callees.len(), 3);
 }
 
@@ -219,7 +221,7 @@ fn reports_what_the_depth_limit_cuts() {
         a.omitted,
         Omitted {
             nodes: 1,
-            cpu_ns: 9
+            time_ns: 9
         }
     );
     let rec = result
@@ -231,10 +233,10 @@ fn reports_what_the_depth_limit_cuts() {
         rec.omitted,
         Omitted {
             nodes: 1,
-            cpu_ns: 1
+            time_ns: 1
         }
     );
-    assert_eq!(rec.self_cpu_ns, Some(0), "the leaf is below the limit");
+    assert_eq!(rec.self_ns, Some(0), "the leaf is below the limit");
 }
 
 #[test]
@@ -245,7 +247,7 @@ fn sums_the_children_cut_by_top() {
         result.callers_omitted,
         Omitted {
             nodes: 1,
-            cpu_ns: 2
+            time_ns: 2
         }
     );
     assert_eq!(result.callees.len(), 1);
@@ -253,7 +255,7 @@ fn sums_the_children_cut_by_top() {
         result.callees_omitted,
         Omitted {
             nodes: 2,
-            cpu_ns: 2
+            time_ns: 2
         }
     );
 }
@@ -262,7 +264,7 @@ fn sums_the_children_cut_by_top() {
 fn selects_by_id_or_unique_name() {
     let by_id = paths(&query("/bin/app+0x40", 3, 5));
     assert_eq!(by_id.function.name.as_deref(), Some("spin"));
-    assert_eq!(by_id.total_cpu_ns, 12);
+    assert_eq!(by_id.total_ns, 12);
 
     let recording = recording();
     let error = |name: &str| run(&recording, Some(&symbols()), &query(name, 3, 5)).unwrap_err();
@@ -283,7 +285,7 @@ fn selects_by_id_or_unique_name() {
     ));
 
     let dup = paths(&query("/bin/app+0x80", 3, 5));
-    assert_eq!(dup.total_cpu_ns, 1);
+    assert_eq!(dup.total_ns, 1);
 }
 
 #[test]
@@ -291,10 +293,7 @@ fn follows_only_the_samples_that_pass_the_filter() {
     let mut query = query("spin", 3, 5);
     query.filter.modes = vec![Mode::Kernel];
     let result = paths(&query);
-    assert_eq!(
-        (result.cpu_ns, result.total_cpu_ns, result.self_cpu_ns),
-        (1, 1, 0)
-    );
+    assert_eq!((result.time_ns, result.total_ns, result.self_ns), (1, 1, 0));
     assert_eq!(tree(&result.callers), ["a 1", "  main 1"]);
     assert_eq!(result.total_share, 1.0);
 }
@@ -359,7 +358,7 @@ fn a_binary_that_ran_from_two_paths_is_one_function() {
 
     for function in ["abcd+0x40", "spin"] {
         let result = run(&recording, Some(&symbols), &query(function, 3, 5)).unwrap();
-        assert_eq!(result.total_cpu_ns, 17, "{function}: both copies count");
+        assert_eq!(result.total_ns, 17, "{function}: both copies count");
         assert_eq!(tree(&result.callers)[..2], ["a 9", "  main 9"]);
         assert!(tree(&result.callers).contains(&"main 5".to_owned()));
     }
@@ -378,19 +377,84 @@ fn goes_through_inlined_calls() {
     symbols.inline[3] = vec![call("mixin"), call("spin")];
     let mixin = run(&recording(), Some(&symbols), &query("mixin", 3, 5)).unwrap();
     assert!(mixin.function.inlined);
-    assert_eq!((mixin.total_cpu_ns, mixin.self_cpu_ns), (12, 10));
+    assert_eq!((mixin.total_ns, mixin.self_ns), (12, 10));
     assert_eq!(
         tree(&mixin.callers),
         ["spin 12", "  a 9", "    main 9", "  b 2", "    main 2"]
     );
 
     let spin = run(&recording(), Some(&symbols), &query("spin", 3, 5)).unwrap();
-    assert_eq!(spin.self_cpu_ns, 0, "the time is in the inlined code");
+    assert_eq!(spin.self_ns, 0, "the time is in the inlined code");
     let callee = spin
         .callees
         .iter()
         .find(|n| n.function.name.as_deref() == Some("mixin"))
         .unwrap();
     // The tenth is the recursive call, below the depth limit.
-    assert_eq!(callee.self_cpu_ns, Some(9));
+    assert_eq!(callee.self_ns, Some(9));
+}
+
+#[test]
+fn follows_off_cpu_time_through_the_paths() {
+    let mut recording = recording();
+    recording.manifest.streams.push(Stream {
+        id: "perf".into(),
+        collector: Collector::Perf {
+            version: "6.8".into(),
+            event: "cpu-clock".into(),
+            frequency_hz: 999,
+            requested_frequency_hz: 999,
+            unwinding: Unwinding::FramePointers,
+            stack_copy_bytes: None,
+            context_switches: true,
+        },
+        signals: vec![Signal::OffCPUTime, Signal::OffCPUStacks],
+        missing_signals: Vec::new(),
+        coverage: StreamCoverage {
+            samples: 15,
+            off_cpu_intervals: Some(3),
+            lost_events: 0,
+            throttle_events: 0,
+            max_stack_depth: 127,
+            stacks_at_stack_limit: 0,
+            stacks_cut_at_stack_copy: None,
+            stacks_not_unwound: None,
+            overhead_ns: None,
+            known_biases: Vec::new(),
+        },
+    });
+    let interval = |stack, end_ns| OffCPUInterval {
+        start_ns: 0,
+        end_ns,
+        pid: 1,
+        tid: 1,
+        state: ThreadState::Blocked,
+        stack,
+    };
+    // Under spin b main, under main alone, and without a stack.
+    recording.off_cpu = vec![
+        interval(Some(1), 30),
+        interval(Some(3), 10),
+        interval(None, 10),
+    ];
+    let by = |metric| {
+        let query = Query {
+            metric,
+            ..query("spin", 3, 5)
+        };
+        run(&recording, Some(&symbols()), &query).unwrap()
+    };
+
+    let off = by(Metric::OffCPU);
+    assert_eq!((off.time_ns, off.total_ns, off.self_ns), (50, 30, 30));
+    assert_eq!(off.off_cpu_intervals, 3);
+    assert_eq!(tree(&off.callers), ["b 30", "  main 30"]);
+    assert_eq!(off.coverage.no_stack_share, 0.2);
+
+    let wall = by(Metric::Wall);
+    assert_eq!((wall.time_ns, wall.total_ns), (65, 42));
+    assert_eq!(
+        tree(&wall.callers),
+        ["b 32", "  main 32", "a 9", "  main 9"]
+    );
 }
