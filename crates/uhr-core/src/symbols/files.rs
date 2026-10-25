@@ -1,9 +1,12 @@
 use std::collections::HashMap;
 use std::fmt;
-use std::fs::File;
+use std::fs::{File, Metadata};
 use std::io;
 use std::ops::Deref;
+#[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
+#[cfg(windows)]
+use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -35,26 +38,53 @@ pub(super) struct Files {
     snapshots: Mutex<HashMap<PathBuf, Snapshot>>,
 }
 
+/// What a write to a file changes. Unix also changes the inode's change
+/// time, which a write that sets the old modification time back can't hide.
+#[cfg(unix)]
+fn version(m: &Metadata) -> impl PartialEq {
+    (
+        m.len(),
+        m.mtime(),
+        m.mtime_nsec(),
+        m.ctime(),
+        m.ctime_nsec(),
+    )
+}
+
+#[cfg(not(unix))]
+fn version(m: &Metadata) -> impl PartialEq {
+    (m.len(), m.modified().ok())
+}
+
+/// Windows updates the modification time only once a writer closes the
+/// file, so a writer must not have it open: without write sharing, the open
+/// fails while one does, and no writer can open it during the copy.
+#[cfg(windows)]
+fn open(path: &Path) -> io::Result<File> {
+    const FILE_SHARE_READ: u32 = 0x1;
+    const FILE_SHARE_DELETE: u32 = 0x4;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE)
+        .open(path)
+}
+
+#[cfg(not(windows))]
+fn open(path: &Path) -> io::Result<File> {
+    File::open(path)
+}
+
 impl Files {
     pub fn read(&self, path: &Path) -> io::Result<Snapshot> {
         let mut snapshots = self.snapshots.lock().unwrap();
         if let Some(data) = snapshots.get(path) {
             return Ok(data.clone());
         }
-        let mut source = File::open(path)?;
+        let mut source = open(path)?;
         let before = source.metadata()?;
         let mut file = tempfile::tempfile()?;
         io::copy(&mut source, &mut file)?;
         let after = source.metadata()?;
-        let version = |m: &std::fs::Metadata| {
-            (
-                m.len(),
-                m.mtime(),
-                m.mtime_nsec(),
-                m.ctime(),
-                m.ctime_nsec(),
-            )
-        };
         if version(&before) != version(&after) {
             return Err(io::Error::other(format!(
                 "{} changed while being copied",
