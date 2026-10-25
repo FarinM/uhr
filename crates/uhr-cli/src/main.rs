@@ -65,8 +65,8 @@ enum Command {
     },
     /// Resolve function names in a recording against the files on this machine
     Symbolize { recording: PathBuf },
-    /// Show CPU time by mode, process and thread against time alive: is it
-    /// computing or waiting?
+    /// Show CPU time by mode and time off CPU, by process and thread, against
+    /// time alive: is it computing or waiting?
     Overview {
         recording: PathBuf,
         /// Processes and threads to print
@@ -414,6 +414,16 @@ fn write_overview(out: &mut impl Write, result: &Overview) -> io::Result<()> {
     if cpu.unknown_mode_cpu_ns > 0 {
         writeln!(out, "  unknown mode {}", seconds(cpu.unknown_mode_cpu_ns))?;
     }
+    match &result.off_cpu {
+        Some(off_cpu) => writeln!(
+            out,
+            "off CPU {}, summed over threads: runnable {}, blocked {}",
+            seconds(off_cpu.runnable_ns + off_cpu.blocked_ns),
+            seconds(off_cpu.runnable_ns),
+            seconds(off_cpu.blocked_ns)
+        ),
+        None => writeln!(out, "off CPU: not recorded"),
+    }?;
 
     writeln!(out, "\nprocesses")?;
     writeln!(
@@ -446,18 +456,19 @@ fn write_overview(out: &mut impl Write, result: &Overview) -> io::Result<()> {
     writeln!(out, "\nthreads")?;
     writeln!(
         out,
-        "{:>9} {:>7} {:>7} {:>9} {:>9}  name",
-        "cpu", "kernel", "on cpu", "alive", "tid"
+        "{:>9} {:>7} {:>7} {:>8} {:>7} {:>9} {:>9}  name",
+        "cpu", "kernel", "on cpu", "runnable", "blocked", "alive", "tid"
     )?;
+    let percent = |share: Option<f64>| share.map_or("-".into(), |s| format!("{:.1}%", s * 100.0));
     for thread in &result.threads {
         writeln!(
             out,
-            "{:>9} {:>7} {:>7} {:>9} {:>9}  {}",
+            "{:>9} {:>7} {:>7} {:>8} {:>7} {:>9} {:>9}  {}",
             seconds(thread.cpu.cpu_ns),
             kernel_share(&thread.cpu),
-            thread
-                .on_cpu_share
-                .map_or("-".into(), |share| format!("{:.1}%", share * 100.0)),
+            percent(thread.on_cpu_share),
+            percent(thread.runnable_share),
+            percent(thread.blocked_share),
             seconds(thread.alive_ns),
             thread.tid,
             thread.names.last().map_or("<unnamed>", String::as_str),

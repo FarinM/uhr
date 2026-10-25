@@ -27,8 +27,9 @@ Linux only for now, with perf installed. Build with `cargo build`, then:
 uhr doctor                                 # what this host is missing, and the fix
 uhr record -o rec -- ./my-program args     # record CPU samples and context switches,
                                            # and resolve names
-uhr overview rec                           # computing or waiting? CPU time by mode,
-                                           # process and thread, against time alive
+uhr overview rec                           # computing or waiting? CPU time by mode
+                                           # and time off CPU, runnable or blocked,
+                                           # by process and thread, against time alive
 uhr query rec --group-by function          # top functions, with coverage
 uhr query rec --group-by function --json   # the same, for agents
 uhr query rec --group-by function --thread 'worker-*' --mode kernel --from 1s

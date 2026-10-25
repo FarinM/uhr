@@ -6,12 +6,15 @@ use serde::Serialize;
 use crate::coverage::Coverage;
 use crate::filter::Filter;
 use crate::functions::{self, Functions};
-use crate::recording::{self, Collector, Exit, Mode, Recording, Sample, Signal, Thread};
+use crate::recording::{
+    self, Collector, Exit, Mode, OffCPUInterval, Recording, Sample, Signal, Thread, ThreadState,
+};
 use crate::symbols::Symbols;
 use crate::threads::ThreadNames;
 
 /// Time level 0: how much CPU time each process and thread used, in which
-/// mode, against how long it was alive. It tells computing from waiting.
+/// mode, and how long it waited off CPU, against how long it was alive. It
+/// tells computing from waiting.
 #[derive(Debug, Clone, Serialize)]
 pub struct Overview {
     pub command: Vec<String>,
@@ -30,6 +33,8 @@ pub struct Overview {
     /// CPU time over the window's wall time: 2.0 means two CPUs busy on
     /// average. `None` for an empty window.
     pub cpu_utilization: Option<f64>,
+    /// Summed over threads. `None` if context switches were not recorded.
+    pub off_cpu: Option<OffCPUTime>,
     /// Sorted by CPU time.
     pub processes: Vec<ProcessRow>,
     /// Rows cut by `top`.
@@ -60,9 +65,21 @@ pub struct CPUTime {
     pub unknown_mode_cpu_ns: u64,
 }
 
+/// Time a thread spent switched out, from the off-CPU intervals that passed,
+/// cut to the window.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct OffCPUTime {
+    pub intervals: u64,
+    /// Preempted, waiting for a CPU.
+    pub runnable_ns: u64,
+    /// Waiting for something else: a lock, I/O, a timer or another thread.
+    /// Includes the wait for a CPU after it was woken.
+    pub blocked_ns: u64,
+}
+
 /// One process lifetime: a reused pid gets a row per lifetime. Its name,
 /// times and thread count describe the process, whatever the filter. Its
-/// CPU time is that of the samples that passed.
+/// CPU and off-CPU time is that of the samples and intervals that passed.
 #[derive(Debug, Clone, Serialize)]
 pub struct ProcessRow {
     pub pid: u32,
@@ -82,6 +99,9 @@ pub struct ProcessRow {
     pub cpu: CPUTime,
     /// CPU time over `alive_ns`: 2.0 means two CPUs busy on average.
     pub cpu_utilization: Option<f64>,
+    /// Summed over its threads. `None` if context switches were not
+    /// recorded.
+    pub off_cpu: Option<OffCPUTime>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -103,6 +123,14 @@ pub struct ThreadRow {
     /// Sampling error can put it slightly above 1. `None` if it was not
     /// alive in the window.
     pub on_cpu_share: Option<f64>,
+    /// `None` if context switches were not recorded.
+    pub off_cpu: Option<OffCPUTime>,
+    /// Shares of `alive_ns` spent off CPU, runnable and blocked. Together
+    /// with `on_cpu_share` they come close to 1, short of the time perf
+    /// itself took at each switch. `None` if context switches were not
+    /// recorded, or it was not alive in the window.
+    pub runnable_share: Option<f64>,
+    pub blocked_share: Option<f64>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -156,6 +184,11 @@ pub fn run(
         .any(|s| s.signals.contains(&Signal::KernelCPUSamples))
         || recording.samples.iter().any(|s| s.mode == Mode::Kernel);
     let empty = CPUTime::new(kernel_sampled);
+    let switches_recorded = manifest
+        .streams
+        .iter()
+        .any(|s| s.signals.contains(&Signal::OffCPUTime));
+    let no_off_cpu = switches_recorded.then(OffCPUTime::default);
 
     let lifetimes = Lifetimes::new(recording);
     let names = ThreadNames::new(recording);
@@ -186,6 +219,9 @@ pub fn run(
             alive_ns: life.alive.1.saturating_sub(life.alive.0),
             cpu: empty.clone(),
             on_cpu_share: None,
+            off_cpu: no_off_cpu.clone(),
+            runnable_share: None,
+            blocked_share: None,
         }
     };
     let mut threads: HashMap<usize, ThreadRow> = HashMap::new();
@@ -200,13 +236,30 @@ pub fn run(
     let functions = Functions::new(recording, symbols);
     for sample in filter.samples(recording, &functions)? {
         cpu.add(sample);
-        let id = lifetimes.of(sample);
+        let id = lifetimes.of(sample.pid, sample.tid, sample.time_ns);
         // Inserts the lifetime if the sample lies outside it, so the
         // sample still counts.
         threads.entry(id).or_insert_with(|| row(id)).cpu.add(sample);
     }
+    let mut off_cpu = no_off_cpu.clone();
+    for (interval, ns) in filter.off_cpu(recording, &functions)? {
+        if let Some(total) = off_cpu.as_mut() {
+            total.add(interval, ns);
+        }
+        let id = lifetimes.of(interval.pid, interval.tid, interval.start_ns);
+        let row = threads.entry(id).or_insert_with(|| row(id));
+        if let Some(time) = row.off_cpu.as_mut() {
+            time.add(interval, ns);
+        }
+    }
 
-    let mut processes = processes(&lifetimes, &lives, &threads, &empty, base);
+    let mut processes = processes(
+        &lifetimes,
+        &lives,
+        &threads,
+        &(empty.clone(), no_off_cpu),
+        base,
+    );
     processes.sort_by(|a, b| {
         b.cpu
             .cpu_ns
@@ -219,6 +272,10 @@ pub fn run(
         .into_values()
         .map(|mut row| {
             row.on_cpu_share = ratio(row.cpu.cpu_ns, row.alive_ns);
+            if let Some(time) = &row.off_cpu {
+                row.runnable_share = ratio(time.runnable_ns, row.alive_ns);
+                row.blocked_share = ratio(time.blocked_ns, row.alive_ns);
+            }
             row
         })
         .collect();
@@ -233,11 +290,13 @@ pub fn run(
     threads.truncate(top);
 
     let mut coverage = Coverage::of(recording);
-    coverage.unknown.push(
-        "why threads were off CPU (blocked, sleeping or waiting to run): no scheduler signal was \
-         recorded"
-            .into(),
-    );
+    if !switches_recorded {
+        coverage.unknown.push(
+            "why threads were off CPU (blocked, sleeping or waiting to run): context switches \
+             were not recorded"
+                .into(),
+        );
+    }
     coverage
         .unknown
         .push("memory use: no memory signal was recorded".into());
@@ -260,12 +319,29 @@ pub fn run(
         window,
         cpu_utilization: ratio(cpu.cpu_ns, window.end_ns - window.start_ns),
         cpu,
+        off_cpu,
         processes,
         processes_omitted,
         threads,
         threads_omitted,
         coverage,
     })
+}
+
+impl OffCPUTime {
+    fn add(&mut self, interval: &OffCPUInterval, ns: u64) {
+        self.intervals += 1;
+        match interval.state {
+            ThreadState::Runnable => self.runnable_ns += ns,
+            ThreadState::Blocked => self.blocked_ns += ns,
+        }
+    }
+
+    fn merge(&mut self, other: &OffCPUTime) {
+        self.intervals += other.intervals;
+        self.runnable_ns += other.runnable_ns;
+        self.blocked_ns += other.blocked_ns;
+    }
 }
 
 impl CPUTime {
@@ -300,7 +376,8 @@ impl CPUTime {
     }
 }
 
-/// Every thread lifetime, including ids that only appear in samples.
+/// Every thread lifetime, including ids that only appear in samples or
+/// off-CPU intervals.
 struct Lifetimes {
     threads: Vec<Thread>,
     /// Lifetimes of each thread id, by start. Ones that started before the
@@ -315,11 +392,16 @@ impl Lifetimes {
         for (id, thread) in threads.iter().enumerate() {
             by_id.entry((thread.pid, thread.tid)).or_default().push(id);
         }
-        for sample in &recording.samples {
-            by_id.entry((sample.pid, sample.tid)).or_insert_with(|| {
+        let seen = recording
+            .samples
+            .iter()
+            .map(|s| (s.pid, s.tid))
+            .chain(recording.off_cpu.iter().map(|i| (i.pid, i.tid)));
+        for (pid, tid) in seen {
+            by_id.entry((pid, tid)).or_insert_with(|| {
                 threads.push(Thread {
-                    pid: sample.pid,
-                    tid: sample.tid,
+                    pid,
+                    tid,
                     parent_pid: None,
                     parent_tid: None,
                     start_ns: None,
@@ -346,9 +428,9 @@ impl Lifetimes {
         Some(ids[started.saturating_sub(1)])
     }
 
-    fn of(&self, sample: &Sample) -> usize {
-        self.at(sample.pid, sample.tid, Some(sample.time_ns))
-            .expect("every sampled thread id has a lifetime")
+    fn of(&self, pid: u32, tid: u32, time_ns: u64) -> usize {
+        self.at(pid, tid, Some(time_ns))
+            .expect("every thread id seen has a lifetime")
     }
 }
 
@@ -403,7 +485,7 @@ fn processes(
     lifetimes: &Lifetimes,
     lives: &[Life],
     threads: &HashMap<usize, ThreadRow>,
-    empty: &CPUTime,
+    empty: &(CPUTime, Option<OffCPUTime>),
     base: u64,
 ) -> Vec<ProcessRow> {
     let mut members: HashMap<(u32, Option<usize>), Vec<usize>> = HashMap::new();
@@ -412,14 +494,19 @@ fn processes(
             members.entry(life.process).or_default().push(id);
         }
     }
-    let mut cpu: HashMap<(u32, Option<usize>), CPUTime> = HashMap::new();
+    let mut times: HashMap<(u32, Option<usize>), (CPUTime, Option<OffCPUTime>)> = HashMap::new();
     for (&id, row) in threads {
-        cpu.entry(lives[id].process)
-            .or_insert_with(|| empty.clone())
-            .merge(&row.cpu);
+        let (cpu, off_cpu) = times
+            .entry(lives[id].process)
+            .or_insert_with(|| empty.clone());
+        cpu.merge(&row.cpu);
+        if let (Some(total), Some(time)) = (off_cpu.as_mut(), &row.off_cpu) {
+            total.merge(time);
+        }
     }
-    cpu.into_iter()
-        .map(|((pid, main), cpu)| {
+    times
+        .into_iter()
+        .map(|((pid, main), (cpu, off_cpu))| {
             let ids = &members[&(pid, main)];
             let first = ids.iter().map(|&id| lives[id].alive.0).min().unwrap_or(0);
             let last = ids.iter().map(|&id| lives[id].alive.1).max().unwrap_or(0);
@@ -446,6 +533,7 @@ fn processes(
                 alive_ns,
                 cpu_utilization: ratio(cpu.cpu_ns, alive_ns),
                 cpu,
+                off_cpu,
             }
         })
         .collect()

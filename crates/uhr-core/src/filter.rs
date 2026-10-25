@@ -3,24 +3,28 @@ use std::collections::{HashMap, HashSet};
 use serde::Serialize;
 
 use crate::functions::{self, Functions};
-use crate::recording::{Mode, Recording, Sample};
+use crate::recording::{Mode, OffCPUInterval, Recording, Sample};
 use crate::threads::ThreadNames;
 
-/// Which samples a result covers. An empty list matches everything. The
-/// values in one list are alternatives, and every list has to match.
+/// Which samples and off-CPU intervals a result covers. An empty list
+/// matches everything. The values in one list are alternatives, and every
+/// list has to match.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct Filter {
     pub pids: Vec<u32>,
     /// Matches every lifetime of a reused thread id.
     pub tids: Vec<u32>,
-    /// Patterns for the name the thread had when the sample was taken. `*`
-    /// matches any run of characters and `?` one character.
+    /// Patterns for the name the thread had when the sample was taken, or
+    /// when it went off CPU. `*` matches any run of characters and `?` one
+    /// character.
     pub thread_names: Vec<String>,
+    /// Off-CPU time has no mode, so any mode leaves it out.
     pub modes: Vec<Mode>,
-    /// Functions, by id or by a name only one function has. A sample passes
-    /// if its stack contains one of them.
+    /// Functions, by id or by a name only one function has. A sample or
+    /// off-CPU interval passes if its stack contains one of them.
     pub under: Vec<String>,
-    /// Offset from the recording start, inclusive.
+    /// Offset from the recording start, inclusive. Off-CPU intervals are
+    /// cut to the time range.
     pub from_ns: Option<u64>,
     /// Offset from the recording start, exclusive.
     pub to_ns: Option<u64>,
@@ -51,7 +55,34 @@ impl Filter {
                     .is_none_or(|under| under[sample.stack as usize])
                 && names
                     .as_mut()
-                    .is_none_or(|names| names.matches(self, sample))
+                    .is_none_or(|names| names.matches(self, sample.pid, sample.tid, sample.time_ns))
+        }))
+    }
+
+    /// The off-CPU intervals that pass, each with how long it lies in the
+    /// time range. Fails like `samples`.
+    pub(crate) fn off_cpu<'a>(
+        &'a self,
+        recording: &'a Recording,
+        functions: &Functions,
+    ) -> Result<impl Iterator<Item = (&'a OffCPUInterval, u64)> + 'a, functions::Error> {
+        let under = self.stacks_under(recording, functions)?;
+        let mut names = (!self.thread_names.is_empty()).then(|| NameMatcher::new(recording));
+        let range = self.time_range(recording.manifest.start_ns);
+        Ok(recording.off_cpu.iter().filter_map(move |interval| {
+            let (start, end) =
+                range.map(|(from, to)| (interval.start_ns.max(from), interval.end_ns.min(to)))?;
+            let passes = self.modes.is_empty()
+                && start < end
+                && (self.pids.is_empty() || self.pids.contains(&interval.pid))
+                && (self.tids.is_empty() || self.tids.contains(&interval.tid))
+                && under
+                    .as_ref()
+                    .is_none_or(|under| interval.stack.is_some_and(|stack| under[stack as usize]))
+                && names.as_mut().is_none_or(|names| {
+                    names.matches(self, interval.pid, interval.tid, interval.start_ns)
+                });
+            passes.then(|| (interval, end - start))
         }))
     }
 
@@ -100,15 +131,23 @@ impl Filter {
         })
     }
 
-    fn in_time_range(&self, time_ns: u64, start_ns: Option<u64>) -> bool {
+    /// The time range in absolute times, end exclusive. `None` if nothing
+    /// can be in it.
+    fn time_range(&self, start_ns: Option<u64>) -> Option<(u64, u64)> {
         if self.from_ns.is_none() && self.to_ns.is_none() {
-            return true;
+            return Some((0, u64::MAX));
         }
         // Without a start, offsets are meaningless.
-        let Some(offset) = start_ns.map(|start| time_ns.saturating_sub(start)) else {
-            return false;
-        };
-        self.from_ns.is_none_or(|from| from <= offset) && self.to_ns.is_none_or(|to| offset < to)
+        let start = start_ns?;
+        Some((
+            start.saturating_add(self.from_ns.unwrap_or(0)),
+            self.to_ns.map_or(u64::MAX, |to| start.saturating_add(to)),
+        ))
+    }
+
+    fn in_time_range(&self, time_ns: u64, start_ns: Option<u64>) -> bool {
+        self.time_range(start_ns)
+            .is_some_and(|(from, to)| from <= time_ns && time_ns < to)
     }
 }
 
@@ -126,8 +165,8 @@ impl<'a> NameMatcher<'a> {
         }
     }
 
-    fn matches(&mut self, filter: &Filter, sample: &Sample) -> bool {
-        let Some(name) = self.names.at(sample.pid, sample.tid, sample.time_ns) else {
+    fn matches(&mut self, filter: &Filter, pid: u32, tid: u32, time_ns: u64) -> bool {
+        let Some(name) = self.names.at(pid, tid, time_ns) else {
             return false;
         };
         *self

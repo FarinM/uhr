@@ -1,5 +1,5 @@
 use uhr_core::filter::Filter;
-use uhr_core::overview::{Overview, ThreadRow, Window, run};
+use uhr_core::overview::{OffCPUTime, Overview, ThreadRow, Window, run};
 use uhr_core::recording::*;
 
 fn thread(tid: u32, start_ns: Option<u64>, end_ns: Option<u64>) -> Thread {
@@ -126,6 +126,39 @@ fn recording() -> Recording {
         off_cpu: Vec::new(),
         kernel_symbols: Vec::new(),
     }
+}
+
+/// Adds context switches: main thread 1 blocked from 2000 to 10000, worker
+/// 2 preempted from 3500 to 3900 and blocked from 4200 to 4800, and the
+/// second thread 3 blocked from 8500 to 8800.
+fn with_off_cpu(mut recording: Recording) -> Recording {
+    let stream = &mut recording.manifest.streams[0];
+    stream
+        .signals
+        .extend([Signal::OffCPUTime, Signal::OffCPUStacks]);
+    let interval = |tid, start_ns, end_ns, state, stack| OffCPUInterval {
+        start_ns,
+        end_ns,
+        pid: 1,
+        tid,
+        state,
+        stack,
+    };
+    recording.off_cpu = vec![
+        interval(1, 2_000, 10_000, ThreadState::Blocked, Some(0)),
+        interval(2, 3_500, 3_900, ThreadState::Runnable, None),
+        interval(2, 4_200, 4_800, ThreadState::Blocked, Some(0)),
+        interval(3, 8_500, 8_800, ThreadState::Blocked, Some(0)),
+    ];
+    recording
+}
+
+fn off_cpu(intervals: u64, runnable_ns: u64, blocked_ns: u64) -> Option<OffCPUTime> {
+    Some(OffCPUTime {
+        intervals,
+        runnable_ns,
+        blocked_ns,
+    })
 }
 
 fn overview(recording: &Recording, filter: Filter) -> Overview {
@@ -449,6 +482,109 @@ fn kernel_time_is_unknown_when_the_kernel_was_not_sampled() {
             .unknown
             .iter()
             .any(|u| u.starts_with("CPU time in the kernel")),
+        "{:?}",
+        result.coverage.unknown
+    );
+}
+
+#[test]
+fn splits_off_cpu_time_into_runnable_and_blocked() {
+    let result = overview(&with_off_cpu(recording()), Filter::default());
+    assert_eq!(result.off_cpu, off_cpu(4, 400, 8_900));
+    let worker = find(&result, 2, Some(1_000));
+    assert_eq!(worker.off_cpu, off_cpu(2, 400, 600));
+    assert_eq!(
+        (worker.runnable_share, worker.blocked_share),
+        (Some(0.1), Some(0.15))
+    );
+    assert_eq!(find(&result, 1, None).blocked_share, Some(0.8));
+    assert_eq!(find(&result, 3, Some(2_000)).off_cpu, off_cpu(0, 0, 0));
+    assert_eq!(find(&result, 3, Some(7_000)).off_cpu, off_cpu(1, 0, 300));
+    assert_eq!(result.processes[0].off_cpu, off_cpu(4, 400, 8_900));
+    assert_eq!(result.processes[1].off_cpu, off_cpu(0, 0, 0));
+    assert!(
+        !result
+            .coverage
+            .unknown
+            .iter()
+            .any(|u| u.starts_with("why threads were off CPU")),
+        "{:?}",
+        result.coverage.unknown
+    );
+}
+
+#[test]
+fn cuts_off_cpu_time_to_the_time_range() {
+    let filter = Filter {
+        from_ns: Some(4_500),
+        to_ns: Some(9_500),
+        ..Filter::default()
+    };
+    let result = overview(&with_off_cpu(recording()), filter);
+    assert_eq!(result.off_cpu, off_cpu(2, 0, 4_800));
+    assert_eq!(find(&result, 1, None).blocked_share, Some(0.9));
+}
+
+#[test]
+fn matches_off_cpu_time_by_thread() {
+    let recording = with_off_cpu(recording());
+    let worker = Filter {
+        thread_names: vec!["worker".into()],
+        ..Filter::default()
+    };
+    assert_eq!(overview(&recording, worker).off_cpu, off_cpu(2, 400, 600));
+    let main = Filter {
+        tids: vec![1],
+        ..Filter::default()
+    };
+    assert_eq!(overview(&recording, main).off_cpu, off_cpu(1, 0, 8_000));
+}
+
+#[test]
+fn off_cpu_time_takes_the_name_its_thread_went_off_cpu_with() {
+    let mut recording = with_off_cpu(recording());
+    recording.thread_names.push(name(1, Some(5_000), "renamed"));
+    let renamed = Filter {
+        thread_names: vec!["renamed".into()],
+        ..Filter::default()
+    };
+    assert_eq!(
+        overview(&recording, renamed.clone()).off_cpu,
+        off_cpu(0, 0, 0)
+    );
+    let later = Filter {
+        from_ns: Some(5_000),
+        ..renamed
+    };
+    assert_eq!(overview(&recording, later).off_cpu, off_cpu(0, 0, 0));
+}
+
+#[test]
+fn off_cpu_time_has_no_mode() {
+    let filter = Filter {
+        modes: vec![Mode::Kernel],
+        ..Filter::default()
+    };
+    let result = overview(&with_off_cpu(recording()), filter);
+    assert_eq!(result.off_cpu, off_cpu(0, 0, 0));
+}
+
+#[test]
+fn off_cpu_time_is_unknown_without_context_switches() {
+    let result = overview(&recording(), Filter::default());
+    assert_eq!(result.off_cpu, None);
+    assert!(
+        result
+            .threads
+            .iter()
+            .all(|t| t.off_cpu.is_none() && t.blocked_share.is_none())
+    );
+    assert!(
+        result
+            .coverage
+            .unknown
+            .iter()
+            .any(|u| u.starts_with("why threads were off CPU")),
         "{:?}",
         result.coverage.unknown
     );
