@@ -60,8 +60,6 @@ pub enum Error {
     Unfinished(PathBuf),
     #[error("{} is not a usable output directory", .0.display())]
     UnusableOutput(PathBuf),
-    #[error("{0}")]
-    PerfVersion(String),
     #[error("{path} is not a number: {value:?}")]
     NotANumber { path: &'static str, value: String },
     #[error(transparent)]
@@ -156,13 +154,10 @@ pub fn record(options: &RecordOptions, interrupts: &Interrupts, out: &Path) -> R
     // A perf map older than this, or than an attached process, belongs to
     // an earlier process with its pid.
     let since = SystemTime::now();
-    let report = doctor::check_perf();
-    if let Some(check) = report.blocked().next() {
-        return Err(Error::Blocked {
-            detail: check.detail.clone(),
-            fix: check.fix.clone(),
-        });
-    }
+    let perf_version = doctor::perf_version().map_err(|detail| Error::Blocked {
+        detail,
+        fix: Some(doctor::INSTALL_PERF.into()),
+    })?;
     if let Unwind::Dwarf { .. } = options.unwind {
         let check = doctor::check_dwarf_unwinding();
         if check.status != Status::Ok {
@@ -213,7 +208,6 @@ pub fn record(options: &RecordOptions, interrupts: &Interrupts, out: &Path) -> R
         result => result.map_err(io_error("creating", &staging))?,
     }
 
-    let perf_version = doctor::perf_version().map_err(Error::PerfVersion)?;
     let max_stack_depth = read_max_stack_depth()?;
     let perf_data = staging.join("perf.data");
     // Without the watch, a map counts only if it belongs to root or the
@@ -227,7 +221,7 @@ pub fn record(options: &RecordOptions, interrupts: &Interrupts, out: &Path) -> R
         Ok(ended) => ended,
         Err(error) => {
             remove_staging(&staging);
-            return Err(error);
+            return Err(diagnose(error));
         }
     };
     // While the boot and the loaded modules are still the ones recorded.
@@ -346,6 +340,22 @@ fn remove_runtime_files(pids: BTreeSet<u32>, since: SystemTime, owners: impl Fn(
             (Ok(_), _) => {}
             (Err(error), _) => warn!(pid, %error, "removing the perf map"),
         }
+    }
+}
+
+/// Why perf could not start, from the doctor's checks if they find it. They
+/// cost as much as a recording's start, so they run only then, and show
+/// perf's own error, which `--quiet` hides.
+fn diagnose(error: Error) -> Error {
+    if !matches!(error, Error::PerfStart { .. }) {
+        return error;
+    }
+    match doctor::check_perf().blocked().next() {
+        Some(check) => Error::Blocked {
+            detail: check.detail.clone(),
+            fix: check.fix.clone(),
+        },
+        None => error,
     }
 }
 

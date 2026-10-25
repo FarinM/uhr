@@ -274,6 +274,7 @@ uhr can stop everything it started, which cancellation needs.
   at 1 Hz with the collector's flags, then reads the event attributes to learn
   whether kernel sampling was excluded. It does not infer permission from
   uhr's UID or capabilities: the perf executable can have different credentials.
+  `record` runs it only when perf fails to start, to say why.
 - It also checks whether `/proc/kallsyms` shows the kernel's addresses. uhr
   reads that file itself, so there its own credentials are the ones that
   count. Without them kernel frames have no names, and the fix depends on

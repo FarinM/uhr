@@ -98,6 +98,10 @@ pub fn perf_version() -> Result<String, String> {
     Ok(version)
 }
 
+pub(crate) const INSTALL_PERF: &str = "Install perf for the running kernel: \
+    `sudo apt install linux-tools-$(uname -r)` on Debian and Ubuntu, `sudo dnf install perf` \
+    on Fedora.";
+
 fn check_perf_binary() -> Check {
     match perf_version() {
         Ok(version) => Check {
@@ -108,11 +112,7 @@ fn check_perf_binary() -> Check {
         Err(detail) => Check {
             status: Status::Blocked,
             detail,
-            fix: Some(
-                "Install perf for the running kernel: `sudo apt install linux-tools-$(uname -r)` \
-                 on Debian and Ubuntu, `sudo dnf install perf` on Fedora."
-                    .into(),
-            ),
+            fix: Some(INSTALL_PERF.into()),
         },
     }
 }

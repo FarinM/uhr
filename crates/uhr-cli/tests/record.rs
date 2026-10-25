@@ -609,3 +609,46 @@ fn records_a_uhr_that_records() {
         );
     }
 }
+
+/// uhr checks perf only when it fails to start, and then says why from
+/// perf's own error.
+#[test]
+fn says_why_perf_could_not_record() {
+    let dir = common::scratch("says_why_perf_could_not_record");
+    let bin = dir.join("bin");
+    fs::create_dir(&bin).unwrap();
+    let perf = bin.join("perf");
+    fs::write(
+        &perf,
+        "#!/bin/sh\n\
+         [ \"$1\" = --version ] && { echo 'perf version 6.8.12'; exit 0; }\n\
+         echo 'perf_event_open blocked by this test' >&2\n\
+         exit 1\n",
+    )
+    .unwrap();
+    fs::set_permissions(&perf, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let ran = dir.join("ran");
+    let recording = dir.join("rec");
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let output = Command::new(common::UHR)
+        .args(["record", "-o"])
+        .arg(&recording)
+        .args(["--", "touch"])
+        .arg(&ran)
+        .env("PATH", path)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("cannot record: perf recording probe failed"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("perf_event_open blocked by this test"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("fix: "), "{stderr}");
+    assert!(!ran.exists(), "the target ran");
+    assert!(!dir.join("rec.partial").exists());
+}
