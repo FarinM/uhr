@@ -96,6 +96,20 @@ query(filter={syscall: futex}, group_by=user_function)  Pool.acquire 28%
 timeline(threads="pool-*", filter={syscall: futex})     14 threads waiting on one lock
 ```
 
+## Code on runtimes
+
+Python, Node, Bun and Lua programs are profiled with the same commands as
+native ones, and each function in a result says which language it is written
+in.
+
+When uhr could not record a program's own frames, the result says so. A
+Python program recorded without a collector that sees Python frames gets "0%
+of the time in Python functions" and how to fix that, not the interpreter's
+own functions, such as `_PyEval_EvalFrameDefault`, presented as the answer.
+
+Whether the interpreter's own functions are hidden, folded into the
+program's, or shown is decided with the first runtime uhr supports.
+
 ## Measurement rigor
 
 The agent's main loop is measure, change, measure. The tools must make noise

@@ -61,7 +61,7 @@ recording; `uhr doctor` says how to allow that.
 - [Model](docs/model.md): core abstractions -- recordings, observations,
   dimensions, levels, coverage, storage.
 - [Format](docs/format.md): the on-disk schema of a recording.
-- [Collection](docs/collection.md): collectors, code origin resolution,
+- [Collection](docs/collection.md): collectors, runtimes, code origin resolution,
   platforms, privileges.
 - [Agent interface](docs/agent-interface.md): tools, result behavior,
   measurement rigor.

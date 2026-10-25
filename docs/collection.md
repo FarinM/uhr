@@ -169,7 +169,7 @@ Resolution decides what kind of memory the address is in and how to name it.
 | eBPF programs | `bpf_prog_<tag>_<name>` symbols in `kallsyms` (needs `net.core.bpf_jit_kallsyms=1`). BTF line info maps back to program source. `kernel.bpf_stats_enabled` gives per-program run time and run count |
 | JIT code with a map | perf map files or jitdump: Node `--perf-basic-prof`/`--perf-prof`, Python 3.12+ `-X perf`, JVM through async-profiler, .NET `DOTNET_PerfMapEnabled=1`, Wasmtime `--profile` |
 | JIT code without a map | Name the region (address range, thread, likely runtime), copy its code bytes so instruction views still work, and count it as unresolved |
-| Interpreted frames | Runtime-aware collector: py-spy, rbspy, async-profiler, V8 |
+| Interpreted frames | A collector that reads the interpreter's frames, or the runtime's own profiler. See [runtimes](#runtimes) |
 
 Requirements:
 - Resolution must be able to run after recording, from the stored mappings.
@@ -177,6 +177,17 @@ Requirements:
 - JIT tier and JIT compile time are recorded when the runtime exposes them.
 - The profiler's own eBPF programs show up in the eBPF stats and count toward
   reported overhead.
+
+## Runtimes
+
+For code on a runtime, such as Python, JavaScript or Lua, the frames that
+matter are the program's, not the interpreter's. A runtime can name its code
+for a native sampler, in perf map files or jitdump; a collector can read the
+interpreter's frames from its memory; or the runtime's own profiler can
+record them. Which way a runtime uses is decided when it is supported, and
+each supported runtime gets a test program. uhr detects the runtimes in a
+target and records their versions. What it knows about a runtime's frames is
+kept apart from how it reads memory, so other platforms can use it too.
 
 ## Unwinding and symbols
 
