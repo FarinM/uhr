@@ -44,9 +44,9 @@ fn record_finishes_when_stderr_is_closed() {
     let program = dir.join("cpu_bound");
     common::compile("cpu_bound", &program, "-O2");
     let recording = dir.join("rec");
-    // The target writes to stderr itself, so this fails on any host, not
-    // only on those where perf prints a warning.
-    let target = format!("echo started >&2; exec '{}' 20", program.display());
+    // The target has uhr's stderr, as it would without uhr, so writing to
+    // it kills the target. uhr and perf still finish the recording.
+    let target = format!("'{}' 20; echo done >&2", program.display());
     let output = uhr(
         &[
             "record",
@@ -68,7 +68,7 @@ fn record_finishes_when_stderr_is_closed() {
 
     let manifest: Value =
         serde_json::from_slice(&fs::read(recording.join("manifest.json")).unwrap()).unwrap();
-    assert_eq!(manifest["target"]["exit"]["code"], 0);
+    assert_eq!(manifest["target"]["exit"]["signal"], 13);
     assert!(
         manifest["streams"][0]["coverage"]["samples"]
             .as_u64()

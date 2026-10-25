@@ -16,6 +16,7 @@ arrow-buffer = "60"
 arrow-schema = "60"
 arrow-select = "60"
 clap = { version = "4.6", features = ["derive"] }
+libc = "0.2"
 linux-perf-data = "0.13"
 memmap2 = "0.9"
 lzma-rs = "0.3"
@@ -23,10 +24,9 @@ crc32fast = "1"
 framehop = { version = "0.16", default-features = false, features = ["std"] }
 gimli = { version = "0.31", default-features = false, features = ["read", "std", "endian-reader"] }
 parquet = { version = "60", default-features = false, features = ["arrow", "zstd"] }
-rustix = { version = "1", features = ["time"] }
+rustix = { version = "1", features = ["pipe", "process", "time"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-signal-hook = "0.4"
 stable_deref_trait = "1.2"
 tempfile = "3"
 thiserror = "2"

@@ -126,17 +126,25 @@ Debian and Ubuntu its package must match the running kernel.
   default: with every core of a 32-core host busy, perf's writer fell behind
   compressing the stack copies and dropped 0.3% of events, where
   frame-pointer recording dropped none.
-- perf and the target share uhr's stderr. When that is a pipe or socket, uhr
-  gives perf a pipe instead and copies it through, so a reader that stops
-  early, as `head` does, can't kill perf with SIGPIPE. Terminals and files are
-  passed straight through.
-- Terminal Ctrl-C reaches the whole process group and lets perf finish its
-  recording. perf stops collecting then, often before the target exits, so
-  uhr notes when it got the interrupt and counts that as the end of the
-  capture. PID-directed cancellation of uhr is not yet supported reliably:
-  SIGINT is not forwarded and SIGTERM can leave perf and the target running.
-  The installed SIGINT handler also remains ineffective after perf exits.
-  Fixing this requires a supervisor that preserves terminal job control.
+- uhr starts the target held before it runs any of its own code and
+  attaches perf with `--pid`, sampling off (`--delay=-1`). Once perf says
+  over its control pipe (`--control`, perf 5.10 or later) that it samples,
+  uhr lets the target run, so the recording starts at its first instruction.
+  Until then perf follows the target with a dummy event, and the held
+  process still runs uhr's code, which the recording leaves out.
+- perf shares uhr's stderr. When that is a pipe or socket, uhr gives perf a
+  pipe instead and copies it through, so a reader that stops early, as
+  `head` does, can't kill perf with SIGPIPE. Terminals and files are passed
+  straight through. The target has uhr's stderr itself, as it would without
+  uhr.
+- The capture ends when the target exits; processes it leaves running are
+  not followed after that. Terminal Ctrl-C reaches uhr and the target: uhr
+  stops perf at once and counts the interrupt as the end of the capture, then
+  waits for the target, so the recording has its exit status. A second
+  interrupt kills the target. If perf stops first, uhr asks the target to
+  stop with SIGTERM. Signals sent to uhr alone don't reach the target yet:
+  SIGTERM ends uhr without writing the recording, and SIGINT waits for a
+  target that never got it.
 
 ### eBPF on Linux
 
@@ -222,8 +230,7 @@ is not decided.
 uhr launches a target itself: it starts the program stopped before any of its
 own code runs, attaches each collector, then lets it go. Launching and
 attaching then share one path, several collectors can watch one target, and
-uhr can stop everything it started, which cancellation needs. Today perf
-still launches the target.
+uhr can stop everything it started, which cancellation needs.
 
 ## Privileges and doctor
 

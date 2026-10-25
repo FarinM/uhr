@@ -26,6 +26,9 @@ use crate::recording::{
 pub(super) struct Input<'a> {
     pub perf_data: &'a Path,
     pub command: &'a [String],
+    /// The process uhr started and held until perf sampled it. Until its
+    /// first exec it still runs uhr's code, so that is left out.
+    pub launched_pid: Option<u32>,
     pub exit: Option<Exit>,
     /// When the recording was interrupted, on CLOCK_MONOTONIC.
     pub interrupted_ns: Option<u64>,
@@ -51,27 +54,38 @@ pub(super) fn convert(input: Input) -> Result<Recording> {
         mut record_iter,
     } = PerfFileReader::parse_file(BufReader::new(file)).map_err(Error::PerfData)?;
 
-    let attributes = perf_file.event_attributes();
-    let cpu_clock = attributes.iter().position(|a| {
+    // Started with sampling off, perf adds a dummy event that tracks the
+    // target meanwhile. It samples nothing.
+    let attributes: Vec<_> = perf_file
+        .event_attributes()
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| !is_dummy(a.attributes()))
+        .collect();
+    let index = |wanted: fn(&PerfEventType) -> bool| {
+        attributes
+            .iter()
+            .find_map(|&(index, a)| wanted(&a.attributes().type_).then_some(index))
+    };
+    let cpu_clock = index(|t| matches!(t, PerfEventType::Software(SoftwareCounterType::CpuClock)));
+    let switches = index(|t| {
         matches!(
-            a.attributes().type_,
-            PerfEventType::Software(SoftwareCounterType::CpuClock)
-        )
-    });
-    let switches = attributes.iter().position(|a| {
-        matches!(
-            a.attributes().type_,
+            t,
             PerfEventType::Software(SoftwareCounterType::ContextSwitches)
         )
     });
     let expected = if switches.is_some() { 2 } else { 1 };
     let Some(cpu_clock) = cpu_clock.filter(|_| attributes.len() == expected) else {
-        let types: Vec<_> = attributes.iter().map(|a| a.attributes().type_).collect();
+        let types: Vec<_> = attributes
+            .iter()
+            .map(|(_, a)| a.attributes().type_)
+            .collect();
         return Err(unexpected(format!(
             "expected a cpu-clock event and maybe a context-switches event, found {types:?}"
         )));
     };
-    let attr = attributes[cpu_clock].attributes();
+    let all = perf_file.event_attributes();
+    let attr = all[cpu_clock].attributes();
     check_clock(attr)?;
     let SamplingPolicy::Frequency(frequency_hz) = attr.sampling_policy else {
         return Err(unexpected(format!(
@@ -87,7 +101,7 @@ pub(super) fn convert(input: Input) -> Result<Recording> {
     // Threads go off CPU in the kernel, so without it there are no stacks.
     let mut switch_stacks_excluded = false;
     if let Some(index) = switches {
-        let attr = attributes[index].attributes();
+        let attr = all[index].attributes();
         check_clock(attr)?;
         if !matches!(attr.sampling_policy, SamplingPolicy::Period(period) if period.get() == 1) {
             return Err(unexpected(format!(
@@ -95,7 +109,7 @@ pub(super) fn convert(input: Input) -> Result<Recording> {
                 attr.sampling_policy
             )));
         }
-        if !attributes
+        if !all
             .iter()
             .any(|a| a.attributes().flags.contains(AttrFlags::CONTEXT_SWITCH))
         {
@@ -110,6 +124,7 @@ pub(super) fn convert(input: Input) -> Result<Recording> {
     if stack_copy_bytes.is_some() {
         state.unwinding = Some(UserUnwinding::new());
     }
+    let mut held = input.launched_pid;
     while let Some(record) = record_iter
         .next_record(&mut perf_file)
         .map_err(Error::PerfData)?
@@ -117,20 +132,34 @@ pub(super) fn convert(input: Input) -> Result<Recording> {
         let PerfFileRecord::EventRecord { attr_index, record } = record else {
             continue;
         };
+        let parsed = record
+            .parse()
+            .map_err(io_error("parsing a record in", input.perf_data))?;
+        if let Some(pid) = held {
+            match &parsed {
+                EventRecord::Comm(c) if c.is_execve && id(c.pid)? == pid => held = None,
+                _ if record_pid(&record, &parsed) == Some(pid) => continue,
+                _ => {}
+            }
+        }
         // perf stamps the records it synthesizes at startup with 0.
         let time = record.timestamp().filter(|&t| t != 0);
         if let Some(time) = time {
             state.start_ns = Some(state.start_ns.map_or(time, |t| t.min(time)));
             state.end_ns = Some(state.end_ns.map_or(time, |t| t.max(time)));
         }
-        let parsed = record
-            .parse()
-            .map_err(io_error("parsing a record in", input.perf_data))?;
         match parsed {
             EventRecord::Sample(sample) if attr_index == cpu_clock => {
                 state.sample(&record, &sample)?
             }
-            EventRecord::Sample(sample) => state.switch_sample(&record, &sample)?,
+            EventRecord::Sample(sample) if Some(attr_index) == switches => {
+                state.switch_sample(&record, &sample)?
+            }
+            EventRecord::Sample(_) => {
+                return Err(unexpected(
+                    "a sample of an event uhr did not ask for".into(),
+                ));
+            }
             EventRecord::ContextSwitch(switch) if switches.is_some() => {
                 let common = record
                     .common_data()
@@ -283,7 +312,7 @@ pub(super) fn convert(input: Input) -> Result<Recording> {
             format_version: FORMAT_VERSION,
             target: Target {
                 command: input.command.to_vec(),
-                launched: true,
+                launched: input.launched_pid.is_some(),
                 exit: input.exit,
             },
             clock: Clock::Monotonic,
@@ -301,6 +330,26 @@ pub(super) fn convert(input: Input) -> Result<Recording> {
         off_cpu: state.off_cpu,
         kernel_symbols,
     })
+}
+
+pub(crate) fn is_dummy(attr: &PerfEventAttr) -> bool {
+    matches!(
+        attr.type_,
+        PerfEventType::Software(SoftwareCounterType::Dummy)
+    )
+}
+
+/// The process a record is about, if it names one.
+fn record_pid(record: &RawEventRecord, parsed: &EventRecord) -> Option<u32> {
+    let pid = match parsed {
+        EventRecord::Comm(c) => c.pid,
+        EventRecord::Mmap(m) => m.pid,
+        EventRecord::Mmap2(m) => m.pid,
+        EventRecord::Fork(f) => f.pid,
+        EventRecord::Exit(e) => e.pid,
+        _ => record.common_data().ok()?.pid?,
+    };
+    u32::try_from(pid).ok()
 }
 
 fn check_clock(attr: &PerfEventAttr) -> Result<()> {

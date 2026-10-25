@@ -4,6 +4,7 @@ pub mod doctor;
 pub mod filter;
 pub mod functions;
 pub mod kallsyms;
+pub mod launch;
 pub mod metric;
 pub mod overview;
 pub mod perf;

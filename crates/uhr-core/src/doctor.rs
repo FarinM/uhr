@@ -1,13 +1,14 @@
 use std::fs::File;
-use std::io::BufReader;
+use std::io::{BufReader, Read};
 use std::path::Path;
-use std::process::Command;
+use std::process::{ChildStderr, Command, ExitStatus, Stdio};
 
 use linux_perf_data::{PerfFileReader, linux_perf_event_reader::AttrFlags};
 use serde::Serialize;
 
 use crate::kallsyms;
-use crate::perf::{RecordOptions, Unwind, perf_args};
+use crate::launch::Held;
+use crate::perf::{Perf, RecordOptions, Unwind, finished, is_dummy, perf_args};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Report {
@@ -221,6 +222,8 @@ fn hidden_fix(kptr_restrict: Option<i32>, perf_event_paranoid: Option<i32>) -> S
     }
 }
 
+/// Records `true` the way `uhr record` records a target: held, with perf
+/// attached and sampling before it runs.
 fn probe_recording(perf: &Path) -> Result<bool, String> {
     let dir = tempfile::tempdir().map_err(|e| format!("creating perf probe directory: {e}"))?;
     let data = dir.path().join("perf.data");
@@ -230,25 +233,50 @@ fn probe_recording(perf: &Path) -> Result<bool, String> {
         unwind: Unwind::FramePointers,
         off_cpu: true,
     };
+    let held = Held::spawn(&options.command).map_err(|e| format!("starting `true`: {e}"))?;
     let mut args = perf_args(&data, &options);
     // Permission errors from perf are suppressed by --quiet.
     args.retain(|arg| arg != "--quiet");
-    let output = Command::new(perf)
-        .args(args)
-        .output()
+    args.extend([
+        "--pid".into(),
+        held.pid().to_string().into(),
+        "--delay=-1".into(),
+    ]);
+    let mut probe = Perf::attach(perf, args, Stdio::piped())
         .map_err(|e| format!("cannot run perf recording probe: {e}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "perf recording probe failed ({}): {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
+    let mut stderr = probe.child.stderr.take();
+    let failed = |status: ExitStatus, stderr: &mut Option<ChildStderr>| {
+        let mut text = String::new();
+        if let Some(stderr) = stderr {
+            let _ = stderr.read_to_string(&mut text);
+        }
+        format!("perf recording probe failed ({status}): {}", text.trim())
+    };
+    match probe.enable() {
+        Ok(None) => {}
+        Ok(Some(status)) => return Err(failed(status, &mut stderr)),
+        Err(e) => return Err(format!("waiting for the perf recording probe: {e}")),
+    }
+    let mut target = held.release().map_err(|e| format!("running `true`: {e}"))?;
+    let _ = target.child.wait();
+    probe.stop();
+    let status = probe
+        .wait()
+        .map_err(|e| format!("waiting for the perf recording probe: {e}"))?;
+    if !finished(status) {
+        return Err(failed(status, &mut stderr));
     }
     let file = File::open(&data).map_err(|e| format!("opening perf probe: {e}"))?;
     let reader = PerfFileReader::parse_file(BufReader::new(file))
         .map_err(|e| format!("reading perf probe: {e}"))?;
-    let events = reader.perf_file.event_attributes();
-    // The CPU clock and the context switches.
+    // The CPU clock and the context switches. The dummy event that tracks
+    // the target while sampling is off never samples the kernel.
+    let events: Vec<_> = reader
+        .perf_file
+        .event_attributes()
+        .iter()
+        .filter(|e| !is_dummy(e.attributes()))
+        .collect();
     if events.len() != 2 {
         return Err("perf probe did not record the requested events".into());
     }

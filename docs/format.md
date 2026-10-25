@@ -40,7 +40,7 @@ replaces them.
 | `format_version` | `0` |
 | `target.command` | Command and arguments |
 | `target.launched` | True if the recording started the target, false if it attached |
-| `target.exit` | `{"code": n}`, `{"signal": n}`, `{"unknown": reason}` when the observed status can't be trusted, or null if it was still running. The perf collector reports signal exits as unknown: perf can re-raise its own signal rather than the target's |
+| `target.exit` | `{"code": n}`, `{"signal": n}`, `{"unknown": reason}` when uhr could not see the status, or null if it was still running |
 | `clock` | `CLOCK_MONOTONIC` |
 | `start_ns`, `end_ns` | When the capture started and stopped: the first and last event, or the interrupt that stopped the recording if that came later. Null if nothing was recorded |
 | `streams` | One per collector that ran |

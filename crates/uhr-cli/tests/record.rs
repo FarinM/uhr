@@ -52,8 +52,8 @@ fn records_the_frequency_perf_actually_used() {
 }
 
 #[test]
-fn an_interrupt_makes_the_exit_status_unknown() {
-    let dir = common::scratch("interrupt_makes_exit_unknown");
+fn an_interrupt_records_how_the_target_ended() {
+    let dir = common::scratch("interrupt_records_exit");
     let program = dir.join("cpu_bound");
     common::compile("cpu_bound", &program, "-O2");
     let recording = dir.join("rec");
@@ -80,8 +80,8 @@ fn an_interrupt_makes_the_exit_status_unknown() {
     assert!(uhr.wait().unwrap().success());
 
     let manifest = manifest(&recording);
-    assert!(
-        manifest["target"]["exit"]["unknown"].is_string(),
+    assert_eq!(
+        manifest["target"]["exit"]["signal"], 2,
         "{}",
         manifest["target"]
     );
@@ -119,22 +119,34 @@ impl Drop for RecordingProcess {
     }
 }
 
-/// Whether perf's child, which is uhr's grandchild, has exec'd `name`.
-fn target_runs(uhr: u32, name: &str) -> bool {
-    let children = |pid: u32| -> Vec<u32> {
-        fs::read_to_string(format!("/proc/{pid}/task/{pid}/children"))
-            .unwrap_or_default()
-            .split_whitespace()
-            .map(|pid| pid.parse().unwrap())
-            .collect()
-    };
-    children(uhr).into_iter().flat_map(children).any(|pid| {
+/// uhr's child running `name`, once it has exec'd it. Any of uhr's threads
+/// can be its parent.
+fn child_running(uhr: u32, name: &str) -> Option<u32> {
+    let mut children = Vec::new();
+    for task in fs::read_dir(format!("/proc/{uhr}/task")).ok()?.flatten() {
+        let list = fs::read_to_string(task.path().join("children")).unwrap_or_default();
+        children.extend(
+            list.split_whitespace()
+                .map(|pid| pid.parse::<u32>().unwrap()),
+        );
+    }
+    children.into_iter().find(|pid| {
         fs::read_to_string(format!("/proc/{pid}/comm")).is_ok_and(|comm| comm.trim() == name)
     })
 }
 
+fn interrupt_group(uhr: u32) {
+    assert!(
+        Command::new("kill")
+            .args(["-INT", "--", &format!("-{uhr}")])
+            .status()
+            .unwrap()
+            .success()
+    );
+}
+
 #[test]
-fn an_interrupt_ends_the_capture_even_while_the_target_sleeps() {
+fn an_interrupt_ends_the_capture_and_a_second_kills_the_target() {
     let dir = common::scratch("interrupt_ends_the_capture");
     let recording = dir.join("rec");
     // Ignored signals stay ignored across exec, so sleep outlives the
@@ -154,7 +166,7 @@ fn an_interrupt_ends_the_capture_even_while_the_target_sleeps() {
     );
     let deadline = Instant::now() + Duration::from_secs(10);
     // The capture starts when the target execs.
-    while !target_runs(uhr.0.id(), "sleep") {
+    while child_running(uhr.0.id(), "sleep").is_none() {
         assert!(
             uhr.0.try_wait().unwrap().is_none(),
             "recording exited early"
@@ -163,29 +175,28 @@ fn an_interrupt_ends_the_capture_even_while_the_target_sleeps() {
         thread::sleep(Duration::from_millis(10));
     }
     thread::sleep(Duration::from_millis(500));
-    let group = format!("-{}", uhr.0.id());
-    assert!(
-        Command::new("kill")
-            .args(["-INT", "--", &group])
-            .status()
-            .unwrap()
-            .success()
-    );
+    interrupt_group(uhr.0.id());
+    // uhr waits for the target, which ignores the interrupt.
+    thread::sleep(Duration::from_millis(500));
+    assert!(uhr.0.try_wait().unwrap().is_none(), "uhr did not wait");
+    assert!(!recording.exists());
+    interrupt_group(uhr.0.id());
     assert!(uhr.wait().success());
 
     let manifest = manifest(&recording);
     let start = manifest["start_ns"].as_u64().unwrap();
     let end = manifest["end_ns"].as_u64().unwrap();
     assert!(
-        end - start >= 500_000_000,
-        "the capture lasted only {} ns",
+        (500_000_000..900_000_000).contains(&(end - start)),
+        "the capture lasted {} ns, not until the first interrupt",
         end - start
     );
+    assert_eq!(manifest["target"]["exit"]["signal"], 9);
 }
 
 #[test]
-fn a_signal_sent_only_to_perf_is_not_the_targets_exit_status() {
-    let dir = common::scratch("perf_signal_makes_exit_unknown");
+fn when_perf_stops_first_the_target_is_asked_to_stop() {
+    let dir = common::scratch("perf_stops_first");
     let source = dir.join("target.c");
     let program = dir.join("target");
     let ready = dir.join("ready");
@@ -251,21 +262,18 @@ int main(int argc, char **argv) {
         assert!(Instant::now() < deadline, "target did not start");
         thread::sleep(Duration::from_millis(10));
     }
-    let pid = uhr.0.id();
-    let children = fs::read_to_string(format!("/proc/{pid}/task/{pid}/children")).unwrap();
-    let children: Vec<_> = children.split_whitespace().collect();
-    assert_eq!(children.len(), 1, "expected only the perf subprocess");
+    let perf = child_running(uhr.0.id(), "perf").expect("perf runs");
     assert!(
         Command::new("kill")
-            .args(["-INT", "--", children[0]])
+            .args(["-INT", &perf.to_string()])
             .status()
             .unwrap()
             .success()
     );
     assert!(uhr.wait().success());
+    // The target got SIGTERM, and exited 0 from its handler.
     assert_eq!(fs::read_to_string(exited).unwrap(), "exit 0");
-    let exit = &manifest(&recording)["target"]["exit"];
-    assert!(exit["unknown"].is_string(), "{exit}");
+    assert_eq!(manifest(&recording)["target"]["exit"]["code"], 0);
 }
 
 #[test]

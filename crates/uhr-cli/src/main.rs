@@ -1,3 +1,5 @@
+mod signals;
+
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -19,6 +21,8 @@ use uhr_core::query::{
 };
 use uhr_core::recording::{Exit, Mode};
 use uhr_core::symbols;
+
+use signals::{Handlers, INTERRUPTS};
 
 #[derive(Parser)]
 #[command(
@@ -394,7 +398,10 @@ fn run_record(
         unwind,
         off_cpu,
     };
-    perf::record(&options, &output)?;
+    let handlers = Handlers::install().context("installing the signal handlers")?;
+    let recorded = perf::record(&options, &INTERRUPTS, &output);
+    drop(handlers);
+    recorded?;
     if no_symbolize {
         return Ok(ExitCode::SUCCESS);
     }
