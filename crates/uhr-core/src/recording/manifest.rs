@@ -31,6 +31,10 @@ pub enum KernelSymbols {
 pub struct Target {
     pub command: Vec<String>,
     pub launched: bool,
+    /// The runtimes whose perf maps were on in the target's environment, so
+    /// that they named the code they compiled. `None` for a process uhr
+    /// attached to, whose environment it did not see.
+    pub runtime_support: Option<Vec<String>>,
     /// `None` if the target was still running when the recording stopped.
     pub exit: Option<Exit>,
 }

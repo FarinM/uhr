@@ -68,6 +68,11 @@ enum Command {
         /// switch often, but then nothing says why threads were off CPU
         #[arg(long)]
         no_off_cpu: bool,
+        /// Don't set the variables that make runtimes, such as Python 3.12
+        /// and later and Node, name the code they compile. That costs them
+        /// a little time, and without it their functions have no names
+        #[arg(long, conflicts_with = "pid")]
+        no_runtime_support: bool,
         /// Record this running process, and the threads and processes it
         /// starts, rather than a command. It is not signalled
         #[arg(long, conflicts_with = "command")]
@@ -277,10 +282,11 @@ fn main() -> ExitCode {
             unwind,
             stack_size,
             no_off_cpu,
+            no_runtime_support,
             pid,
             duration,
             command,
-        } => {
+        } => unwind_of(unwind, stack_size).and_then(|unwind| {
             let target = match pid {
                 Some(pid) => Target::Attach {
                     pid,
@@ -288,16 +294,15 @@ fn main() -> ExitCode {
                 },
                 None => Target::Launch(command),
             };
-            run_record(
-                output,
-                frequency,
-                no_symbolize,
-                unwind,
-                stack_size,
-                !no_off_cpu,
+            let options = RecordOptions {
                 target,
-            )
-        }
+                frequency_hz: frequency,
+                unwind,
+                off_cpu: !no_off_cpu,
+                runtime_support: !no_runtime_support,
+            };
+            run_record(&output, &options, no_symbolize)
+        }),
         Command::Symbolize { recording } => run_symbolize(&recording),
         Command::Overview {
             recording,
@@ -397,36 +402,25 @@ fn write_report(out: &mut impl Write, report: &Report) -> io::Result<()> {
     Ok(())
 }
 
-fn run_record(
-    output: PathBuf,
-    frequency_hz: u64,
-    no_symbolize: bool,
-    unwind: UnwindArg,
-    stack_size: Option<u32>,
-    off_cpu: bool,
-    target: Target,
-) -> Result<ExitCode> {
-    let unwind = match (unwind, stack_size) {
+fn unwind_of(unwind: UnwindArg, stack_size: Option<u32>) -> Result<Unwind> {
+    Ok(match (unwind, stack_size) {
         (UnwindArg::Fp, None) => Unwind::FramePointers,
         (UnwindArg::Fp, Some(_)) => bail!("--stack-size only applies to --unwind dwarf"),
         (UnwindArg::Dwarf, stack_size) => Unwind::Dwarf {
             stack_bytes: stack_size.unwrap_or(STACK_COPY_BYTES),
         },
-    };
-    let options = RecordOptions {
-        target,
-        frequency_hz,
-        unwind,
-        off_cpu,
-    };
+    })
+}
+
+fn run_record(output: &Path, options: &RecordOptions, no_symbolize: bool) -> Result<ExitCode> {
     let handlers = Handlers::install().context("installing the signal handlers")?;
-    let recorded = perf::record(&options, &INTERRUPTS, &output);
+    let recorded = perf::record(options, &INTERRUPTS, output);
     drop(handlers);
     recorded?;
     if no_symbolize {
         return Ok(ExitCode::SUCCESS);
     }
-    run_symbolize(&output)
+    run_symbolize(output)
 }
 
 fn run_symbolize(recording: &Path) -> Result<ExitCode> {

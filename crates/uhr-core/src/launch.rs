@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::fs::File;
 use std::io::{self, Read};
 use std::os::fd::{AsRawFd, OwnedFd};
@@ -59,7 +60,11 @@ pub(crate) struct Launched {
 }
 
 impl Held {
-    pub(crate) fn spawn(command: &[String]) -> Result<Self, Error> {
+    /// Starts `command` with `environment` added to uhr's own.
+    pub(crate) fn spawn(
+        command: &[String],
+        environment: &[(&str, OsString)],
+    ) -> Result<Self, Error> {
         let program = command[0].clone();
         let error = |source| Error::Spawn {
             program: program.clone(),
@@ -69,7 +74,7 @@ impl Held {
         let (go_read, go_write) = pipe_with(PipeFlags::CLOEXEC).map_err(|e| error(e.into()))?;
         let go_write_fd = go_write.as_raw_fd();
         let mut target = Command::new(&program);
-        target.args(&command[1..]);
+        target.args(&command[1..]).envs(environment.iter().cloned());
         let hold = move || {
             // The child's copy of the release end would keep it waiting
             // even after uhr is gone.

@@ -16,6 +16,7 @@ fn example() -> Recording {
             target: Target {
                 command: vec!["./app".into(), "--fast".into()],
                 launched: true,
+                runtime_support: Some(Vec::new()),
                 exit: Some(Exit::Unknown("perf was interrupted".into())),
             },
             clock: Clock::Monotonic,

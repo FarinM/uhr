@@ -132,6 +132,15 @@ Debian and Ubuntu its package must match the running kernel.
   uhr lets the target run, so the recording starts at its first instruction.
   Until then perf follows the target with a dummy event, and the held
   process still runs uhr's code, which the recording leaves out.
+- When it launches a target, uhr sets the variables that make runtimes name
+  the code they compile in perf maps, unless `uhr record
+  --no-runtime-support`: `PYTHONPERFSUPPORT=1` for Python 3.12 and later,
+  and `--perf-basic-prof --interpreted-frames-native-stack` in
+  `NODE_OPTIONS` for Node. Every process the target starts inherits them,
+  and programs that don't read them ignore them. A variable the user set is
+  left alone, except that each of Node's flags is added to the options
+  already there, unless they hold it or turn it off. It makes those
+  runtimes a little slower.
 - With `--pid`, uhr attaches perf the same way to a running process, and
   follows the threads and processes it starts. It never signals the
   process: the capture ends at an interrupt, at the end of `--duration`, or

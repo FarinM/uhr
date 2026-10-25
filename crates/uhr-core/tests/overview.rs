@@ -84,6 +84,7 @@ fn recording() -> Recording {
             target: Target {
                 command: vec!["app".into(), "--fast".into()],
                 launched: true,
+                runtime_support: Some(Vec::new()),
                 exit: Some(Exit::Code(0)),
             },
             clock: Clock::Monotonic,

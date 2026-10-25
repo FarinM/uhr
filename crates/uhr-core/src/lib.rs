@@ -10,6 +10,7 @@ pub mod overview;
 pub mod perf;
 pub mod query;
 pub mod recording;
+mod runtimes;
 pub mod symbols;
 mod syscalls;
 mod threads;

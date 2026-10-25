@@ -65,6 +65,7 @@ mod tests {
                 target: Target {
                     command: vec!["app".into()],
                     launched: true,
+                    runtime_support: Some(Vec::new()),
                     exit: None,
                 },
                 clock: Clock::Monotonic,

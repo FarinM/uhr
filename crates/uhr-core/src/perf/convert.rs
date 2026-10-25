@@ -29,6 +29,7 @@ pub(super) struct Input<'a> {
     /// The process uhr started and held until perf sampled it. Until its
     /// first exec it still runs uhr's code, so that is left out.
     pub launched_pid: Option<u32>,
+    pub runtime_support: Option<Vec<String>>,
     pub exit: Option<Exit>,
     /// When uhr stopped the capture before the target exited, at an
     /// interrupt or the end of a duration, on CLOCK_MONOTONIC.
@@ -322,6 +323,7 @@ pub(super) fn convert(input: Input) -> Result<Recording> {
             target: Target {
                 command: input.command.to_vec(),
                 launched: input.launched_pid.is_some(),
+                runtime_support: input.runtime_support,
                 exit: input.exit,
             },
             clock: Clock::Monotonic,

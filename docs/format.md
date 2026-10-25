@@ -40,6 +40,7 @@ replaces them.
 | `format_version` | `0` |
 | `target.command` | Command and arguments. Empty for an attached process without a command line, such as a kernel thread |
 | `target.launched` | True if the recording started the target, false if it attached |
+| `target.runtime_support` | The runtimes whose perf maps were on in the target's environment, so that they named the code they compiled: `python`, `node`. Null for a process uhr attached to, whose environment it did not see |
 | `target.exit` | `{"code": n}`, `{"signal": n}`, `{"unknown": reason}` when uhr could not see the status, as for a process it attached to, or null if it was still running |
 | `clock` | `CLOCK_MONOTONIC` |
 | `start_ns`, `end_ns` | When the capture started and stopped: the first and last event, or when perf began sampling a process uhr attached to if that came earlier, and when uhr stopped the recording if that came later, at an interrupt or the end of `--duration`. Null if nothing was recorded |

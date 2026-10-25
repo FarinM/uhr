@@ -25,6 +25,7 @@ use crate::doctor;
 use crate::kallsyms::Kallsyms;
 use crate::launch::{self, Held, Interrupts, Process, monotonic_ns};
 use crate::recording::{self, Collector, Exit, Recording};
+use crate::runtimes;
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -111,6 +112,9 @@ pub struct RecordOptions {
     /// Record every context switch, with the stack of each thread going
     /// off CPU.
     pub off_cpu: bool,
+    /// Set the variables that make runtimes, such as Python 3.12 and later
+    /// and Node, name the code they compile in perf maps.
+    pub runtime_support: bool,
 }
 
 /// What to record.
@@ -215,6 +219,7 @@ pub fn record(options: &RecordOptions, interrupts: &Interrupts, out: &Path) -> R
         perf_data: &perf_data,
         command: &command,
         launched_pid: ended.launched_pid,
+        runtime_support: ended.runtime_support,
         exit: ended.exit,
         stopped_ns: ended.stopped_ns,
         attached_ns: ended.attached_ns,
@@ -367,6 +372,8 @@ fn remove_staging(staging: &Path) {
 
 /// How a capture ended.
 struct Ended {
+    /// The runtimes whose perf maps were on in a target uhr launched.
+    runtime_support: Option<Vec<String>>,
     /// The process uhr started, when it launched the target.
     launched_pid: Option<u32>,
     exit: Option<Exit>,
@@ -400,7 +407,9 @@ fn run(
         // Held until perf samples, so perf sees it from its first
         // instruction.
         Ready::Launch(command) => {
-            let held = Held::spawn(command)?;
+            let (environment, runtimes) =
+                runtimes::environment(|v| env::var_os(v), options.runtime_support);
+            let held = Held::spawn(command, &environment)?;
             let pid = held.pid();
             let mut sampling = sample(perf_data, options, pid)?;
             sampling.stop_if_interrupted(interrupts)?;
@@ -410,6 +419,7 @@ fn run(
                 supervise(program, &mut target.child, &mut sampling.perf, interrupts)?;
             sampling.finish_relay();
             Ok(Ended {
+                runtime_support: Some(runtimes),
                 launched_pid: Some(pid),
                 exit: exit(target),
                 perf,
@@ -447,6 +457,7 @@ fn run(
                 )
             });
             Ok(Ended {
+                runtime_support: None,
                 launched_pid: None,
                 exit,
                 perf,

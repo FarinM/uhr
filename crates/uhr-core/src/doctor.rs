@@ -232,8 +232,9 @@ fn probe_recording(perf: &Path) -> Result<bool, String> {
         frequency_hz: 1,
         unwind: Unwind::FramePointers,
         off_cpu: true,
+        runtime_support: false,
     };
-    let held = Held::spawn(&["true".into()]).map_err(|e| format!("starting `true`: {e}"))?;
+    let held = Held::spawn(&["true".into()], &[]).map_err(|e| format!("starting `true`: {e}"))?;
     let mut args = perf_args(&data, &options);
     // Permission errors from perf are suppressed by --quiet.
     args.retain(|arg| arg != "--quiet");
