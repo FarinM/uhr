@@ -7,9 +7,10 @@ use serde::Serialize;
 use crate::coverage::{Coverage, SymbolCoverage};
 use crate::filter::Filter;
 use crate::functions::{self, Function, Functions, SourceLine};
-use crate::metric::{self, Metric, stack_times};
+use crate::metric::{self, Metric, StackTimes, stack_times};
 use crate::recording::{self, Origin, Recording};
 use crate::symbols::Symbols;
+use crate::syscalls::{self, InSyscall};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -19,6 +20,9 @@ pub enum GroupBy {
     Line,
     /// Binary or library, or the kernel or one of its modules.
     Module,
+    /// The syscall the thread was in, from the kernel functions on its
+    /// stack.
+    Syscall,
 }
 
 #[derive(Debug, Clone)]
@@ -54,6 +58,8 @@ pub enum Rows {
     Functions(Vec<FunctionRow>),
     /// Sorted by self time, then total time.
     Modules(Vec<ModuleRow>),
+    /// Sorted by time.
+    Syscalls(Vec<SyscallRow>),
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -88,6 +94,22 @@ pub struct ModuleRow {
     /// Time with the module anywhere on the stack.
     pub total_ns: u64,
     pub total_share: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SyscallRow {
+    /// Whether the time was in a syscall. `None` when the stack does not
+    /// show it: its kernel functions have no names, it may have been cut
+    /// short, or it has none and the CPU was not in user mode, as when
+    /// running a virtual machine's guest code. Off-CPU time without a stack
+    /// is `None` too.
+    pub in_syscall: Option<bool>,
+    /// The name in the syscall's kernel function, as `read` in
+    /// `__x64_sys_read`. `None` outside syscalls, and in a syscall whose
+    /// function is not on the stack, as on its way back to user space.
+    pub syscall: Option<String>,
+    pub time_ns: u64,
+    pub share: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -149,6 +171,7 @@ pub fn run(
             &share,
         )),
         GroupBy::Module => Rows::Modules(module_rows(recording, &functions, &times.ns, &share)),
+        GroupBy::Syscall => Rows::Syscalls(syscall_rows(recording, &functions, &times, &share)),
     };
     let rows_omitted = rows.truncate(query.top);
 
@@ -193,6 +216,7 @@ impl Rows {
         match self {
             Rows::Functions(rows) => truncate(rows, top),
             Rows::Modules(rows) => truncate(rows, top),
+            Rows::Syscalls(rows) => truncate(rows, top),
         }
     }
 }
@@ -300,6 +324,55 @@ fn module_rows(
             .then_with(|| a.module.cmp(&b.module))
             .then_with(|| a.build_id.cmp(&b.build_id))
             .then_with(|| a.origin.cmp(&b.origin))
+    });
+    rows
+}
+
+fn syscall_rows(
+    recording: &Recording,
+    functions: &Functions,
+    times: &StackTimes,
+    share: &impl Fn(u64) -> f64,
+) -> Vec<SyscallRow> {
+    let in_syscall = syscalls::of_stacks(recording, functions);
+    let mut ns: HashMap<InSyscall, u64> = HashMap::new();
+    let mut add = |syscall, weight| {
+        if weight > 0 {
+            *ns.entry(syscall).or_default() += weight;
+        }
+    };
+    for (stack, &weight) in times.ns.iter().enumerate() {
+        match in_syscall[stack] {
+            Some(syscall) => add(syscall, weight),
+            None => {
+                add(InSyscall::Outside, times.user_ns[stack]);
+                add(InSyscall::Unknown, weight - times.user_ns[stack]);
+            }
+        }
+    }
+    add(InSyscall::Unknown, times.no_stack_ns);
+    let mut rows: Vec<SyscallRow> = ns
+        .into_iter()
+        .map(|(syscall, time_ns)| {
+            let (in_syscall, syscall) = match syscall {
+                InSyscall::Named(name) => (Some(true), Some(name.to_owned())),
+                InSyscall::Unnamed => (Some(true), None),
+                InSyscall::Outside => (Some(false), None),
+                InSyscall::Unknown => (None, None),
+            };
+            SyscallRow {
+                in_syscall,
+                syscall,
+                time_ns,
+                share: share(time_ns),
+            }
+        })
+        .collect();
+    rows.sort_by(|a, b| {
+        b.time_ns
+            .cmp(&a.time_ns)
+            .then_with(|| a.syscall.cmp(&b.syscall))
+            .then_with(|| a.in_syscall.cmp(&b.in_syscall))
     });
     rows
 }

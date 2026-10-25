@@ -14,7 +14,9 @@ use uhr_core::functions::Function;
 use uhr_core::metric::Metric;
 use uhr_core::overview::{self, CPUTime, Overview};
 use uhr_core::perf::{self, RecordOptions, Unwind};
-use uhr_core::query::{self, FunctionRow, GroupBy, ModuleRow, Query, QueryResult, Rows};
+use uhr_core::query::{
+    self, FunctionRow, GroupBy, ModuleRow, Query, QueryResult, Rows, SyscallRow,
+};
 use uhr_core::recording::{Exit, Mode};
 use uhr_core::symbols;
 
@@ -143,6 +145,8 @@ enum GroupByArg {
     /// Binary or library, or the kernel or one of its modules: self time
     /// runs its code, total time has it anywhere on the stack
     Module,
+    /// The syscall a thread was in, from the kernel functions on its stack
+    Syscall,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -672,6 +676,7 @@ fn run_query(
             GroupByArg::Function => GroupBy::Function,
             GroupByArg::Line => GroupBy::Line,
             GroupByArg::Module => GroupBy::Module,
+            GroupByArg::Syscall => GroupBy::Syscall,
         },
         metric,
         top,
@@ -692,6 +697,7 @@ fn write_query(out: &mut impl Write, result: &QueryResult) -> io::Result<()> {
         GroupBy::Function => "function",
         GroupBy::Line => "line",
         GroupBy::Module => "module",
+        GroupBy::Syscall => "syscall",
     };
     writeln!(
         out,
@@ -709,6 +715,7 @@ fn write_query(out: &mut impl Write, result: &QueryResult) -> io::Result<()> {
     match &result.rows {
         Rows::Functions(rows) => write_function_rows(out, result.group_by == GroupBy::Line, rows)?,
         Rows::Modules(rows) => write_module_rows(out, rows)?,
+        Rows::Syscalls(rows) => write_syscall_rows(out, rows)?,
     }
     if result.rows_omitted > 0 {
         writeln!(
@@ -770,6 +777,20 @@ fn write_module_rows(out: &mut impl Write, rows: &[ModuleRow]) -> io::Result<()>
             row.total_share * 100.0,
             row.module.as_deref().unwrap_or(row.origin.as_str()),
         )?;
+    }
+    Ok(())
+}
+
+fn write_syscall_rows(out: &mut impl Write, rows: &[SyscallRow]) -> io::Result<()> {
+    writeln!(out, "{:>7}  syscall", "time")?;
+    for row in rows {
+        let syscall = match (row.in_syscall, &row.syscall) {
+            (_, Some(name)) => name,
+            (Some(true), None) => "(in a syscall, unknown which)",
+            (Some(false), None) => "(not in a syscall)",
+            (None, None) => "(unknown)",
+        };
+        writeln!(out, "{:>6.1}%  {syscall}", row.share * 100.0)?;
     }
     Ok(())
 }

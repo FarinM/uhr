@@ -2,7 +2,7 @@ use serde::Serialize;
 
 use crate::filter::Filter;
 use crate::functions::{self, Functions};
-use crate::recording::{Recording, Signal};
+use crate::recording::{Mode, Recording, Signal};
 
 /// The time results weigh stacks by.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -46,6 +46,8 @@ impl Metric {
 pub(crate) struct StackTimes {
     /// By stack id.
     pub ns: Vec<u64>,
+    /// Of `ns`, the time of CPU samples taken in user mode.
+    pub user_ns: Vec<u64>,
     /// Off-CPU time whose stack was not recorded.
     pub no_stack_ns: u64,
     pub samples: u64,
@@ -67,6 +69,7 @@ pub(crate) fn stack_times(
 ) -> Result<StackTimes, functions::Error> {
     let mut times = StackTimes {
         ns: vec![0; recording.stacks.len()],
+        user_ns: vec![0; recording.stacks.len()],
         no_stack_ns: 0,
         samples: 0,
         off_cpu_intervals: 0,
@@ -74,6 +77,9 @@ pub(crate) fn stack_times(
     if metric != Metric::OffCPU {
         for sample in filter.samples(recording, functions)? {
             times.ns[sample.stack as usize] += sample.cpu_ns;
+            if sample.mode == Mode::User {
+                times.user_ns[sample.stack as usize] += sample.cpu_ns;
+            }
             times.samples += 1;
         }
     }

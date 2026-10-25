@@ -10,4 +10,5 @@ pub mod perf;
 pub mod query;
 pub mod recording;
 pub mod symbols;
+mod syscalls;
 mod threads;
