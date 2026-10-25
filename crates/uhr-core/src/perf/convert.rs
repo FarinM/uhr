@@ -432,7 +432,30 @@ impl State {
         };
         let (pid, tid) = (id(pid)?, id(tid)?);
         self.thread(pid, tid);
+        let stack = self.stack(pid, time_ns, record, sample)?;
+        self.samples.push(Sample {
+            time_ns,
+            pid,
+            tid,
+            cpu: sample.cpu,
+            mode: match sample.cpu_mode {
+                CpuMode::User => Mode::User,
+                CpuMode::Kernel => Mode::Kernel,
+                _ => Mode::Unknown,
+            },
+            stack,
+            cpu_ns: period,
+        });
+        Ok(())
+    }
 
+    fn stack(
+        &mut self,
+        pid: u32,
+        time_ns: u64,
+        record: &RawEventRecord,
+        sample: &SampleRecord,
+    ) -> Result<u32> {
         let mut stack = Vec::new();
         if let Some(callchain) = &sample.callchain {
             let mut context = ChainContext::Other;
@@ -484,22 +507,7 @@ impl State {
         if stack.len() >= self.max_stack_depth as usize {
             self.samples_at_stack_limit += 1;
         }
-
-        let stack = intern(&mut self.stacks, &mut self.stack_ids, stack);
-        self.samples.push(Sample {
-            time_ns,
-            pid,
-            tid,
-            cpu: sample.cpu,
-            mode: match sample.cpu_mode {
-                CpuMode::User => Mode::User,
-                CpuMode::Kernel => Mode::Kernel,
-                _ => Mode::Unknown,
-            },
-            stack,
-            cpu_ns: period,
-        });
-        Ok(())
+        Ok(intern(&mut self.stacks, &mut self.stack_ids, stack))
     }
 
     fn frame(
