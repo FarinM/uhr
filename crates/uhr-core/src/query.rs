@@ -69,7 +69,9 @@ pub struct FunctionRow {
     /// Grouped by line, the line in the function. `None` there for code
     /// without line info, and always `None` grouped by function.
     pub line: Option<SourceLine>,
-    /// Time with this row as the leaf.
+    /// Time with this row as the leaf. A runtime's own code, as its
+    /// interpreter or builtins, run for one of the program's functions it
+    /// compiled, counts for that function instead.
     pub self_ns: u64,
     pub self_share: f64,
     /// Time with this row anywhere on the stack, counted once per sample or
@@ -88,7 +90,7 @@ pub struct ModuleRow {
     pub module: Option<String>,
     pub build_id: Option<String>,
     pub origin: Origin,
-    /// Time running the module's code.
+    /// Time running the module's code, counted as for functions.
     pub self_ns: u64,
     pub self_share: f64,
     /// Time with the module anywhere on the stack.
@@ -243,14 +245,20 @@ fn function_rows(
     };
     let mut rows: Vec<FunctionRow> = if by_line {
         tally(recording, stack_ns, |stack, keys| {
-            keys.extend(functions.steps(stack))
+            keys.extend(functions.steps(stack));
+            let own = functions.own(stack);
+            *keys
+                .iter()
+                .find(|step| step.function == own)
+                .unwrap_or(&keys[0])
         })
         .into_iter()
         .map(|(step, times)| row(step.function, step.line, times))
         .collect()
     } else {
         tally(recording, stack_ns, |stack, keys| {
-            keys.extend(functions.expand(stack))
+            keys.extend(functions.expand(stack));
+            functions.own(stack)
         })
         .into_iter()
         .map(|(function, times)| row(function, None, times))
@@ -301,7 +309,8 @@ fn module_rows(
         })
         .collect();
     let mut rows: Vec<ModuleRow> = tally(recording, stack_ns, |stack, keys| {
-        keys.extend(functions.expand(stack).map(|f| module_of[f as usize]))
+        keys.extend(functions.expand(stack).map(|f| module_of[f as usize]));
+        module_of[functions.own(stack) as usize]
     })
     .into_iter()
     .map(|(module, (self_ns, total_ns))| {
@@ -377,12 +386,12 @@ fn syscall_rows(
 }
 
 /// Self and total time of each key. `keys` lists the keys of a stack, leaf
-/// first. A stack's time counts once for each key, however often the key
-/// repeats on it.
+/// first, and returns the one its self time counts for. A stack's time
+/// counts once for each key, however often the key repeats on it.
 fn tally<K: Copy + Eq + Hash>(
     recording: &Recording,
     stack_ns: &[u64],
-    mut keys: impl FnMut(&[u32], &mut Vec<K>),
+    mut keys: impl FnMut(&[u32], &mut Vec<K>) -> K,
 ) -> HashMap<K, (u64, u64)> {
     let mut times: HashMap<K, (u64, u64)> = HashMap::new();
     let mut stack_keys = Vec::new();
@@ -392,8 +401,8 @@ fn tally<K: Copy + Eq + Hash>(
             continue;
         }
         stack_keys.clear();
-        keys(stack, &mut stack_keys);
-        times.entry(stack_keys[0]).or_default().0 += weight;
+        let own = keys(stack, &mut stack_keys);
+        times.entry(own).or_default().0 += weight;
         seen.clear();
         for &key in &stack_keys {
             if seen.insert(key) {

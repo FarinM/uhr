@@ -12,6 +12,8 @@ struct Runtime {
     setting: Setting,
     /// Whether the variable's value turns the map on.
     on: fn(&str) -> bool,
+    /// Its own binaries, by file name.
+    binary: fn(&str) -> bool,
 }
 
 enum Setting {
@@ -29,6 +31,7 @@ const RUNTIMES: [Runtime; 2] = [
         variable: "PYTHONPERFSUPPORT",
         setting: Setting::Value("1"),
         on: python_on,
+        binary: python_binary,
     },
     Runtime {
         name: "node",
@@ -39,6 +42,7 @@ const RUNTIMES: [Runtime; 2] = [
             &["--interpreted-frames-native-stack"],
         ]),
         on: node_on,
+        binary: node_binary,
     },
 ];
 
@@ -99,6 +103,23 @@ fn options(value: &str) -> Vec<String> {
         .iter()
         .map(|option| option.replace('_', "-"))
         .collect()
+}
+
+/// `python3.12`, or a `libpython3.12.so` another program embeds it with.
+fn python_binary(file: &str) -> bool {
+    file.starts_with("python3") || file.starts_with("libpython3")
+}
+
+fn node_binary(file: &str) -> bool {
+    file == "node" || file == "nodejs" || file.starts_with("libnode.so")
+}
+
+/// The runtime a binary is, by its file name.
+pub(crate) fn binary_runtime(file: &str) -> Option<&'static str> {
+    RUNTIMES
+        .iter()
+        .find(|runtime| (runtime.binary)(file))
+        .map(|runtime| runtime.name)
 }
 
 /// What to add to a target's environment, read with `get`, so that runtimes

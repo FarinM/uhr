@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use serde::Serialize;
 
 use crate::recording::{KERNEL, Origin, Recording};
-use crate::runtimes::{JitCode, jit_code};
+use crate::runtimes::{JitCode, binary_runtime, jit_code};
 use crate::symbols::{FrameName, InlineFrame, Symbols};
 
 /// One function, or the unnamed code of one module.
@@ -139,8 +139,20 @@ pub(crate) struct Functions {
     /// is the function the frame's machine code belongs to.
     chains: Vec<Vec<Step>>,
     functions: Vec<Function>,
+    roles: Vec<Role>,
     lines: Vec<SourceLine>,
     symbolized: bool,
+}
+
+/// What a function is to the runtime that compiled the program's code, if
+/// one did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Role {
+    /// One of the program's functions, which this runtime compiled.
+    Program(&'static str),
+    /// This runtime's own code, as its interpreter or V8's builtins.
+    Runtime(&'static str),
+    Other,
 }
 
 /// A function in a frame's chain, and the line the frame is at in it.
@@ -155,6 +167,7 @@ impl Functions {
     pub(crate) fn new<'a>(recording: &'a Recording, symbols: Option<&'a Symbols>) -> Self {
         let mut ids: HashMap<Key<'a>, u32> = HashMap::new();
         let mut functions = Vec::new();
+        let mut roles = Vec::new();
         let mut line_ids: HashMap<(&'a str, u32), u32> = HashMap::new();
         let mut lines = Vec::new();
         let mut line = |call: &'a InlineFrame| {
@@ -183,7 +196,9 @@ impl Functions {
                     // copies of it, is one function.
                     let module = module.filter(|_| !matches!(code, Code::Jit(_)));
                     *ids.entry((frame.origin, module, code)).or_insert_with(|| {
-                        functions.push(make());
+                        let function = make();
+                        roles.push(role(&function, code));
+                        functions.push(function);
                         functions.len() as u32 - 1
                     })
                 };
@@ -305,6 +320,7 @@ impl Functions {
         Self {
             chains,
             functions,
+            roles,
             lines,
             symbolized: symbols.is_some(),
         }
@@ -326,6 +342,24 @@ impl Functions {
     /// The function running at the top of a stack.
     pub(crate) fn leaf(&self, stack: &[u32]) -> u32 {
         self.chains[stack[0] as usize][0].function
+    }
+
+    /// The function a stack's self time counts for: its leaf, unless that is
+    /// a runtime's own code, run for one of the program's functions the
+    /// runtime compiled. Then it is the innermost such function, so an
+    /// interpreter's time counts for the code it interprets. Native code and
+    /// the kernel keep theirs.
+    pub(crate) fn own(&self, stack: &[u32]) -> u32 {
+        let leaf = self.leaf(stack);
+        let mut runtime = None;
+        for function in self.expand(stack) {
+            match self.roles[function as usize] {
+                Role::Program(of) if runtime.is_none_or(|r| r == of) => return function,
+                Role::Runtime(of) if runtime.is_none_or(|r| r == of) => runtime = Some(of),
+                _ => return leaf,
+            }
+        }
+        leaf
     }
 
     pub(crate) fn line(&self, id: u32) -> &SourceLine {
@@ -367,6 +401,25 @@ impl Functions {
 
     pub(crate) fn get(&self, id: u32) -> &Function {
         &self.functions[id as usize]
+    }
+}
+
+fn role(function: &Function, code: Code) -> Role {
+    match code {
+        Code::Jit(Jit::Function { runtime, .. }) => Role::Program(runtime),
+        Code::Jit(Jit::Named(name)) => match jit_code(name) {
+            Some(JitCode {
+                runtime,
+                function: None,
+            }) => Role::Runtime(runtime),
+            _ => Role::Other,
+        },
+        _ if function.origin == Origin::Binary => function
+            .module
+            .as_deref()
+            .and_then(|path| binary_runtime(path.rsplit('/').next().unwrap_or(path)))
+            .map_or(Role::Other, Role::Runtime),
+        _ => Role::Other,
     }
 }
 

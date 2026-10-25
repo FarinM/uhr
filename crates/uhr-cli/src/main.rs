@@ -639,7 +639,7 @@ fn write_call_paths(out: &mut impl Write, result: &CallPaths) -> io::Result<()> 
     )?;
     writeln!(
         out,
-        "{}. On the stack for {:.1}% of it, the leaf for {:.1}%",
+        "{}. On the stack for {:.1}% of it, its own for {:.1}%",
         describe_time(
             result.metric,
             result.samples,
@@ -784,8 +784,8 @@ fn write_query(out: &mut impl Write, result: &QueryResult) -> io::Result<()> {
     let coverage = &result.coverage;
     writeln!(out, "\ncoverage")?;
     match coverage.named_share {
-        Some(share) => writeln!(out, "  self time in named functions: {:.1}%", share * 100.0),
-        None => writeln!(out, "  self time in named functions: unknown, no time"),
+        Some(share) => writeln!(out, "  time with a named leaf frame: {:.1}%", share * 100.0),
+        None => writeln!(out, "  time with a named leaf frame: unknown, no time"),
     }?;
     for (origin, share) in &coverage.unnamed_by_origin {
         writeln!(out, "  unnamed {}: {:.1}%", origin.as_str(), share * 100.0)?;

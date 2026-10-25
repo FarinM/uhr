@@ -53,7 +53,8 @@ pub struct CallPaths {
     /// Time with the function anywhere on the stack.
     pub total_ns: u64,
     pub total_share: f64,
-    /// Time with the function as the leaf.
+    /// Time with the function as the leaf, or running the runtime's own
+    /// code for it. See `query`.
     pub self_ns: u64,
     pub self_share: f64,
     /// Time where nothing called the function: it is where its thread
@@ -146,7 +147,7 @@ pub fn run(
             continue;
         };
         total_ns += weight;
-        if path[0] == target {
+        if functions.own(stack) == target {
             self_ns += weight;
         }
         if outermost + 1 == path.len() {

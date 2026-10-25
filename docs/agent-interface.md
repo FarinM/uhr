@@ -108,8 +108,13 @@ Python program recorded without a collector that sees Python frames gets "0%
 of the time in Python functions" and how to fix that, not the interpreter's
 own functions, such as `_PyEval_EvalFrameDefault`, presented as the answer.
 
-Whether the interpreter's own functions are hidden, folded into the
-program's, or shown is decided with the first runtime uhr supports.
+Python 3.12 and later and Node name their functions for uhr. Stacks still
+show the runtime's own functions, such as `_PyEval_EvalFrameDefault` or V8's
+builtins, but their time counts as the self time of the innermost of the
+program's functions they ran for, so the program's functions come first in a
+query by function or module. Native code the program calls, such as libc or
+an extension, and the kernel keep their own self time. Whether the
+runtime's own functions are hidden from stacks is not decided.
 
 ## Measurement rigor
 

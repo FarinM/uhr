@@ -1,3 +1,4 @@
+use uhr_core::call_paths;
 use uhr_core::filter::{self, Filter};
 use uhr_core::functions;
 use uhr_core::metric::{self, Metric};
@@ -1186,4 +1187,137 @@ fn groups_code_runtimes_compiled_by_their_names() {
             ),
         ]
     );
+}
+
+/// Adds a frame in `mapping`, named `name` at the function `start`.
+fn named_frame(
+    recording: &mut Recording,
+    symbols: &mut Symbols,
+    frame: Frame,
+    name: &str,
+    start: Option<u32>,
+) -> u32 {
+    recording.frames.push(frame);
+    symbols.function_addresses.push(start);
+    symbols.names.push(Some(FrameName::Symbol(name.into())));
+    symbols.inline.push(Vec::new());
+    recording.frames.len() as u32 - 1
+}
+
+/// Python's interpreter running `inner` under `outer` for 5, native code
+/// called from `inner` for 2, the interpreter outside Python code for 1,
+/// and one of V8's builtins called from Python code for 1.
+fn with_interpreter() -> (Recording, Symbols) {
+    let (mut recording, mut symbols) = (recording(), symbols());
+    let file = |path: &str, start: u64| Mapping {
+        pid: Some(1),
+        start,
+        end: start + 0x1000,
+        file_offset: 0,
+        path: path.into(),
+        build_id: None,
+        time_ns: None,
+    };
+    recording
+        .mappings
+        .push(file("/usr/bin/python3.12", 0x10_000));
+    recording
+        .mappings
+        .push(file("/usr/lib/libc.so.6", 0x20_000));
+    recording.mappings.push(Mapping {
+        path: "//anon".into(),
+        ..file("", 0x30_000)
+    });
+    let (python, libc, anon) = (1, 2, 3);
+    let binary = |address, mapping| Frame {
+        origin: Origin::Binary,
+        address,
+        mapping: Some(mapping),
+        file_offset: Some(address),
+        return_address: false,
+    };
+    let jit = |address| Frame {
+        origin: Origin::Jit,
+        address,
+        mapping: Some(anon),
+        file_offset: None,
+        return_address: false,
+    };
+    let mut add =
+        |frame, name: &str, start| named_frame(&mut recording, &mut symbols, frame, name, start);
+    let eval = add(
+        binary(0x10_100, python),
+        "_PyEval_EvalFrameDefault",
+        Some(0x100),
+    );
+    let memchr = add(binary(0x20_100, libc), "memchr", Some(0x100));
+    let inner = add(jit(0x30_010), "py::inner:/app/spin.py", None);
+    let outer = add(jit(0x30_110), "py::outer:/app/spin.py", None);
+    let builtin = add(jit(0x30_210), "Builtin:ArrayPrototypePush", None);
+    for (start, name) in [
+        (0x30_000, "py::inner:/app/spin.py"),
+        (0x30_100, "py::outer:/app/spin.py"),
+        (0x30_200, "Builtin:ArrayPrototypePush"),
+    ] {
+        recording.jit_symbols.push(JitSymbol {
+            pid: 1,
+            start,
+            end: start + 0x20,
+            name: name.into(),
+        });
+    }
+    for (stack, cpu_ns) in [
+        (vec![eval, inner, eval, outer, 3], 5),
+        (vec![memchr, eval, inner, 3], 2),
+        (vec![eval, 3], 1),
+        (vec![builtin, inner, 3], 1),
+    ] {
+        recording.stacks.push(stack);
+        recording
+            .samples
+            .push(sample(recording.stacks.len() as u32 - 1, cpu_ns));
+    }
+    recording.samples.retain(|s| s.stack >= 3);
+    (recording, symbols)
+}
+
+#[test]
+fn counts_a_runtimes_own_code_for_the_function_it_runs() {
+    let (recording, symbols) = with_interpreter();
+    let result = run(&recording, Some(&symbols), &query(20)).unwrap();
+    assert_eq!(times(&result, "inner"), (5, 8));
+    assert_eq!(times(&result, "outer"), (0, 5));
+    assert_eq!(times(&result, "_PyEval_EvalFrameDefault"), (1, 8));
+    assert_eq!(times(&result, "memchr"), (2, 2));
+    assert_eq!(times(&result, "Builtin:ArrayPrototypePush"), (1, 1));
+
+    let by_module = Query {
+        group_by: GroupBy::Module,
+        ..query(20)
+    };
+    let result = run(&recording, Some(&symbols), &by_module).unwrap();
+    let self_ns = |module: &str| {
+        module_rows(&result)
+            .iter()
+            .find(|r| r.module.as_deref() == Some(module))
+            .map(|r| r.self_ns)
+    };
+    assert_eq!(self_ns("[python]"), Some(5));
+    assert_eq!(self_ns("/usr/bin/python3.12"), Some(1));
+    assert_eq!(self_ns("/usr/lib/libc.so.6"), Some(2));
+    assert_eq!(self_ns("[node]"), Some(1));
+
+    let paths = call_paths::run(
+        &recording,
+        Some(&symbols),
+        &call_paths::Query {
+            function: "inner".into(),
+            depth: 2,
+            top: 5,
+            metric: Metric::OnCPU,
+            filter: Filter::default(),
+        },
+    )
+    .unwrap();
+    assert_eq!((paths.self_ns, paths.total_ns), (5, 8));
 }
