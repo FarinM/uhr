@@ -75,6 +75,9 @@ pub struct OffCPUTime {
     /// Waiting for something else: a lock, I/O, a timer or another thread.
     /// Includes the wait for a CPU after it was woken.
     pub blocked_ns: u64,
+    /// Off CPU already when an attached capture started, runnable or
+    /// blocked.
+    pub unknown_state_ns: u64,
 }
 
 /// One process lifetime: a reused pid gets a row per lifetime. Its name,
@@ -125,12 +128,14 @@ pub struct ThreadRow {
     pub on_cpu_share: Option<f64>,
     /// `None` if context switches were not recorded.
     pub off_cpu: Option<OffCPUTime>,
-    /// Shares of `alive_ns` spent off CPU, runnable and blocked. Together
-    /// with `on_cpu_share` they come close to 1, short of the time perf
-    /// itself took at each switch. `None` if context switches were not
-    /// recorded, or it was not alive in the window.
+    /// Shares of `alive_ns` spent off CPU, runnable, blocked, and in a state
+    /// unknown because it began before an attached capture. Together with
+    /// `on_cpu_share` they come close to 1, short of the time perf itself
+    /// took at each switch. `None` if context switches were not recorded, or
+    /// it was not alive in the window.
     pub runnable_share: Option<f64>,
     pub blocked_share: Option<f64>,
+    pub unknown_state_share: Option<f64>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -222,6 +227,7 @@ pub fn run(
             off_cpu: no_off_cpu.clone(),
             runnable_share: None,
             blocked_share: None,
+            unknown_state_share: None,
         }
     };
     let mut threads: HashMap<usize, ThreadRow> = HashMap::new();
@@ -275,6 +281,7 @@ pub fn run(
             if let Some(time) = &row.off_cpu {
                 row.runnable_share = ratio(time.runnable_ns, row.alive_ns);
                 row.blocked_share = ratio(time.blocked_ns, row.alive_ns);
+                row.unknown_state_share = ratio(time.unknown_state_ns, row.alive_ns);
             }
             row
         })
@@ -334,6 +341,7 @@ impl OffCPUTime {
         match interval.state {
             ThreadState::Runnable => self.runnable_ns += ns,
             ThreadState::Blocked => self.blocked_ns += ns,
+            ThreadState::Unknown => self.unknown_state_ns += ns,
         }
     }
 
@@ -341,6 +349,7 @@ impl OffCPUTime {
         self.intervals += other.intervals;
         self.runnable_ns += other.runnable_ns;
         self.blocked_ns += other.blocked_ns;
+        self.unknown_state_ns += other.unknown_state_ns;
     }
 }
 

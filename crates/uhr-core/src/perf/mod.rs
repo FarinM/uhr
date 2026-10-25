@@ -217,6 +217,7 @@ pub fn record(options: &RecordOptions, interrupts: &Interrupts, out: &Path) -> R
         launched_pid: ended.launched_pid,
         exit: ended.exit,
         stopped_ns: ended.stopped_ns,
+        attached_ns: ended.attached_ns,
         perf_version,
         requested_frequency_hz: options.frequency_hz,
         max_stack_depth,
@@ -373,6 +374,8 @@ struct Ended {
     /// When uhr stopped the capture before the target exited, on
     /// CLOCK_MONOTONIC.
     stopped_ns: Option<u64>,
+    /// When perf started sampling a process uhr attached to.
+    attached_ns: Option<u64>,
 }
 
 /// A target checked and ready to record.
@@ -411,6 +414,7 @@ fn run(
                 exit: exit(target),
                 perf,
                 stopped_ns: interrupts.first_ns(),
+                attached_ns: None,
             })
         }
         Ready::Attach {
@@ -419,6 +423,7 @@ fn run(
             process,
         } => {
             let mut sampling = sample(perf_data, options, *pid)?;
+            let attached_ns = monotonic_ns();
             sampling.stop_if_interrupted(interrupts)?;
             match duration {
                 Some(duration) => info!(
@@ -446,6 +451,7 @@ fn run(
                 exit,
                 perf,
                 stopped_ns,
+                attached_ns: Some(attached_ns),
             })
         }
     }

@@ -497,13 +497,19 @@ fn write_overview(out: &mut impl Write, result: &Overview) -> io::Result<()> {
         writeln!(out, "  unknown mode {}", seconds(cpu.unknown_mode_cpu_ns))?;
     }
     match &result.off_cpu {
-        Some(off_cpu) => writeln!(
-            out,
-            "off CPU {}, summed over threads: runnable {}, blocked {}",
-            seconds(off_cpu.runnable_ns + off_cpu.blocked_ns),
-            seconds(off_cpu.runnable_ns),
-            seconds(off_cpu.blocked_ns)
-        ),
+        Some(off_cpu) => {
+            let unknown = match off_cpu.unknown_state_ns {
+                0 => String::new(),
+                ns => format!(", unknown {}", seconds(ns)),
+            };
+            writeln!(
+                out,
+                "off CPU {}, summed over threads: runnable {}, blocked {}{unknown}",
+                seconds(off_cpu.runnable_ns + off_cpu.blocked_ns + off_cpu.unknown_state_ns),
+                seconds(off_cpu.runnable_ns),
+                seconds(off_cpu.blocked_ns)
+            )
+        }
         None => writeln!(out, "off CPU: not recorded"),
     }?;
 
@@ -536,21 +542,41 @@ fn write_overview(out: &mut impl Write, result: &Overview) -> io::Result<()> {
     }
 
     writeln!(out, "\nthreads")?;
+    // Off CPU since before an attached capture, runnable or blocked.
+    let unknown = result
+        .threads
+        .iter()
+        .any(|t| t.unknown_state_share.is_some_and(|s| s > 0.0));
+    let unknown_column = |cell: String| {
+        if unknown {
+            format!(" {cell:>7}")
+        } else {
+            String::new()
+        }
+    };
+    let percent = |share: Option<f64>| share.map_or("-".into(), |s| format!("{:.1}%", s * 100.0));
     writeln!(
         out,
-        "{:>9} {:>7} {:>7} {:>8} {:>7} {:>9} {:>9}  name",
-        "cpu", "kernel", "on cpu", "runnable", "blocked", "alive", "tid"
+        "{:>9} {:>7} {:>7} {:>8} {:>7}{} {:>9} {:>9}  name",
+        "cpu",
+        "kernel",
+        "on cpu",
+        "runnable",
+        "blocked",
+        unknown_column("unknown".into()),
+        "alive",
+        "tid"
     )?;
-    let percent = |share: Option<f64>| share.map_or("-".into(), |s| format!("{:.1}%", s * 100.0));
     for thread in &result.threads {
         writeln!(
             out,
-            "{:>9} {:>7} {:>7} {:>8} {:>7} {:>9} {:>9}  {}",
+            "{:>9} {:>7} {:>7} {:>8} {:>7}{} {:>9} {:>9}  {}",
             seconds(thread.cpu.cpu_ns),
             kernel_share(&thread.cpu),
             percent(thread.on_cpu_share),
             percent(thread.runnable_share),
             percent(thread.blocked_share),
+            unknown_column(percent(thread.unknown_state_share)),
             seconds(thread.alive_ns),
             thread.tid,
             thread.names.last().map_or("<unnamed>", String::as_str),

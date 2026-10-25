@@ -231,3 +231,40 @@ fn records_no_context_switches_when_told_not_to() {
         "{stderr}"
     );
 }
+
+#[test]
+fn attached_time_off_cpu_from_before_the_capture_is_of_unknown_state() {
+    let dir = scratch("attached_off_cpu");
+    let program = dir.join("waits");
+    compile("waits", &program, "-O2");
+    let mut waits = Command::new(&program)
+        .arg("3000")
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    // Long enough for its threads to start, and locker to wait for the
+    // lock holder keeps for as long as it computes.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let recording = dir.join("rec");
+    let recording = recording.to_str().unwrap();
+    let pid = waits.id().to_string();
+    uhr(&[
+        "record",
+        "-o",
+        recording,
+        "--no-symbolize",
+        "--pid",
+        &pid,
+        "--duration",
+        "500ms",
+    ]);
+    let _ = waits.kill();
+    let _ = waits.wait();
+
+    let overview = json(&["overview", recording]);
+    let locker = thread(&overview, "locker");
+    assert!(number(&locker["unknown_state_share"]) > 0.9, "{locker}");
+    assert_eq!(number(&locker["blocked_share"]), 0.0, "{locker}");
+    let holder = thread(&overview, "holder");
+    assert!(number(&holder["unknown_state_share"]) < 0.05, "{holder}");
+}

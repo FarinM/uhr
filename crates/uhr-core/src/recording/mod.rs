@@ -281,6 +281,9 @@ pub enum ThreadState {
     /// thread. Once woken, it can wait for a CPU too, and that time counts
     /// here as well.
     Blocked,
+    /// It was off CPU already when an attached capture started, so whether
+    /// it was preempted or blocked is not known.
+    Unknown,
 }
 
 impl ThreadState {
@@ -288,6 +291,7 @@ impl ThreadState {
         match self {
             ThreadState::Runnable => "runnable",
             ThreadState::Blocked => "blocked",
+            ThreadState::Unknown => "unknown",
         }
     }
 
@@ -295,6 +299,7 @@ impl ThreadState {
         Ok(match value {
             "runnable" => ThreadState::Runnable,
             "blocked" => ThreadState::Blocked,
+            "unknown" => ThreadState::Unknown,
             _ => return Err(format!("unknown thread state {value:?}")),
         })
     }

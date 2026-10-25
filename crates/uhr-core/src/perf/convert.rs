@@ -33,6 +33,9 @@ pub(super) struct Input<'a> {
     /// When uhr stopped the capture before the target exited, at an
     /// interrupt or the end of a duration, on CLOCK_MONOTONIC.
     pub stopped_ns: Option<u64>,
+    /// When perf started sampling a process uhr attached to, on
+    /// CLOCK_MONOTONIC.
+    pub attached_ns: Option<u64>,
     pub perf_version: String,
     pub requested_frequency_hz: u64,
     pub max_stack_depth: u32,
@@ -221,10 +224,15 @@ pub(super) fn convert(input: Input) -> Result<Recording> {
     }
 
     // Stopping perf ends the capture, which can be long after the last
-    // event, and before the target's exit.
-    if let (Some(end), Some(stopped)) = (state.end_ns.as_mut(), input.stopped_ns) {
-        *end = (*end).max(stopped);
+    // event, and before the target's exit. Attached, it starts when perf
+    // samples, which can be long before the first event.
+    if let Some(stopped) = input.stopped_ns {
+        state.end_ns = Some(state.end_ns.map_or(stopped, |end| end.max(stopped)));
     }
+    if let Some(attached) = input.attached_ns {
+        state.start_ns = Some(state.start_ns.map_or(attached, |start| start.min(attached)));
+    }
+    state.attached_ns = input.attached_ns;
     state.finish_off_cpu();
 
     let mut signals = vec![Signal::UserCPUSamples, Signal::UserStacks];
@@ -340,6 +348,11 @@ pub(crate) fn is_dummy(attr: &PerfEventAttr) -> bool {
     )
 }
 
+fn first(times: &mut HashMap<(u32, u32), u64>, thread: (u32, u32), time_ns: u64) {
+    let earliest = times.entry(thread).or_insert(time_ns);
+    *earliest = (*earliest).min(time_ns);
+}
+
 /// The process a record is about, if it names one.
 fn record_pid(record: &RawEventRecord, parsed: &EventRecord) -> Option<u32> {
     let pid = match parsed {
@@ -411,6 +424,11 @@ struct State {
     /// Threads off CPU, until their switch back in.
     switched_out: HashMap<(u32, u32), SwitchedOut>,
     off_cpu: Vec<OffCPUInterval>,
+    /// When perf started sampling a process uhr attached to.
+    attached_ns: Option<u64>,
+    /// When each thread was first seen on CPU, and first switched in.
+    first_on_cpu: HashMap<(u32, u32), u64>,
+    first_in: HashMap<(u32, u32), u64>,
     lost_events: u64,
     throttle_events: u64,
     stacks_at_stack_limit: u64,
@@ -447,6 +465,9 @@ impl State {
             switch_stacks: HashMap::new(),
             switched_out: HashMap::new(),
             off_cpu: Vec::new(),
+            attached_ns: None,
+            first_on_cpu: HashMap::new(),
+            first_in: HashMap::new(),
             lost_events: 0,
             throttle_events: 0,
             stacks_at_stack_limit: 0,
@@ -617,6 +638,7 @@ impl State {
 
     fn switch_out(&mut self, pid: u32, tid: u32, time_ns: u64, preempted: TaskWasPreempted) {
         self.thread(pid, tid);
+        first(&mut self.first_on_cpu, (pid, tid), time_ns);
         let state = match preempted {
             TaskWasPreempted::Yes => ThreadState::Runnable,
             TaskWasPreempted::No => ThreadState::Blocked,
@@ -635,6 +657,7 @@ impl State {
     }
 
     fn switch_in(&mut self, pid: u32, tid: u32, time_ns: u64) {
+        first(&mut self.first_in, (pid, tid), time_ns);
         // A stack left from before belongs to a switch out that was lost.
         self.switch_stacks.remove(&(pid, tid));
         if let Some(out) = self.switched_out.remove(&(pid, tid)) {
@@ -652,6 +675,7 @@ impl State {
     /// A thread seen on CPU after it went off lost its switch back in, so
     /// when it came back is unknown.
     fn seen_on_cpu(&mut self, pid: u32, tid: u32, time_ns: u64) {
+        first(&mut self.first_on_cpu, (pid, tid), time_ns);
         if self
             .switched_out
             .get(&(pid, tid))
@@ -668,8 +692,39 @@ impl State {
         self.switch_stacks.remove(&(pid, tid));
     }
 
-    /// Threads still off CPU stay off until the capture ends.
+    /// Threads still off CPU stay off until the capture ends. Attached,
+    /// a thread that ran before the capture and first switched in was off
+    /// CPU from its start until then, and one never seen all along, for
+    /// reasons unknown.
     fn finish_off_cpu(&mut self) {
+        if let (Some(_), Some(start_ns), Some(end_ns)) =
+            (self.attached_ns, self.start_ns, self.end_ns)
+        {
+            for thread in self.threads.values().chain(&self.ended) {
+                if thread.start_ns.is_some() {
+                    continue;
+                }
+                let key = (thread.pid, thread.tid);
+                let (back, on) = (self.first_in.get(&key), self.first_on_cpu.get(&key));
+                let until = match (back, on) {
+                    (Some(&back), None) => back,
+                    (Some(&back), Some(&on)) if back <= on => back,
+                    (None, None) => end_ns,
+                    _ => continue,
+                };
+                let until = until.min(thread.end_ns.unwrap_or(end_ns));
+                if start_ns < until {
+                    self.off_cpu.push(OffCPUInterval {
+                        start_ns,
+                        end_ns: until,
+                        pid: thread.pid,
+                        tid: thread.tid,
+                        state: ThreadState::Unknown,
+                        stack: None,
+                    });
+                }
+            }
+        }
         if let Some(end_ns) = self.end_ns {
             for ((pid, tid), out) in self.switched_out.drain() {
                 self.off_cpu.push(OffCPUInterval {
@@ -1039,6 +1094,43 @@ mod tests {
 
         let leaf = state.frame(7, ChainContext::User, 0x2000, false);
         assert_eq!(state.frames[leaf as usize].mapping, None);
+    }
+
+    #[test]
+    fn attached_threads_were_off_cpu_until_first_seen() {
+        let attached = || {
+            let mut state = State::new(127);
+            (state.start_ns, state.end_ns) = (Some(100), Some(1_000));
+            // Running before the capture: 1 first switches in, 2 is seen on
+            // CPU first, and 3 is never seen.
+            for tid in [1, 2, 3] {
+                state.comm(7, tid, "t".into(), false, None);
+            }
+            state.fork(7, 4, Some((7, 1)), Some(150));
+            state.switch_in(7, 1, 300);
+            state.seen_on_cpu(7, 2, 200);
+            state.switch_in(7, 2, 400);
+            state.switch_in(7, 4, 500);
+            state
+        };
+        let unknown = |state: State| -> Vec<_> {
+            state
+                .off_cpu
+                .iter()
+                .filter(|i| i.state == ThreadState::Unknown)
+                .map(|i| (i.tid, i.start_ns, i.end_ns, i.stack))
+                .collect()
+        };
+
+        let mut state = attached();
+        state.attached_ns = Some(100);
+        state.finish_off_cpu();
+        assert_eq!(unknown(state), [(1, 100, 300, None), (3, 100, 1_000, None)]);
+
+        // Launched, every thread ran in the capture.
+        let mut state = attached();
+        state.finish_off_cpu();
+        assert!(unknown(state).is_empty());
     }
 
     #[test]

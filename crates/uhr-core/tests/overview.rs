@@ -158,6 +158,7 @@ fn off_cpu(intervals: u64, runnable_ns: u64, blocked_ns: u64) -> Option<OffCPUTi
         intervals,
         runnable_ns,
         blocked_ns,
+        unknown_state_ns: 0,
     })
 }
 

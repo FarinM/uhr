@@ -42,7 +42,7 @@ replaces them.
 | `target.launched` | True if the recording started the target, false if it attached |
 | `target.exit` | `{"code": n}`, `{"signal": n}`, `{"unknown": reason}` when uhr could not see the status, as for a process it attached to, or null if it was still running |
 | `clock` | `CLOCK_MONOTONIC` |
-| `start_ns`, `end_ns` | When the capture started and stopped: the first and last event, or when uhr stopped the recording if that came later, at an interrupt or the end of `--duration`. Null if nothing was recorded |
+| `start_ns`, `end_ns` | When the capture started and stopped: the first and last event, or when perf began sampling a process uhr attached to if that came earlier, and when uhr stopped the recording if that came later, at an interrupt or the end of `--duration`. Null if nothing was recorded |
 | `streams` | One per collector that ran |
 | `kernel_symbols` | `{"status": "saved"}` if the kernel's symbols were read while recording, or `{"status": "unavailable", "reason": ...}` if not, and then kernel frames have no names |
 
@@ -128,16 +128,17 @@ Each stream has:
 
 `off_cpu`, one row per time a thread was switched out, sorted by
 `start_ns`. A thread still off CPU when the capture ends stays off until
-then. A new thread's wait for its first run is not included, nor is a time
-off CPU whose switch back in the kernel dropped, since when it ended is
-unknown.
+then. One already off CPU when an attached capture starts is off from then
+until it first runs, or all along if it never does. A new thread's wait for
+its first run is not included, nor is a time off CPU whose switch back in
+the kernel dropped, since when it ended is unknown.
 
 | Column | Type | Meaning |
 |---|---|---|
 | `start_ns`, `end_ns` | uint64 | When it was switched out and back in |
 | `pid`, `tid` | uint32 | |
-| `state` | string | `runnable` if it was preempted and waited for a CPU, `blocked` if it gave up the CPU to wait, for a lock, I/O, a timer or another thread. Only switches are recorded, not wakeups, so the time a woken thread then waits for a CPU counts as `blocked` |
-| `stack_id` | uint32, nullable | The stack it was switched out at. Null if the stack was not recorded: without kernel sampling, or when the kernel dropped it |
+| `state` | string | `runnable` if it was preempted and waited for a CPU, `blocked` if it gave up the CPU to wait, for a lock, I/O, a timer or another thread. Only switches are recorded, not wakeups, so the time a woken thread then waits for a CPU counts as `blocked`. `unknown` if it was off CPU already when an attached capture started, so its switch out was not seen |
+| `stack_id` | uint32, nullable | The stack it was switched out at. Null if the stack was not recorded: without kernel sampling, when the kernel dropped it, or when the switch out came before the capture |
 
 `kernel_symbols`, sorted by `start`, with ranges that don't overlap. The
 kernel moves to a random address on every boot, and modules come and go, so
