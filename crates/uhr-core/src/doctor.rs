@@ -151,12 +151,12 @@ fn check_recording() -> Check {
     match probe_recording(Path::new("perf")) {
         Ok(false) => Check {
             status: Status::Ok,
-            detail: "perf can record user and kernel CPU samples and stacks".into(),
+            detail: "perf can record user and kernel CPU samples and stacks, and off-CPU time and stacks".into(),
             fix: None,
         },
         Ok(true) => Check {
             status: Status::Limited,
-            detail: "perf can record user CPU samples and stacks; kernel CPU samples and stacks are excluded".into(),
+            detail: "perf can record user CPU samples and stacks, and off-CPU time; kernel CPU samples and stacks, and off-CPU stacks, are excluded".into(),
             fix: Some("Allow kernel sampling through the perf executable's capabilities or the host's perf_event_paranoid setting.".into()),
         },
         Err(detail) => Check {
@@ -228,6 +228,7 @@ fn probe_recording(perf: &Path) -> Result<bool, String> {
         command: vec!["true".into()],
         frequency_hz: 1,
         unwind: Unwind::FramePointers,
+        off_cpu: true,
     };
     let mut args = perf_args(&data, &options);
     // Permission errors from perf are suppressed by --quiet.
@@ -246,10 +247,14 @@ fn probe_recording(perf: &Path) -> Result<bool, String> {
     let file = File::open(&data).map_err(|e| format!("opening perf probe: {e}"))?;
     let reader = PerfFileReader::parse_file(BufReader::new(file))
         .map_err(|e| format!("reading perf probe: {e}"))?;
-    let [event] = reader.perf_file.event_attributes() else {
-        return Err("perf probe did not record the requested event".into());
-    };
-    Ok(event.attributes().flags.contains(AttrFlags::EXCLUDE_KERNEL))
+    let events = reader.perf_file.event_attributes();
+    // The CPU clock and the context switches.
+    if events.len() != 2 {
+        return Err("perf probe did not record the requested events".into());
+    }
+    Ok(events
+        .iter()
+        .any(|e| e.attributes().flags.contains(AttrFlags::EXCLUDE_KERNEL)))
 }
 
 #[cfg(test)]

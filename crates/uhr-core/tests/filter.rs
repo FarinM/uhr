@@ -62,6 +62,7 @@ fn recording() -> Recording {
             sample(2, 3, 3_000, Mode::Kernel, 8),
             sample(1, 2, 2_000, Mode::User, 16),
         ],
+        off_cpu: Vec::new(),
         kernel_symbols: Vec::new(),
     }
 }

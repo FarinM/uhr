@@ -30,8 +30,14 @@ fn example() -> Recording {
                     requested_frequency_hz: 999,
                     unwinding: Unwinding::FramePointers,
                     stack_copy_bytes: None,
+                    context_switches: true,
                 },
-                signals: vec![Signal::UserCPUSamples, Signal::UserStacks],
+                signals: vec![
+                    Signal::UserCPUSamples,
+                    Signal::UserStacks,
+                    Signal::OffCPUTime,
+                    Signal::OffCPUStacks,
+                ],
                 missing_signals: [Signal::KernelCPUSamples, Signal::KernelStacks]
                     .map(|signal| MissingSignal {
                         signal,
@@ -40,12 +46,13 @@ fn example() -> Recording {
                     .to_vec(),
                 coverage: StreamCoverage {
                     samples: 2,
+                    off_cpu_intervals: Some(2),
                     lost_events: 0,
                     throttle_events: 0,
                     max_stack_depth: 127,
-                    samples_at_stack_limit: 0,
-                    samples_cut_at_stack_copy: None,
-                    samples_not_unwound: None,
+                    stacks_at_stack_limit: 0,
+                    stacks_cut_at_stack_copy: None,
+                    stacks_not_unwound: None,
                     overhead_ns: None,
                     known_biases: vec!["example bias".into()],
                 },
@@ -122,6 +129,24 @@ fn example() -> Recording {
                 cpu_ns: 1_001_001,
             },
         ],
+        off_cpu: vec![
+            OffCPUInterval {
+                start_ns: 2_500,
+                end_ns: 2_900,
+                pid: 7,
+                tid: 7,
+                state: ThreadState::Blocked,
+                stack: Some(1),
+            },
+            OffCPUInterval {
+                start_ns: 4_000,
+                end_ns: 4_100,
+                pid: 7,
+                tid: 8,
+                state: ThreadState::Runnable,
+                stack: None,
+            },
+        ],
         kernel_symbols: vec![
             KernelSymbol {
                 start: 0xffffffff81001010,
@@ -171,12 +196,29 @@ fn rejects_dangling_references() {
     fewer_frames.frames.truncate(1);
     fewer_frames.stacks = vec![vec![0]];
     fewer_frames.samples.truncate(1);
+    fewer_frames.off_cpu.clear();
     fewer_frames.write(&other).unwrap();
     fs::copy(other.join("frames.parquet"), dir.join("frames.parquet")).unwrap();
     match Recording::read(&dir).unwrap_err() {
         Error::Invalid { path, reason } => {
             assert_eq!(path, dir);
             assert!(reason.contains("stack 0 refers to frame 1"), "{reason}");
+        }
+        error => panic!("{error}"),
+    }
+}
+
+#[test]
+fn rejects_off_cpu_intervals_that_end_before_they_start() {
+    let dir = scratch("backwards_off_cpu");
+    let mut recording = example();
+    recording.off_cpu[1].end_ns = 3_999;
+    match recording.write(&dir).unwrap_err() {
+        Error::Invalid { reason, .. } => {
+            assert!(
+                reason.contains("off-CPU interval 1 ends before it starts"),
+                "{reason}"
+            );
         }
         error => panic!("{error}"),
     }

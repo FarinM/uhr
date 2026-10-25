@@ -20,6 +20,7 @@ const FRAMES: &str = "frames.parquet";
 const STACKS: &str = "stacks.parquet";
 const SAMPLES: &str = "samples.parquet";
 const KERNEL_SYMBOLS: &str = "kernel_symbols.parquet";
+const OFF_CPU: &str = "off_cpu.parquet";
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -118,6 +119,7 @@ pub struct Recording {
     /// Frame ids, leaf first.
     pub stacks: Vec<Vec<u32>>,
     pub samples: Vec<Sample>,
+    pub off_cpu: Vec<OffCPUInterval>,
     /// Sorted by start, and not overlapping.
     pub kernel_symbols: Vec<KernelSymbol>,
 }
@@ -256,6 +258,48 @@ impl Mode {
     }
 }
 
+/// A time a thread spent off CPU, from the moment it was switched out to the
+/// moment it was switched back in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OffCPUInterval {
+    pub start_ns: u64,
+    pub end_ns: u64,
+    pub pid: u32,
+    pub tid: u32,
+    pub state: ThreadState,
+    /// Where it was switched out. `None` if its stack was not recorded.
+    pub stack: Option<u32>,
+}
+
+/// Why a thread was off CPU.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThreadState {
+    /// Preempted: it could have run, but had to wait for a CPU.
+    Runnable,
+    /// It gave up the CPU to wait: for a lock, I/O, a timer or another
+    /// thread. Once woken, it can wait for a CPU too, and that time counts
+    /// here as well.
+    Blocked,
+}
+
+impl ThreadState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ThreadState::Runnable => "runnable",
+            ThreadState::Blocked => "blocked",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, String> {
+        Ok(match value {
+            "runnable" => ThreadState::Runnable,
+            "blocked" => ThreadState::Blocked,
+            _ => return Err(format!("unknown thread state {value:?}")),
+        })
+    }
+}
+
 impl Recording {
     /// Writes the manifest last: a directory without one is a recording that
     /// did not finish. Checks first what `read` checks, so a recording that
@@ -286,6 +330,7 @@ impl Recording {
             frames: read_frames(dir)?,
             stacks: read_stacks(dir)?,
             samples: read_samples(dir)?,
+            off_cpu: read_off_cpu(dir)?,
             kernel_symbols: read_kernel_symbols(dir)?,
         };
         recording
@@ -399,6 +444,19 @@ impl Recording {
             ],
         )?;
 
+        let off_cpu = &self.off_cpu;
+        table::write(
+            &dir.join(OFF_CPU),
+            vec![
+                Column::u64("start_ns", off_cpu.iter().map(|i| i.start_ns).collect()),
+                Column::u64("end_ns", off_cpu.iter().map(|i| i.end_ns).collect()),
+                Column::u32("pid", off_cpu.iter().map(|i| i.pid).collect()),
+                Column::u32("tid", off_cpu.iter().map(|i| i.tid).collect()),
+                Column::string("state", off_cpu.iter().map(|i| i.state.as_str()).collect()),
+                Column::optional_u32("stack_id", off_cpu.iter().map(|i| i.stack).collect()),
+            ],
+        )?;
+
         let symbols = &self.kernel_symbols;
         table::write(
             &dir.join(KERNEL_SYMBOLS),
@@ -435,6 +493,14 @@ impl Recording {
         }
         for (index, sample) in self.samples.iter().enumerate() {
             check_id("sample", index, "stack", sample.stack, self.stacks.len())?;
+        }
+        for (index, interval) in self.off_cpu.iter().enumerate() {
+            if interval.start_ns > interval.end_ns {
+                return Err(format!("off-CPU interval {index} ends before it starts"));
+            }
+            if let Some(stack) = interval.stack {
+                check_id("off-CPU interval", index, "stack", stack, self.stacks.len())?;
+            }
         }
         for (index, symbol) in self.kernel_symbols.iter().enumerate() {
             if symbol.start >= symbol.end {
@@ -580,6 +646,28 @@ fn read_samples(dir: &Path) -> Result<Vec<Sample>> {
                 mode: Mode::parse(&mode[i]).map_err(|reason| table.invalid(reason))?,
                 stack: stack[i],
                 cpu_ns: cpu_ns[i],
+            })
+        })
+        .collect()
+}
+
+fn read_off_cpu(dir: &Path) -> Result<Vec<OffCPUInterval>> {
+    let table = Table::read(&dir.join(OFF_CPU))?;
+    let start_ns = table.u64("start_ns")?;
+    let end_ns = table.u64("end_ns")?;
+    let pid = table.u32("pid")?;
+    let tid = table.u32("tid")?;
+    let state = table.string("state")?;
+    let stack = table.optional_u32("stack_id")?;
+    (0..table.len())
+        .map(|i| {
+            Ok(OffCPUInterval {
+                start_ns: start_ns[i],
+                end_ns: end_ns[i],
+                pid: pid[i],
+                tid: tid[i],
+                state: ThreadState::parse(&state[i]).map_err(|reason| table.invalid(reason))?,
+                stack: stack[i],
             })
         })
         .collect()

@@ -79,6 +79,7 @@ mod tests {
             frames: Vec::new(),
             stacks: Vec::new(),
             samples: Vec::new(),
+            off_cpu: Vec::new(),
             kernel_symbols: Vec::new(),
         }
     }

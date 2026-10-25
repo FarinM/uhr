@@ -15,6 +15,7 @@ A recording is a directory:
 | `frames.parquet` | Unique frames, before symbol resolution |
 | `stacks.parquet` | Unique stacks as lists of frames |
 | `samples.parquet` | CPU samples |
+| `off_cpu.parquet` | Times threads spent off CPU, with why and where |
 | `kernel_symbols.parquet` | The kernel functions kernel frames fall in, read while recording |
 | `symbols.parquet` | Function name per frame, after symbol resolution |
 | `symbol_sources.parquet` | Files the names came from, and why some frames have none |
@@ -50,16 +51,17 @@ Each stream has:
 | Field | Meaning |
 |---|---|
 | `id` | Unique within the recording |
-| `collector` | `name` plus the collector's version and settings. For perf: `version`, `event`, `frequency_hz` (what perf sampled at), `requested_frequency_hz`, `unwinding` (`frame_pointers` or `dwarf`), `stack_copy_bytes` (user stack copied with each sample as perf used it, null without `dwarf`) |
-| `signals` | What was captured: `user_cpu_samples`, `kernel_cpu_samples`, `user_stacks`, `kernel_stacks` |
-| `missing_signals` | Signals requested but not captured, each with a `reason`. Without `kernel_cpu_samples`, CPU time spent in the kernel is not in the samples at all, not merely unnamed |
+| `collector` | `name` plus the collector's version and settings. For perf: `version`, `event`, `frequency_hz` (what perf sampled at), `requested_frequency_hz`, `unwinding` (`frame_pointers` or `dwarf`), `stack_copy_bytes` (user stack copied with each sample as perf used it, null without `dwarf`), `context_switches` (whether perf recorded every context switch) |
+| `signals` | What was captured: `user_cpu_samples`, `kernel_cpu_samples`, `user_stacks`, `kernel_stacks`, `off_cpu_time` (when threads went off CPU and came back, and whether they were preempted), `off_cpu_stacks` (where they went off CPU) |
+| `missing_signals` | Signals requested but not captured, each with a `reason`. Without `kernel_cpu_samples`, CPU time spent in the kernel is not in the samples at all, not merely unnamed. Threads go off CPU in the kernel, so without kernel sampling `off_cpu_stacks` is missing too |
 | `coverage.samples` | Samples written |
+| `coverage.off_cpu_intervals` | Off-CPU intervals written. Null without `context_switches` |
 | `coverage.lost_events` | Events the kernel dropped |
 | `coverage.throttle_events` | Times the kernel throttled sampling |
 | `coverage.max_stack_depth` | Stacks deeper than this were cut |
-| `coverage.samples_at_stack_limit` | Samples whose stack reached that depth |
-| `coverage.samples_cut_at_stack_copy` | Samples whose stack went on past the end of their stack copy, so their outer callers are missing. Null without `dwarf` |
-| `coverage.samples_not_unwound` | Samples of 32-bit code, which `dwarf` unwinding cannot walk. They keep only the sampled instruction. Null without `dwarf` |
+| `coverage.stacks_at_stack_limit` | Stacks that reached that depth. This and the next two count every stack: one per sample and one per switch out |
+| `coverage.stacks_cut_at_stack_copy` | Stacks that went on past the end of their stack copy, so their outer callers are missing. Null without `dwarf` |
+| `coverage.stacks_not_unwound` | Stacks of 32-bit code, which `dwarf` unwinding cannot walk. They keep only the instruction they were taken at. Null without `dwarf` |
 | `coverage.overhead_ns` | Profiler overhead. Null until it is measured |
 | `coverage.known_biases` | Biases of this collector, in words |
 
@@ -123,6 +125,19 @@ Each stream has:
 | `mode` | string | `user`, `kernel` or `unknown` (hypervisor, guest) |
 | `stack_id` | uint32 | |
 | `cpu_ns` | uint64 | CPU time this sample stands for |
+
+`off_cpu`, one row per time a thread was switched out, sorted by
+`start_ns`. A thread still off CPU when the capture ends stays off until
+then. A new thread's wait for its first run is not included, nor is a time
+off CPU whose switch back in the kernel dropped, since when it ended is
+unknown.
+
+| Column | Type | Meaning |
+|---|---|---|
+| `start_ns`, `end_ns` | uint64 | When it was switched out and back in |
+| `pid`, `tid` | uint32 | |
+| `state` | string | `runnable` if it was preempted and waited for a CPU, `blocked` if it gave up the CPU to wait, for a lock, I/O, a timer or another thread. Only switches are recorded, not wakeups, so the time a woken thread then waits for a CPU counts as `blocked` |
+| `stack_id` | uint32, nullable | The stack it was switched out at. Null if the stack was not recorded: without kernel sampling, or when the kernel dropped it |
 
 `kernel_symbols`, sorted by `start`, with ranges that don't overlap. The
 kernel moves to a random address on every boot, and modules come and go, so

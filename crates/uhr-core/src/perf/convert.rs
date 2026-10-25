@@ -8,8 +8,9 @@ use linux_perf_data::linux_perf_event_reader::constants::{
     PERF_SAMPLE_REGS_ABI_64,
 };
 use linux_perf_data::linux_perf_event_reader::{
-    AttrFlags, ClockId, CpuMode, Endianness, EventRecord, Mmap2FileId, PerfClock, PerfEventType,
-    RawEventRecord, SampleFormat, SampleRecord, SamplingPolicy, SoftwareCounterType,
+    AttrFlags, ClockId, ContextSwitchRecord, CpuMode, Endianness, EventRecord, Mmap2FileId,
+    PerfClock, PerfEventAttr, PerfEventType, RawEventRecord, SampleFormat, SampleRecord,
+    SamplingPolicy, SoftwareCounterType, TaskWasPreempted,
 };
 use linux_perf_data::{PerfFileReader, PerfFileRecord};
 
@@ -18,8 +19,8 @@ use super::{Error, Result, io_error};
 use crate::kallsyms::{self, Kallsyms};
 use crate::recording::{
     Clock, Collector, Exit, FORMAT_VERSION, Frame, KERNEL, KernelSymbols, Manifest, Mapping,
-    MissingSignal, Mode, Origin, Recording, Sample, Signal, Stream, StreamCoverage, Target, Thread,
-    ThreadName, Unwinding,
+    MissingSignal, Mode, OffCPUInterval, Origin, Recording, Sample, Signal, Stream, StreamCoverage,
+    Target, Thread, ThreadName, ThreadState, Unwinding,
 };
 
 pub(super) struct Input<'a> {
@@ -40,6 +41,8 @@ const FRAME_POINTER_BIAS: &str = "Frame-pointer unwinding cuts stacks short in c
      without frame pointers, and misses the caller of a leaf function that has no frame setup.";
 const DWARF_BIAS: &str = "DWARF unwinding falls back to frame pointers in code without unwind \
      tables, such as JIT code, and stops at the end of each sample's stack copy.";
+const OFF_CPU_BIAS: &str = "Off-CPU time comes from context switches, without wakeups, so the \
+     time a woken thread waits for a CPU counts as blocked rather than runnable.";
 
 pub(super) fn convert(input: Input) -> Result<Recording> {
     let file = File::open(input.perf_data).map_err(io_error("opening", input.perf_data))?;
@@ -48,28 +51,28 @@ pub(super) fn convert(input: Input) -> Result<Recording> {
         mut record_iter,
     } = PerfFileReader::parse_file(BufReader::new(file)).map_err(Error::PerfData)?;
 
-    let [attributes] = perf_file.event_attributes() else {
+    let attributes = perf_file.event_attributes();
+    let cpu_clock = attributes.iter().position(|a| {
+        matches!(
+            a.attributes().type_,
+            PerfEventType::Software(SoftwareCounterType::CpuClock)
+        )
+    });
+    let switches = attributes.iter().position(|a| {
+        matches!(
+            a.attributes().type_,
+            PerfEventType::Software(SoftwareCounterType::ContextSwitches)
+        )
+    });
+    let expected = if switches.is_some() { 2 } else { 1 };
+    let Some(cpu_clock) = cpu_clock.filter(|_| attributes.len() == expected) else {
+        let types: Vec<_> = attributes.iter().map(|a| a.attributes().type_).collect();
         return Err(unexpected(format!(
-            "expected one perf event, found {}",
-            perf_file.event_attributes().len()
+            "expected a cpu-clock event and maybe a context-switches event, found {types:?}"
         )));
     };
-    let attr = attributes.attributes();
-    if !matches!(
-        attr.type_,
-        PerfEventType::Software(SoftwareCounterType::CpuClock)
-    ) {
-        return Err(unexpected(format!(
-            "expected a cpu-clock event, found {:?}",
-            attr.type_
-        )));
-    }
-    if !matches!(attr.clock, PerfClock::ClockId(ClockId::Monotonic)) {
-        return Err(unexpected(format!(
-            "expected CLOCK_MONOTONIC timestamps, found {:?}",
-            attr.clock
-        )));
-    }
+    let attr = attributes[cpu_clock].attributes();
+    check_clock(attr)?;
     let SamplingPolicy::Frequency(frequency_hz) = attr.sampling_policy else {
         return Err(unexpected(format!(
             "expected sampling by frequency, found {:?}",
@@ -81,6 +84,27 @@ pub(super) fn convert(input: Input) -> Result<Recording> {
         .sample_format
         .contains(SampleFormat::REGS_USER | SampleFormat::STACK_USER)
         .then_some(attr.sample_stack_user);
+    // Threads go off CPU in the kernel, so without it there are no stacks.
+    let mut switch_stacks_excluded = false;
+    if let Some(index) = switches {
+        let attr = attributes[index].attributes();
+        check_clock(attr)?;
+        if !matches!(attr.sampling_policy, SamplingPolicy::Period(period) if period.get() == 1) {
+            return Err(unexpected(format!(
+                "expected a sample at every context switch, found {:?}",
+                attr.sampling_policy
+            )));
+        }
+        if !attributes
+            .iter()
+            .any(|a| a.attributes().flags.contains(AttrFlags::CONTEXT_SWITCH))
+        {
+            return Err(unexpected(
+                "context-switches samples without switch records".into(),
+            ));
+        }
+        switch_stacks_excluded = attr.flags.contains(AttrFlags::EXCLUDE_KERNEL);
+    }
 
     let mut state = State::new(input.max_stack_depth);
     if stack_copy_bytes.is_some() {
@@ -90,7 +114,7 @@ pub(super) fn convert(input: Input) -> Result<Recording> {
         .next_record(&mut perf_file)
         .map_err(Error::PerfData)?
     {
-        let PerfFileRecord::EventRecord { record, .. } = record else {
+        let PerfFileRecord::EventRecord { attr_index, record } = record else {
             continue;
         };
         // perf stamps the records it synthesizes at startup with 0.
@@ -103,7 +127,26 @@ pub(super) fn convert(input: Input) -> Result<Recording> {
             .parse()
             .map_err(io_error("parsing a record in", input.perf_data))?;
         match parsed {
-            EventRecord::Sample(sample) => state.sample(&record, &sample)?,
+            EventRecord::Sample(sample) if attr_index == cpu_clock => {
+                state.sample(&record, &sample)?
+            }
+            EventRecord::Sample(sample) => state.switch_sample(&record, &sample)?,
+            EventRecord::ContextSwitch(switch) if switches.is_some() => {
+                let common = record
+                    .common_data()
+                    .map_err(io_error("parsing a record in", input.perf_data))?;
+                let (Some(pid), Some(tid), Some(time)) = (common.pid, common.tid, common.timestamp)
+                else {
+                    return Err(unexpected("context switch without pid, tid or time".into()));
+                };
+                let (pid, tid) = (id(pid)?, id(tid)?);
+                match switch {
+                    ContextSwitchRecord::Out { preempted, .. } => {
+                        state.switch_out(pid, tid, time, preempted)
+                    }
+                    ContextSwitchRecord::In { .. } => state.switch_in(pid, tid, time),
+                }
+            }
             EventRecord::Mmap(m) => state.mmap(Mmap {
                 pid: m.pid,
                 start: m.address,
@@ -140,7 +183,7 @@ pub(super) fn convert(input: Input) -> Result<Recording> {
                 let parent = u32::try_from(f.ppid).ok().zip(u32::try_from(f.ptid).ok());
                 state.fork(id(f.pid)?, id(f.tid)?, parent, time);
             }
-            EventRecord::Exit(e) => state.thread(id(e.pid)?, id(e.tid)?).end_ns = time,
+            EventRecord::Exit(e) => state.exit(id(e.pid)?, id(e.tid)?, time),
             EventRecord::Lost(l) => state.lost_events += l.count,
             EventRecord::Throttle(_) => state.throttle_events += 1,
             _ => {}
@@ -152,6 +195,7 @@ pub(super) fn convert(input: Input) -> Result<Recording> {
     if let (Some(end), Some(interrupted)) = (state.end_ns.as_mut(), input.interrupted_ns) {
         *end = (*end).max(interrupted);
     }
+    state.finish_off_cpu();
 
     let mut signals = vec![Signal::UserCPUSamples, Signal::UserStacks];
     let mut missing_signals = Vec::new();
@@ -168,7 +212,30 @@ pub(super) fn convert(input: Input) -> Result<Recording> {
     } else {
         signals.extend(kernel_signals);
     }
+    if switches.is_some() {
+        signals.push(Signal::OffCPUTime);
+        if switch_stacks_excluded {
+            missing_signals.push(MissingSignal {
+                signal: Signal::OffCPUStacks,
+                reason: "perf excluded the kernel, where threads go off CPU, usually because \
+                     perf_event_paranoid is 2 or higher. Run `uhr doctor`."
+                    .into(),
+            });
+        } else {
+            signals.push(Signal::OffCPUStacks);
+        }
+    }
 
+    let mut known_biases = vec![
+        TIMER_BIAS,
+        match stack_copy_bytes {
+            Some(_) => DWARF_BIAS,
+            None => FRAME_POINTER_BIAS,
+        },
+    ];
+    if switches.is_some() {
+        known_biases.push(OFF_CPU_BIAS);
+    }
     let stream = Stream {
         id: "perf".into(),
         collector: Collector::Perf {
@@ -181,28 +248,21 @@ pub(super) fn convert(input: Input) -> Result<Recording> {
                 None => Unwinding::FramePointers,
             },
             stack_copy_bytes,
+            context_switches: switches.is_some(),
         },
         signals,
         missing_signals,
         coverage: StreamCoverage {
             samples: state.samples.len() as u64,
+            off_cpu_intervals: switches.map(|_| state.off_cpu.len() as u64),
             lost_events: state.lost_events,
             throttle_events: state.throttle_events,
             max_stack_depth: input.max_stack_depth,
-            samples_at_stack_limit: state.samples_at_stack_limit,
-            samples_cut_at_stack_copy: stack_copy_bytes.map(|_| state.samples_cut_at_stack_copy),
-            samples_not_unwound: stack_copy_bytes.map(|_| state.samples_not_unwound),
+            stacks_at_stack_limit: state.stacks_at_stack_limit,
+            stacks_cut_at_stack_copy: stack_copy_bytes.map(|_| state.stacks_cut_at_stack_copy),
+            stacks_not_unwound: stack_copy_bytes.map(|_| state.stacks_not_unwound),
             overhead_ns: None,
-            known_biases: [
-                TIMER_BIAS,
-                match stack_copy_bytes {
-                    Some(_) => DWARF_BIAS,
-                    None => FRAME_POINTER_BIAS,
-                },
-            ]
-            .iter()
-            .map(|b| b.to_string())
-            .collect(),
+            known_biases: known_biases.iter().map(|b| b.to_string()).collect(),
         },
     };
 
@@ -238,8 +298,19 @@ pub(super) fn convert(input: Input) -> Result<Recording> {
         frames: state.frames,
         stacks: state.stacks,
         samples: state.samples,
+        off_cpu: state.off_cpu,
         kernel_symbols,
     })
+}
+
+fn check_clock(attr: &PerfEventAttr) -> Result<()> {
+    if !matches!(attr.clock, PerfClock::ClockId(ClockId::Monotonic)) {
+        return Err(unexpected(format!(
+            "expected CLOCK_MONOTONIC timestamps, found {:?}",
+            attr.clock
+        )));
+    }
+    Ok(())
 }
 
 const PROT_EXEC: u32 = 0x4;
@@ -284,13 +355,25 @@ struct State {
     stacks: Vec<Vec<u32>>,
     stack_ids: HashMap<Vec<u32>, u32>,
     samples: Vec<Sample>,
+    /// The stack perf took of a thread about to go off CPU, until its
+    /// switch record comes.
+    switch_stacks: HashMap<(u32, u32), u32>,
+    /// Threads off CPU, until their switch back in.
+    switched_out: HashMap<(u32, u32), SwitchedOut>,
+    off_cpu: Vec<OffCPUInterval>,
     lost_events: u64,
     throttle_events: u64,
-    samples_at_stack_limit: u64,
+    stacks_at_stack_limit: u64,
     /// Only for recordings with a stack copy in each sample.
     unwinding: Option<UserUnwinding>,
-    samples_cut_at_stack_copy: u64,
-    samples_not_unwound: u64,
+    stacks_cut_at_stack_copy: u64,
+    stacks_not_unwound: u64,
+}
+
+struct SwitchedOut {
+    time_ns: u64,
+    state: ThreadState,
+    stack: Option<u32>,
 }
 
 impl State {
@@ -311,12 +394,15 @@ impl State {
             stacks: Vec::new(),
             stack_ids: HashMap::new(),
             samples: Vec::new(),
+            switch_stacks: HashMap::new(),
+            switched_out: HashMap::new(),
+            off_cpu: Vec::new(),
             lost_events: 0,
             throttle_events: 0,
-            samples_at_stack_limit: 0,
+            stacks_at_stack_limit: 0,
             unwinding: None,
-            samples_cut_at_stack_copy: 0,
-            samples_not_unwound: 0,
+            stacks_cut_at_stack_copy: 0,
+            stacks_not_unwound: 0,
         }
     }
 
@@ -354,6 +440,9 @@ impl State {
         if let Some(earlier) = self.threads.remove(&(pid, tid)) {
             self.ended.push(earlier);
         }
+        // Left from an earlier thread with this id, whose exit was lost.
+        self.switched_out.remove(&(pid, tid));
+        self.switch_stacks.remove(&(pid, tid));
         self.threads.insert(
             (pid, tid),
             Thread {
@@ -432,6 +521,7 @@ impl State {
         };
         let (pid, tid) = (id(pid)?, id(tid)?);
         self.thread(pid, tid);
+        self.seen_on_cpu(pid, tid, time_ns);
         let stack = self.stack(pid, time_ns, record, sample)?;
         self.samples.push(Sample {
             time_ns,
@@ -447,6 +537,103 @@ impl State {
             cpu_ns: period,
         });
         Ok(())
+    }
+
+    /// perf samples a thread right before it goes off CPU, and the switch
+    /// record follows.
+    fn switch_sample(&mut self, record: &RawEventRecord, sample: &SampleRecord) -> Result<()> {
+        let (Some(pid), Some(tid), Some(time_ns)) = (sample.pid, sample.tid, sample.timestamp)
+        else {
+            return Err(unexpected(
+                "context-switches sample without pid, tid or time".into(),
+            ));
+        };
+        let (pid, tid) = (id(pid)?, id(tid)?);
+        let stack = self.stack(pid, time_ns, record, sample)?;
+        self.switch_stack(pid, tid, time_ns, stack);
+        Ok(())
+    }
+
+    fn switch_stack(&mut self, pid: u32, tid: u32, time_ns: u64, stack: u32) {
+        self.seen_on_cpu(pid, tid, time_ns);
+        // Records with the same time can come in either order.
+        match self.switched_out.get_mut(&(pid, tid)) {
+            Some(out) if out.stack.is_none() && out.time_ns == time_ns => out.stack = Some(stack),
+            _ => {
+                self.switch_stacks.insert((pid, tid), stack);
+            }
+        }
+    }
+
+    fn switch_out(&mut self, pid: u32, tid: u32, time_ns: u64, preempted: TaskWasPreempted) {
+        self.thread(pid, tid);
+        let state = match preempted {
+            TaskWasPreempted::Yes => ThreadState::Runnable,
+            TaskWasPreempted::No => ThreadState::Blocked,
+        };
+        let stack = self.switch_stacks.remove(&(pid, tid));
+        // This drops one still off CPU: its switch back in was lost, so when
+        // it ended is unknown.
+        self.switched_out.insert(
+            (pid, tid),
+            SwitchedOut {
+                time_ns,
+                state,
+                stack,
+            },
+        );
+    }
+
+    fn switch_in(&mut self, pid: u32, tid: u32, time_ns: u64) {
+        // A stack left from before belongs to a switch out that was lost.
+        self.switch_stacks.remove(&(pid, tid));
+        if let Some(out) = self.switched_out.remove(&(pid, tid)) {
+            self.off_cpu.push(OffCPUInterval {
+                start_ns: out.time_ns,
+                end_ns: time_ns,
+                pid,
+                tid,
+                state: out.state,
+                stack: out.stack,
+            });
+        }
+    }
+
+    /// A thread seen on CPU after it went off lost its switch back in, so
+    /// when it came back is unknown.
+    fn seen_on_cpu(&mut self, pid: u32, tid: u32, time_ns: u64) {
+        if self
+            .switched_out
+            .get(&(pid, tid))
+            .is_some_and(|out| out.time_ns < time_ns)
+        {
+            self.switched_out.remove(&(pid, tid));
+        }
+    }
+
+    fn exit(&mut self, pid: u32, tid: u32, time: Option<u64>) {
+        self.thread(pid, tid).end_ns = time;
+        // A thread runs to exit, so these lost their switch back in.
+        self.switched_out.remove(&(pid, tid));
+        self.switch_stacks.remove(&(pid, tid));
+    }
+
+    /// Threads still off CPU stay off until the capture ends.
+    fn finish_off_cpu(&mut self) {
+        if let Some(end_ns) = self.end_ns {
+            for ((pid, tid), out) in self.switched_out.drain() {
+                self.off_cpu.push(OffCPUInterval {
+                    start_ns: out.time_ns,
+                    end_ns,
+                    pid,
+                    tid,
+                    state: out.state,
+                    stack: out.stack,
+                });
+            }
+        }
+        self.off_cpu
+            .sort_by_key(|i| (i.start_ns, i.pid, i.tid, i.end_ns));
     }
 
     fn stack(
@@ -485,8 +672,8 @@ impl State {
             None => None,
         };
         if let Some(user) = user {
-            self.samples_cut_at_stack_copy += u64::from(user.cut);
-            self.samples_not_unwound += u64::from(user.not_unwound);
+            self.stacks_cut_at_stack_copy += u64::from(user.cut);
+            self.stacks_not_unwound += u64::from(user.not_unwound);
             for (address, return_address) in user.frames {
                 stack.push(self.frame(pid, ChainContext::User, address, return_address));
             }
@@ -505,7 +692,7 @@ impl State {
             return Err(unexpected(format!("sample at {time_ns} has no address")));
         }
         if stack.len() >= self.max_stack_depth as usize {
-            self.samples_at_stack_limit += 1;
+            self.stacks_at_stack_limit += 1;
         }
         Ok(intern(&mut self.stacks, &mut self.stack_ids, stack))
     }
@@ -802,6 +989,96 @@ mod tests {
 
         let leaf = state.frame(7, ChainContext::User, 0x2000, false);
         assert_eq!(state.frames[leaf as usize].mapping, None);
+    }
+
+    #[test]
+    fn pairs_each_switch_out_with_the_next_switch_in() {
+        let mut state = State::new(127);
+        state.switch_in(1, 2, 5);
+        state.switch_stack(1, 2, 10, 0);
+        state.switch_out(1, 2, 11, TaskWasPreempted::No);
+        state.switch_in(1, 2, 20);
+        state.switch_out(1, 2, 25, TaskWasPreempted::Yes);
+        state.switch_out(1, 2, 26, TaskWasPreempted::No);
+        // The same time as its switch out, but after it.
+        state.switch_stack(1, 2, 26, 1);
+        state.switch_in(1, 2, 30);
+        // Its switch out was lost.
+        state.switch_stack(1, 2, 35, 2);
+        state.switch_in(1, 2, 40);
+        state.switch_out(1, 2, 45, TaskWasPreempted::No);
+        state.switch_out(1, 3, 50, TaskWasPreempted::No);
+        state.exit(1, 3, Some(55));
+        state.end_ns = Some(60);
+        state.finish_off_cpu();
+
+        let intervals: Vec<_> = state
+            .off_cpu
+            .iter()
+            .map(|i| (i.tid, i.start_ns, i.end_ns, i.state, i.stack))
+            .collect();
+        use ThreadState::*;
+        assert_eq!(
+            intervals,
+            [
+                (2, 11, 20, Blocked, Some(0)),
+                (2, 26, 30, Blocked, Some(1)),
+                (2, 45, 60, Blocked, None),
+            ]
+        );
+    }
+
+    #[test]
+    fn drops_waits_a_thread_was_seen_on_cpu_during() {
+        let mut state = State::new(127);
+        state.switch_out(1, 2, 10, TaskWasPreempted::No);
+        // Sampled right as it went off CPU.
+        state.seen_on_cpu(1, 2, 10);
+        state.switch_in(1, 2, 20);
+        // Its switch back in was lost.
+        state.switch_out(1, 2, 30, TaskWasPreempted::No);
+        state.seen_on_cpu(1, 2, 35);
+        state.switch_in(1, 2, 40);
+        // Its switch back in was lost, and so was its next switch out.
+        state.switch_out(1, 2, 45, TaskWasPreempted::No);
+        state.switch_stack(1, 2, 50, 0);
+        state.switch_in(1, 2, 55);
+        state.switch_out(1, 2, 60, TaskWasPreempted::Yes);
+        state.seen_on_cpu(1, 2, 65);
+        state.end_ns = Some(70);
+        state.finish_off_cpu();
+
+        let intervals: Vec<_> = state
+            .off_cpu
+            .iter()
+            .map(|i| (i.start_ns, i.end_ns))
+            .collect();
+        assert_eq!(intervals, [(10, 20)]);
+    }
+
+    #[test]
+    fn drops_waits_of_an_earlier_thread_with_the_same_id() {
+        let mut state = State::new(127);
+        // Thread 5 lost its switch back in and its exit.
+        state.fork(5, 5, Some((1, 1)), Some(10));
+        state.switch_out(5, 5, 20, TaskWasPreempted::No);
+        // Thread 6 lost its switch out and its exit.
+        state.fork(5, 6, Some((1, 1)), Some(10));
+        state.switch_stack(5, 6, 30, 0);
+        state.fork(5, 5, Some((1, 1)), Some(1_000));
+        state.switch_in(5, 5, 1_001);
+        // Its first switch in and the stack of its switch out were lost.
+        state.fork(5, 6, Some((1, 1)), Some(1_000));
+        state.switch_out(5, 6, 1_010, TaskWasPreempted::Yes);
+        state.switch_in(5, 6, 1_020);
+        state.finish_off_cpu();
+
+        let intervals: Vec<_> = state
+            .off_cpu
+            .iter()
+            .map(|i| (i.tid, i.start_ns, i.end_ns, i.stack))
+            .collect();
+        assert_eq!(intervals, [(6, 1_010, 1_020, None)]);
     }
 
     #[test]

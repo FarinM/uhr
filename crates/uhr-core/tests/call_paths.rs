@@ -101,6 +101,7 @@ fn recording() -> Recording {
         frames,
         stacks: stacks.into_iter().map(|(stack, _)| stack).collect(),
         samples,
+        off_cpu: Vec::new(),
         kernel_symbols: Vec::new(),
     }
 }

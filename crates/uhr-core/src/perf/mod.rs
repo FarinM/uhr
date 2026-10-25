@@ -94,6 +94,9 @@ pub struct RecordOptions {
     pub command: Vec<String>,
     pub frequency_hz: u64,
     pub unwind: Unwind,
+    /// Record every context switch, with the stack of each thread going
+    /// off CPU.
+    pub off_cpu: bool,
 }
 
 /// How user stacks are walked.
@@ -241,9 +244,9 @@ fn log_summary(recording: &Recording, out: &Path) {
                 "the kernel dropped events"
             );
         }
-        if coverage.samples_at_stack_limit > 0 {
+        if coverage.stacks_at_stack_limit > 0 {
             warn!(
-                samples = coverage.samples_at_stack_limit,
+                stacks = coverage.stacks_at_stack_limit,
                 max_stack_depth = coverage.max_stack_depth,
                 "stacks were cut at the depth limit"
             );
@@ -264,6 +267,12 @@ pub(crate) fn perf_args(perf_data: &Path, options: &RecordOptions) -> Vec<OsStri
     .iter()
     .map(OsString::from)
     .collect();
+    if options.off_cpu {
+        // A sample at each switch gives the stack, and the switch records
+        // give when the thread came back and whether it was preempted.
+        args.push("--event=context-switches/period=1/".into());
+        args.push("--switch-events".into());
+    }
     match options.unwind {
         Unwind::FramePointers => args.push("--call-graph=fp".into()),
         Unwind::Dwarf { stack_bytes } => {

@@ -33,7 +33,7 @@ asks otherwise. Deeper signals are added when the question needs them.
 | Per-thread CPU time, user and kernel | time level 0, cheap | `/proc/<pid>/task/<tid>/stat` | thread info APIs | `GetThreadTimes` |
 | Resident memory by category | memory level 0 | `smaps_rollup`, `smaps` | `task_info`, `vmmap` | working set APIs |
 | On-CPU stack sampling, user and kernel | time levels 2-5 | perf, eBPF | samply, xctrace Time Profiler | ETW, samply |
-| Off-CPU and thread state | time level 0, locks, I/O | eBPF on scheduler tracepoints and wakeups | xctrace System Trace | ETW context switches |
+| Off-CPU and thread state | time level 0, locks, I/O | perf context switches, eBPF on scheduler tracepoints and wakeups | xctrace System Trace | ETW context switches |
 | Syscalls | time level 1 | eBPF on `raw_syscalls` tracepoints, `perf trace` | xctrace System Trace | ETW syscall events |
 | Mixed native and runtime stacks | time levels 2-4 for runtimes | OpenTelemetry eBPF profiler, py-spy `--native` | runtime profilers (limited) | runtime profilers |
 | Runtime CPU profiles | time levels 2-4 | async-profiler, V8 `--cpu-prof`, Go pprof, rbspy, dotnet-trace | same | same |
@@ -62,6 +62,22 @@ Debian and Ubuntu its package must match the running kernel.
 
 - `cpu-clock` at 999 Hz. Its sample period is in nanoseconds, so a sample's
   weight is CPU time.
+- Off CPU, unless `uhr record --no-off-cpu`: the `context-switches` event
+  with a period of 1 takes the stack of each thread going off CPU, and
+  `--switch-events` records when it went and came back, and whether it was
+  preempted, which tells runnable from blocked. Neither needs root: the
+  switch records come wherever perf can record, and the stacks need kernel
+  sampling, so a `perf_event_paranoid` of 2 or more leaves them out.
+  Wakeups would also tell when a blocked thread became runnable and what
+  woke it, but perf gets them only from the scheduler's tracepoints, which
+  need root.
+- The cost of context switches grows with how often the target switches. A
+  pipe ping-pong between two threads, 125,000 switches a second, ran 1.6
+  times as long under CPU sampling alone and 2.2 times with context
+  switches, and perf wrote about 260 bytes per switch. With `--unwind
+  dwarf` each switch also copies the user stack, and bursts of switches can
+  overflow perf's buffer: the switch is kept, but its stack is lost and
+  counted among the lost events.
 - `--clockid=CLOCK_MONOTONIC` puts samples on the shared clock.
 - `--buildid-mmap` has the kernel record each mapping's build-id, so symbols
   are matched to the exact file that ran.

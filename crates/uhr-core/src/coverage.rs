@@ -10,16 +10,17 @@ use crate::symbols::{Source, SourceStatus, Symbols};
 #[derive(Debug, Clone, Serialize)]
 pub struct Coverage {
     /// This and the next four count the whole recording, whatever the
-    /// filter.
+    /// filter. The stack counts cover every stack: one per CPU sample, and
+    /// one per thread going off CPU.
     pub lost_events: u64,
     pub throttle_events: u64,
-    pub samples_at_stack_limit: u64,
-    /// Samples whose stack went on past the end of their stack copy, so
-    /// their outer callers are missing. `None` without DWARF unwinding.
-    pub samples_cut_at_stack_copy: Option<u64>,
-    /// Samples of 32-bit code, whose user stacks DWARF unwinding cannot
-    /// walk. `None` without DWARF unwinding.
-    pub samples_not_unwound: Option<u64>,
+    pub stacks_at_stack_limit: u64,
+    /// Stacks that went on past the end of their stack copy, so their outer
+    /// callers are missing. `None` without DWARF unwinding.
+    pub stacks_cut_at_stack_copy: Option<u64>,
+    /// Stacks of 32-bit code, which DWARF unwinding cannot walk. `None`
+    /// without DWARF unwinding.
+    pub stacks_not_unwound: Option<u64>,
     pub missing_signals: Vec<MissingSignal>,
     /// What this result cannot account for because it was not measured.
     pub unknown: Vec<String>,
@@ -31,9 +32,9 @@ impl Coverage {
         let mut coverage = Coverage {
             lost_events: 0,
             throttle_events: 0,
-            samples_at_stack_limit: 0,
-            samples_cut_at_stack_copy: None,
-            samples_not_unwound: None,
+            stacks_at_stack_limit: 0,
+            stacks_cut_at_stack_copy: None,
+            stacks_not_unwound: None,
             missing_signals: Vec::new(),
             unknown: Vec::new(),
             known_biases: Vec::new(),
@@ -42,15 +43,15 @@ impl Coverage {
             let c = &stream.coverage;
             coverage.lost_events += c.lost_events;
             coverage.throttle_events += c.throttle_events;
-            coverage.samples_at_stack_limit += c.samples_at_stack_limit;
-            if let Some(cut) = c.samples_cut_at_stack_copy {
-                *coverage.samples_cut_at_stack_copy.get_or_insert(0) += cut;
+            coverage.stacks_at_stack_limit += c.stacks_at_stack_limit;
+            if let Some(cut) = c.stacks_cut_at_stack_copy {
+                *coverage.stacks_cut_at_stack_copy.get_or_insert(0) += cut;
             }
-            if let Some(skipped) = c.samples_not_unwound {
-                *coverage.samples_not_unwound.get_or_insert(0) += skipped;
+            if let Some(skipped) = c.stacks_not_unwound {
+                *coverage.stacks_not_unwound.get_or_insert(0) += skipped;
                 if skipped > 0 {
                     coverage.unknown.push(format!(
-                        "callers in {skipped} samples of 32-bit code in stream {}, which DWARF \
+                        "callers in {skipped} stacks of 32-bit code in stream {}, which DWARF \
                          unwinding cannot walk",
                         stream.id
                     ));
@@ -81,14 +82,14 @@ impl Coverage {
                 stack_copy_bytes,
                 ..
             } = &stream.collector;
-            match (unwinding, c.samples_cut_at_stack_copy) {
+            match (unwinding, c.stacks_cut_at_stack_copy) {
                 (Unwinding::FramePointers, _) => coverage.unknown.push(format!(
                     "stacks of stream {} cut short where frame pointers are missing",
                     stream.id
                 )),
                 (Unwinding::Dwarf, Some(cut)) if cut > 0 => coverage.unknown.push(format!(
-                    "outer callers of {cut} samples of stream {}, whose stacks were deeper \
-                     than their {}-byte stack copy",
+                    "outer callers of {cut} stacks of stream {}, which were deeper than \
+                     their {}-byte stack copy",
                     stream.id,
                     stack_copy_bytes.unwrap_or_default()
                 )),

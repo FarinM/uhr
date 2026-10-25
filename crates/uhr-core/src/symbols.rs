@@ -1033,6 +1033,7 @@ mod tests {
             ],
             stacks: Vec::new(),
             samples: Vec::new(),
+            off_cpu: Vec::new(),
             kernel_symbols: Vec::new(),
         }
     }

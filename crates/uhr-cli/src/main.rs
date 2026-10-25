@@ -55,6 +55,10 @@ enum Command {
         /// dwarf`. Deeper stacks lose their outer callers [default: 32768]
         #[arg(long, value_name = "BYTES", value_parser = clap::value_parser!(u32).range(8..=65528))]
         stack_size: Option<u32>,
+        /// Don't record context switches. Saves their cost in programs that
+        /// switch often, but then nothing says why threads were off CPU
+        #[arg(long)]
+        no_off_cpu: bool,
         /// Command to profile, after `--`
         #[arg(required = true, last = true)]
         command: Vec<String>,
@@ -218,8 +222,17 @@ fn main() -> ExitCode {
             no_symbolize,
             unwind,
             stack_size,
+            no_off_cpu,
             command,
-        } => run_record(output, frequency, no_symbolize, unwind, stack_size, command),
+        } => run_record(
+            output,
+            frequency,
+            no_symbolize,
+            unwind,
+            stack_size,
+            !no_off_cpu,
+            command,
+        ),
         Command::Symbolize { recording } => run_symbolize(&recording),
         Command::Overview {
             recording,
@@ -315,6 +328,7 @@ fn run_record(
     no_symbolize: bool,
     unwind: UnwindArg,
     stack_size: Option<u32>,
+    off_cpu: bool,
     command: Vec<String>,
 ) -> Result<ExitCode> {
     let unwind = match (unwind, stack_size) {
@@ -328,6 +342,7 @@ fn run_record(
         command,
         frequency_hz,
         unwind,
+        off_cpu,
     };
     perf::record(&options, &output)?;
     if no_symbolize {
@@ -688,14 +703,14 @@ fn write_coverage(out: &mut impl Write, coverage: &Coverage) -> io::Result<()> {
     writeln!(out, "  throttle events: {}", coverage.throttle_events)?;
     writeln!(
         out,
-        "  samples with stacks at the depth limit: {}",
-        coverage.samples_at_stack_limit
+        "  stacks at the depth limit: {}",
+        coverage.stacks_at_stack_limit
     )?;
-    if let Some(cut) = coverage.samples_cut_at_stack_copy {
-        writeln!(out, "  samples with stacks cut at the stack copy: {cut}")?;
+    if let Some(cut) = coverage.stacks_cut_at_stack_copy {
+        writeln!(out, "  stacks cut at the stack copy: {cut}")?;
     }
-    if let Some(skipped) = coverage.samples_not_unwound.filter(|&n| n > 0) {
-        writeln!(out, "  samples of 32-bit code, not unwound: {skipped}")?;
+    if let Some(skipped) = coverage.stacks_not_unwound.filter(|&n| n > 0) {
+        writeln!(out, "  stacks of 32-bit code, not unwound: {skipped}")?;
     }
     for missing in &coverage.missing_signals {
         writeln!(
