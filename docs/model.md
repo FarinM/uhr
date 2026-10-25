@@ -13,7 +13,9 @@ A recording is one profiling session of one target. It contains:
   page, existing production data) and whether it was launched or attached.
 - **Streams**: one per collector that ran. Each stream states its collector,
   version, settings (rate, filters), the signals it captured, and its own
-  coverage.
+  coverage. Observations name the stream they came from, while frames,
+  stacks and the process and thread table are shared, so the streams of one
+  target can be read together.
 - **Shared clock**: all observations sit on one monotonic timeline. Collectors
   with their own clocks are aligned by a measured offset.
 - **Process and thread table**: every process and thread seen, with lifetime

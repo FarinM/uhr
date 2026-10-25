@@ -34,7 +34,7 @@ behaviors.
 
 | Tool | Purpose |
 |---|---|
-| `record` | Launch or attach, choose signals, threads and duration. Returns a recording ID and the overview |
+| `record` | Launch or attach, choose signals or collectors, threads and duration. Returns a recording ID, which collectors ran and why, and the overview |
 | `overview` | Time and memory level 0 plus coverage. The first call of any investigation |
 | `query` | Group and filter observations at any level: metric, group_by, filters, time range, top N |
 | `call_paths` | Callers and callees of a selected node |
@@ -44,7 +44,7 @@ behaviors.
 | `benchmark` | Repeated runs of a command with statistics |
 | `sql` | Later: direct SQL over a recording's Parquet files. See [storage](model.md#storage) |
 | `export` | Write Perfetto, Firefox Profiler or speedscope files for human review |
-| `doctor` | What the requested signals need on this target and host |
+| `doctor` | For a target on this host: what each collector would capture, what blocks the rest and how to fix it, and which ones `record` would use |
 
 `call_paths` takes a function by its id, or by a name only one function
 has, and returns two trees from it outward: its callers and its callees. Both

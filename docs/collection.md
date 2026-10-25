@@ -19,9 +19,41 @@ collector must:
 - clean up everything it started (processes, probes, temp files) and report
   when cleanup failed
 
-Collector selection must be deterministic and reported in the result. If the
-preferred collector is unavailable, the result says so. Nothing silently falls
-back to a weaker collector.
+## Collector interface
+
+Collectors sit behind one interface in the core, so adding one touches no
+analysis tool. A collector:
+
+- checks a target on this host: which signals it can capture, what blocks
+  the rest, and how to fix that. `doctor` shows this, and `record` plans with
+  it
+- prepares the launch: environment variables or flags the target needs, such
+  as `PYTHONPERFSUPPORT=1`
+- starts on a running process and, once stopped, writes one stream through a
+  shared recording builder, which interns frames and stacks and keeps the
+  thread table
+
+Behind the interface, a collector can call a Rust crate in uhr's own process
+or run an existing tool and convert its output. Either way it states whether
+its samples have times. A stream without them, such as a tool's stack
+totals, cannot be filtered by time or lined up with other streams, and its
+coverage says so.
+
+## Choosing collectors
+
+`doctor` takes the target and lists, for each collector, what it would
+capture and what it lacks. `record` uses a default for the target, or the
+collectors or signals the caller names. Selection is deterministic, and the
+recording states which collectors ran and why. A named collector that cannot
+run is an error with the fix. Nothing silently falls back to a weaker
+collector.
+
+For now a recording has at most one stack sampler per process: two samplers
+on one process distort each other, and py-spy, for one, pauses its target to
+read it. The model does not depend on this. Observations name their stream,
+frames, stacks and threads are shared across streams, and queries pick data
+by signal, so merging stacks from several samplers can come later without a
+format change.
 
 ## Signals
 
@@ -167,6 +199,12 @@ Most bad profiles come from here, not from the sampler.
 Launch a command, attach to a PID, profile a test or benchmark command, profile
 a service under generated load, a container, or a remote host over ssh. Order
 is not decided.
+
+uhr launches a target itself: it starts the program stopped before any of its
+own code runs, attaches each collector, then lets it go. Launching and
+attaching then share one path, several collectors can watch one target, and
+uhr can stop everything it started, which cancellation needs. Today perf
+still launches the target.
 
 ## Privileges and doctor
 
