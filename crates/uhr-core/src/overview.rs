@@ -4,8 +4,8 @@ use std::path::Path;
 use serde::Serialize;
 
 use crate::coverage::Coverage;
-use crate::filter::Filter;
-use crate::functions::{self, Functions};
+use crate::filter::{self, Filter};
+use crate::functions::Functions;
 use crate::recording::{
     self, Collector, Exit, Mode, OffCPUInterval, Recording, Sample, Signal, Thread, ThreadState,
 };
@@ -137,9 +137,8 @@ pub struct ThreadRow {
 pub enum Error {
     #[error(transparent)]
     Recording(#[from] recording::Error),
-    /// The filter names a function that is not there, or not only once.
     #[error(transparent)]
-    Function(#[from] functions::Error),
+    Filter(#[from] filter::Error),
 }
 
 pub fn overview(dir: &Path, filter: &Filter, top: usize) -> Result<Overview, Error> {
@@ -148,7 +147,8 @@ pub fn overview(dir: &Path, filter: &Filter, top: usize) -> Result<Overview, Err
     run(&recording, symbols.as_ref(), filter, top)
 }
 
-/// `symbols` are only needed to pick out the functions of `filter.under`.
+/// `symbols` are only needed to pick out the functions of `filter.under`
+/// and the syscalls of `filter.syscalls`.
 pub fn run(
     recording: &Recording,
     symbols: Option<&Symbols>,

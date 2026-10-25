@@ -1,7 +1,7 @@
 use serde::Serialize;
 
-use crate::filter::Filter;
-use crate::functions::{self, Functions};
+use crate::filter::{self, Filter};
+use crate::functions::Functions;
 use crate::recording::{Mode, Recording, Signal};
 
 /// The time results weigh stacks by.
@@ -66,7 +66,7 @@ pub(crate) fn stack_times(
     functions: &Functions,
     filter: &Filter,
     metric: Metric,
-) -> Result<StackTimes, functions::Error> {
+) -> Result<StackTimes, filter::Error> {
     let mut times = StackTimes {
         ns: vec![0; recording.stacks.len()],
         user_ns: vec![0; recording.stacks.len()],

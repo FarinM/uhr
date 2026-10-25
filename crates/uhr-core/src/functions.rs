@@ -315,6 +315,10 @@ impl Functions {
         }
     }
 
+    pub(crate) fn symbolized(&self) -> bool {
+        self.symbolized
+    }
+
     pub(crate) fn len(&self) -> usize {
         self.functions.len()
     }

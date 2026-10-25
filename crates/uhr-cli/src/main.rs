@@ -189,6 +189,9 @@ struct FilterArgs {
     /// only one function has
     #[arg(long = "under", value_name = "FUNCTION")]
     under: Vec<String>,
+    /// Only samples in this syscall, by name, as in read
+    #[arg(long = "syscall", value_name = "NAME")]
+    syscalls: Vec<String>,
     /// Only samples from this offset into the recording on, such as 1.5s or
     /// 200ms
     #[arg(long, value_name = "OFFSET", value_parser = parse_offset)]
@@ -226,6 +229,7 @@ impl FilterArgs {
                 })
                 .collect(),
             under: self.under,
+            syscalls: self.syscalls,
             from_ns: self.from,
             to_ns: self.to,
         })
@@ -885,6 +889,12 @@ fn describe_filter(filter: &Filter) -> String {
             .under
             .iter()
             .map(|function| format!("under {function}")),
+    );
+    parts.extend(
+        filter
+            .syscalls
+            .iter()
+            .map(|syscall| format!("syscall {syscall}")),
     );
     if let Some(from) = filter.from_ns {
         parts.push(format!("from {}", seconds(from)));

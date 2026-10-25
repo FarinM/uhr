@@ -5,8 +5,8 @@ use std::path::Path;
 use serde::Serialize;
 
 use crate::coverage::{Coverage, SymbolCoverage};
-use crate::filter::Filter;
-use crate::functions::{self, Function, Functions, SourceLine};
+use crate::filter::{self, Filter};
+use crate::functions::{Function, Functions, SourceLine};
 use crate::metric::{self, Metric, StackTimes, stack_times};
 use crate::recording::{self, Origin, Recording};
 use crate::symbols::Symbols;
@@ -132,9 +132,8 @@ pub struct QueryCoverage {
 pub enum Error {
     #[error(transparent)]
     Recording(#[from] recording::Error),
-    /// The filter names a function that is not there, or not only once.
     #[error(transparent)]
-    Function(#[from] functions::Error),
+    Filter(#[from] filter::Error),
     #[error(transparent)]
     Metric(#[from] metric::Error),
 }

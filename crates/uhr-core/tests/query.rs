@@ -1,4 +1,4 @@
-use uhr_core::filter::Filter;
+use uhr_core::filter::{self, Filter};
 use uhr_core::functions;
 use uhr_core::metric::{self, Metric};
 use uhr_core::query::{
@@ -559,12 +559,16 @@ fn a_function_that_is_not_there_is_an_error() {
     let missing = run(&recording(), Some(&symbols()), &under(&["missing"]));
     assert!(matches!(
         missing,
-        Err(Error::Function(functions::Error::NotFound(_)))
+        Err(Error::Filter(filter::Error::Function(
+            functions::Error::NotFound(_)
+        )))
     ));
     let unsymbolized = run(&recording(), None, &under(&["leaf"]));
     assert!(matches!(
         unsymbolized,
-        Err(Error::Function(functions::Error::NotSymbolized))
+        Err(Error::Filter(filter::Error::Function(
+            functions::Error::NotSymbolized
+        )))
     ));
 }
 
@@ -1026,4 +1030,64 @@ fn off_cpu_time_without_kernel_functions_is_in_an_unknown_syscall() {
     };
     let result = run(&with_off_cpu(recording()), Some(&symbols()), &query).unwrap();
     assert_eq!(syscall_rows(&result), [(None, None, 40)]);
+}
+
+fn in_syscalls(syscalls: &[&str], under: &[&str]) -> Query {
+    Query {
+        filter: Filter {
+            syscalls: syscalls.iter().map(|&s| s.to_owned()).collect(),
+            under: under.iter().map(|&f| f.to_owned()).collect(),
+            ..Filter::default()
+        },
+        ..query(10)
+    }
+}
+
+#[test]
+fn filters_by_the_syscall_on_the_stack() {
+    let (recording, symbols) = with_syscalls();
+    let time_ns = |syscalls: &[&str], under: &[&str]| {
+        run(&recording, Some(&symbols), &in_syscalls(syscalls, under))
+            .unwrap()
+            .time_ns
+    };
+    assert_eq!(time_ns(&["read"], &[]), 20);
+    assert_eq!(time_ns(&["read", "futex"], &[]), 24);
+    assert_eq!(time_ns(&["futex"], &["futex_wait"]), 4);
+    assert_eq!(time_ns(&["read"], &["futex_wait"]), 0);
+
+    match run(&recording, Some(&symbols), &in_syscalls(&["futx"], &[])) {
+        Err(Error::Filter(filter::Error::NoSuchSyscall { name, known })) => {
+            assert_eq!(name, "futx");
+            assert_eq!(known, ["futex", "read"]);
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(matches!(
+        run(&recording, None, &in_syscalls(&["read"], &[])),
+        Err(Error::Filter(filter::Error::Function(
+            functions::Error::NotSymbolized
+        )))
+    ));
+    let mut unnamed = recording.clone();
+    unnamed.manifest.kernel_symbols = KernelSymbols::Unavailable {
+        reason: "kptr_restrict".into(),
+    };
+    assert!(matches!(
+        run(&unnamed, Some(&symbols), &in_syscalls(&["read"], &[])),
+        Err(Error::Filter(filter::Error::NoKernelNames(_)))
+    ));
+}
+
+#[test]
+fn off_cpu_time_without_a_stack_is_in_no_syscall() {
+    let (mut recording, symbols) = with_syscalls();
+    recording = with_off_cpu(recording);
+    recording.off_cpu[1].stack = Some(3);
+    let query = Query {
+        metric: Metric::OffCPU,
+        ..in_syscalls(&["read"], &[])
+    };
+    let result = run(&recording, Some(&symbols), &query).unwrap();
+    assert_eq!((result.off_cpu_intervals, result.time_ns), (1, 5));
 }

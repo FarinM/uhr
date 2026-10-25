@@ -3,7 +3,8 @@ use std::collections::{HashMap, HashSet};
 use serde::Serialize;
 
 use crate::functions::{self, Functions};
-use crate::recording::{Mode, OffCPUInterval, Recording, Sample};
+use crate::recording::{KernelSymbols, Mode, OffCPUInterval, Recording, Sample};
+use crate::syscalls::{self, InSyscall};
 use crate::threads::ThreadNames;
 
 /// Which samples and off-CPU intervals a result covers. An empty list
@@ -23,11 +24,30 @@ pub struct Filter {
     /// Functions, by id or by a name only one function has. A sample or
     /// off-CPU interval passes if its stack contains one of them.
     pub under: Vec<String>,
+    /// Syscalls by name, as `read`. A sample or off-CPU interval passes if
+    /// its stack is in one of them.
+    pub syscalls: Vec<String>,
     /// Offset from the recording start, inclusive. Off-CPU intervals are
     /// cut to the time range.
     pub from_ns: Option<u64>,
     /// Offset from the recording start, exclusive.
     pub to_ns: Option<u64>,
+}
+
+/// Why a filter could not be applied.
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    /// `under` names a function that is not there, or not only once, or
+    /// the filter needs names the recording does not have yet.
+    #[error(transparent)]
+    Function(#[from] functions::Error),
+    #[error("the recording has no kernel function names, so its syscalls are unknown: {0}")]
+    NoKernelNames(String),
+    #[error(
+        "no stack in the recording is in the syscall {name:?}. Its stacks are in: {}",
+        if .known.is_empty() { "none".to_owned() } else { .known.join(", ") }
+    )]
+    NoSuchSyscall { name: String, known: Vec<String> },
 }
 
 impl Filter {
@@ -36,13 +56,14 @@ impl Filter {
     }
 
     /// Fails if `under` names a function that is not in the stacks, or a
-    /// name several functions share.
+    /// name several functions share, or `syscalls` a syscall no stack is
+    /// in.
     pub(crate) fn samples<'a>(
         &'a self,
         recording: &'a Recording,
         functions: &Functions,
-    ) -> Result<impl Iterator<Item = &'a Sample> + 'a, functions::Error> {
-        let under = self.stacks_under(recording, functions)?;
+    ) -> Result<impl Iterator<Item = &'a Sample> + 'a, Error> {
+        let stacks = self.stacks(recording, functions)?;
         let mut names = (!self.thread_names.is_empty()).then(|| NameMatcher::new(recording));
         let start_ns = recording.manifest.start_ns;
         Ok(recording.samples.iter().filter(move |sample| {
@@ -50,9 +71,9 @@ impl Filter {
                 && (self.tids.is_empty() || self.tids.contains(&sample.tid))
                 && (self.modes.is_empty() || self.modes.contains(&sample.mode))
                 && self.in_time_range(sample.time_ns, start_ns)
-                && under
+                && stacks
                     .as_ref()
-                    .is_none_or(|under| under[sample.stack as usize])
+                    .is_none_or(|stacks| stacks[sample.stack as usize])
                 && names
                     .as_mut()
                     .is_none_or(|names| names.matches(self, sample.pid, sample.tid, sample.time_ns))
@@ -65,8 +86,8 @@ impl Filter {
         &'a self,
         recording: &'a Recording,
         functions: &Functions,
-    ) -> Result<impl Iterator<Item = (&'a OffCPUInterval, u64)> + 'a, functions::Error> {
-        let under = self.stacks_under(recording, functions)?;
+    ) -> Result<impl Iterator<Item = (&'a OffCPUInterval, u64)> + 'a, Error> {
+        let stacks = self.stacks(recording, functions)?;
         let mut names = (!self.thread_names.is_empty()).then(|| NameMatcher::new(recording));
         let range = self.time_range(recording.manifest.start_ns);
         Ok(recording.off_cpu.iter().filter_map(move |interval| {
@@ -76,14 +97,74 @@ impl Filter {
                 && start < end
                 && (self.pids.is_empty() || self.pids.contains(&interval.pid))
                 && (self.tids.is_empty() || self.tids.contains(&interval.tid))
-                && under
-                    .as_ref()
-                    .is_none_or(|under| interval.stack.is_some_and(|stack| under[stack as usize]))
+                && stacks.as_ref().is_none_or(|stacks| {
+                    interval.stack.is_some_and(|stack| stacks[stack as usize])
+                })
                 && names.as_mut().is_none_or(|names| {
                     names.matches(self, interval.pid, interval.tid, interval.start_ns)
                 });
             passes.then(|| (interval, end - start))
         }))
+    }
+
+    /// Whether each stack passes `under` and `syscalls`. `None` without
+    /// either.
+    fn stacks(
+        &self,
+        recording: &Recording,
+        functions: &Functions,
+    ) -> Result<Option<Vec<bool>>, Error> {
+        let under = self.stacks_under(recording, functions)?;
+        let in_syscalls = self.stacks_in_syscalls(recording, functions)?;
+        Ok(match (under, in_syscalls) {
+            (Some(under), Some(in_syscalls)) => {
+                Some(under.iter().zip(&in_syscalls).map(|(a, b)| a & b).collect())
+            }
+            (under, in_syscalls) => under.or(in_syscalls),
+        })
+    }
+
+    /// Whether each stack is in a syscall of `syscalls`. `None` without
+    /// `syscalls`.
+    fn stacks_in_syscalls(
+        &self,
+        recording: &Recording,
+        functions: &Functions,
+    ) -> Result<Option<Vec<bool>>, Error> {
+        if self.syscalls.is_empty() {
+            return Ok(None);
+        }
+        if !functions.symbolized() {
+            return Err(functions::Error::NotSymbolized.into());
+        }
+        if let KernelSymbols::Unavailable { reason } = &recording.manifest.kernel_symbols {
+            return Err(Error::NoKernelNames(reason.clone()));
+        }
+        let in_syscall = syscalls::of_stacks(recording, functions);
+        let mut known: Vec<&str> = in_syscall
+            .iter()
+            .filter_map(|s| match s {
+                Some(InSyscall::Named(name)) => Some(*name),
+                _ => None,
+            })
+            .collect();
+        known.sort_unstable();
+        known.dedup();
+        if let Some(name) = self.syscalls.iter().find(|s| !known.contains(&s.as_str())) {
+            return Err(Error::NoSuchSyscall {
+                name: name.clone(),
+                known: known.iter().map(|&s| s.to_owned()).collect(),
+            });
+        }
+        Ok(Some(
+            in_syscall
+                .iter()
+                .map(|s| match s {
+                    Some(InSyscall::Named(name)) => self.syscalls.iter().any(|w| w == name),
+                    _ => false,
+                })
+                .collect(),
+        ))
     }
 
     /// Whether each stack contains a function of `under`. `None` without

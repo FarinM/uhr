@@ -83,7 +83,9 @@ shows what the threads waited in.
 
 A function picked the same way also works as a filter: `under` keeps the
 samples whose stack contains it. One recording can then be split by the code
-that led to the time, such as one benchmark of several in a run.
+that led to the time, such as one benchmark of several in a run. A
+`syscall` filter keeps the samples and off-CPU intervals in a syscall of that
+name, so grouping them by function shows the code that made it.
 
 Moving across levels on one recording:
 

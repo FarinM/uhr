@@ -4,7 +4,7 @@ use std::path::Path;
 use serde::Serialize;
 
 use crate::coverage::{Coverage, SymbolCoverage};
-use crate::filter::Filter;
+use crate::filter::{self, Filter};
 use crate::functions::{self, Function, Functions};
 use crate::metric::{self, Metric, stack_times};
 use crate::recording::{self, Collector, Origin, Recording, Unwinding};
@@ -28,6 +28,8 @@ pub enum Error {
     Recording(#[from] recording::Error),
     #[error(transparent)]
     Function(#[from] functions::Error),
+    #[error(transparent)]
+    Filter(#[from] filter::Error),
     #[error(transparent)]
     Metric(#[from] metric::Error),
 }
