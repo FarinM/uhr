@@ -12,8 +12,8 @@ pub(crate) enum InSyscall<'a> {
     /// interrupt from user space, or the start of a thread.
     Outside,
     /// The stack does not show how the kernel was entered: its kernel
-    /// functions have no names, it may have been cut short, or the
-    /// architecture's entries are not known.
+    /// functions have no names, it may have been cut short, or uhr does not
+    /// know the kernel's entries.
     Unknown,
 }
 
@@ -30,16 +30,20 @@ enum Mark<'a> {
 /// The syscall each stack is in. `None` for a stack without kernel
 /// functions, which is outside syscalls only where the CPU was in user
 /// mode: a virtual machine's guest code, for one, runs inside a syscall
-/// with no frames in the host's kernel.
+/// with no frames in the host's kernel. Only Linux's kernel functions are
+/// known.
 pub(crate) fn of_stacks<'a>(
     recording: &Recording,
     functions: &'a Functions,
 ) -> Vec<Option<InSyscall<'a>>> {
+    let linux = recording.manifest.platform.os == "linux";
     let marks: Vec<Option<Mark>> = (0..functions.len() as u32)
         .map(|id| {
             let function = functions.get(id);
-            (function.origin == Origin::Kernel)
-                .then(|| function.name.as_deref().map_or(Mark::Other, mark))
+            (function.origin == Origin::Kernel).then(|| match function.name.as_deref() {
+                Some(name) if linux => mark(name),
+                _ => Mark::Other,
+            })
         })
         .collect();
     // x86 enters the kernel the same way for a fault or an interrupt in

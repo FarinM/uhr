@@ -13,6 +13,10 @@ fn example() -> Recording {
     Recording {
         manifest: Manifest {
             format_version: FORMAT_VERSION,
+            platform: Platform {
+                os: "linux".into(),
+                arch: "x86_64".into(),
+            },
             target: Target {
                 command: vec!["./app".into(), "--fast".into()],
                 launched: true,

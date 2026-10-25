@@ -6,6 +6,7 @@ pub const FORMAT_VERSION: u32 = 0;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Manifest {
     pub format_version: u32,
+    pub platform: Platform,
     pub target: Target,
     pub clock: Clock,
     /// When the capture started and stopped: the first and last event from
@@ -14,6 +15,15 @@ pub struct Manifest {
     pub end_ns: Option<u64>,
     pub streams: Vec<Stream>,
     pub kernel_symbols: KernelSymbols,
+}
+
+/// The system the target ran on, which says how to read what was recorded,
+/// such as the names of its kernel's functions. As Rust names them: `linux`
+/// and `x86_64`, for one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Platform {
+    pub os: String,
+    pub arch: String,
 }
 
 /// Whether the names of kernel code were saved while recording, the only

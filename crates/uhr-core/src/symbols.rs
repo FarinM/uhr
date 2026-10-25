@@ -761,6 +761,7 @@ fn chain(error: &dyn std::error::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::recording::{Clock, FORMAT_VERSION, Frame, Manifest, Platform, Target};
     use std::process::Command;
 
     fn compile(dir: &Path, filename: &str, name: &str, value: u32) -> std::path::PathBuf {
@@ -1026,10 +1027,13 @@ mod tests {
     }
 
     fn recording(frames: usize) -> Recording {
-        use crate::recording::{Clock, FORMAT_VERSION, Frame, KernelSymbols, Manifest, Target};
         Recording {
             manifest: Manifest {
                 format_version: FORMAT_VERSION,
+                platform: Platform {
+                    os: "linux".into(),
+                    arch: "x86_64".into(),
+                },
                 target: Target {
                     command: vec!["app".into()],
                     launched: true,

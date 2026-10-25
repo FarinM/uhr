@@ -40,6 +40,10 @@ fn recording() -> Recording {
     Recording {
         manifest: Manifest {
             format_version: FORMAT_VERSION,
+            platform: Platform {
+                os: "linux".into(),
+                arch: "x86_64".into(),
+            },
             target: Target {
                 command: vec!["app".into()],
                 launched: true,
@@ -998,7 +1002,7 @@ fn with_syscalls() -> (Recording, Symbols) {
 
 #[test]
 fn groups_by_the_syscall_on_the_stack() {
-    let (recording, symbols) = with_syscalls();
+    let (mut recording, symbols) = with_syscalls();
     let query = Query {
         group_by: GroupBy::Syscall,
         ..query(10)
@@ -1016,11 +1020,14 @@ fn groups_by_the_syscall_on_the_stack() {
     );
 
     // Without names, any kernel function could be a syscall's.
+    let unknown = [(None, None, 44), (Some(false), None, 10)];
     let result = run(&recording, None, &query).unwrap();
-    assert_eq!(
-        syscall_rows(&result),
-        [(None, None, 44), (Some(false), None, 10)]
-    );
+    assert_eq!(syscall_rows(&result), unknown);
+
+    // Only Linux's functions are known.
+    recording.manifest.platform.os = "freebsd".into();
+    let result = run(&recording, Some(&symbols), &query).unwrap();
+    assert_eq!(syscall_rows(&result), unknown);
 }
 
 /// Threads go off CPU in the kernel, so a stack without kernel functions

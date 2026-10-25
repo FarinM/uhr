@@ -56,12 +56,18 @@ impl<'a> ThreadNames<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::recording::{Clock, FORMAT_VERSION, KernelSymbols, Manifest, Target, ThreadName};
+    use crate::recording::{
+        Clock, FORMAT_VERSION, KernelSymbols, Manifest, Platform, Target, ThreadName,
+    };
 
     fn recording(names: Vec<ThreadName>) -> Recording {
         Recording {
             manifest: Manifest {
                 format_version: FORMAT_VERSION,
+                platform: Platform {
+                    os: "linux".into(),
+                    arch: "x86_64".into(),
+                },
                 target: Target {
                     command: vec!["app".into()],
                     launched: true,

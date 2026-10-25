@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::env;
 use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
@@ -19,8 +20,8 @@ use super::{Error, Result, io_error};
 use crate::kallsyms::{self, Kallsyms};
 use uhr_core::recording::{
     Clock, Collector, Exit, FORMAT_VERSION, Frame, KERNEL, KernelSymbols, Manifest, Mapping,
-    MissingSignal, Mode, OffCPUInterval, Origin, Recording, Sample, Signal, Stream, StreamCoverage,
-    Target, Thread, ThreadName, ThreadState, Unwinding,
+    MissingSignal, Mode, OffCPUInterval, Origin, Platform, Recording, Sample, Signal, Stream,
+    StreamCoverage, Target, Thread, ThreadName, ThreadState, Unwinding,
 };
 
 pub(super) struct Input<'a> {
@@ -320,6 +321,10 @@ pub(super) fn convert(input: Input) -> Result<Recording> {
     Ok(Recording {
         manifest: Manifest {
             format_version: FORMAT_VERSION,
+            platform: Platform {
+                os: env::consts::OS.into(),
+                arch: env::consts::ARCH.into(),
+            },
             target: Target {
                 command: input.command.to_vec(),
                 launched: input.launched_pid.is_some(),
