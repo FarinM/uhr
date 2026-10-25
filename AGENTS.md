@@ -35,12 +35,18 @@ and the code covers only part of the design.
 ## Building and testing
 
 - `cargo build`, `cargo fmt --check`, `cargo clippy --all-targets` and
-  `cargo test`.
+  `cargo test`. `cargo check --workspace --all-targets --target
+  x86_64-pc-windows-gnu` checks that what is not for Linux builds elsewhere;
+  its C dependencies need a MinGW compiler.
 - The end-to-end tests in `crates/uhr-cli/tests` run perf and a C compiler on
   the host. `uhr doctor` shows what is missing.
-- `uhr-core` holds the model, collectors, symbol resolution and queries.
-  `uhr-cli` is the `uhr` binary. Put new tools in the core, so the CLI and a
-  later MCP server share them.
+- `uhr-core` holds the model, the recording format, symbol resolution and
+  queries, and builds on every platform: nothing in it depends on Linux, so a
+  recording can be read anywhere. `uhr-linux` records on Linux: perf,
+  launching and attaching, kernel symbols and the Linux `doctor` checks.
+  Elsewhere it is empty. `uhr-cli` is the `uhr` binary. Put new tools in the
+  core, so the CLI and a later MCP server share them, and code for one
+  platform in that platform's crate.
 - Core returns typed errors, one `thiserror` enum per module, so callers can
   tell failures apart. Only the CLI uses `anyhow`, to print them.
 - Diagnostics go through `tracing` to stderr. Command results go to stdout

@@ -2338,6 +2338,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uhr-core",
+ "uhr-linux",
 ]
 
 [[package]]
@@ -2350,13 +2351,10 @@ dependencies = [
  "arrow-schema",
  "arrow-select",
  "crc32fast",
- "framehop",
  "gimli 0.31.1",
- "linux-perf-data 0.13.0",
  "lzma-rs",
  "memmap2",
  "parquet",
- "rustix",
  "serde",
  "serde_json",
  "stable_deref_trait",
@@ -2364,6 +2362,21 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "wholesym",
+]
+
+[[package]]
+name = "uhr-linux"
+version = "0.1.0"
+dependencies = [
+ "framehop",
+ "gimli 0.31.1",
+ "linux-perf-data 0.13.0",
+ "rustix",
+ "tempfile",
+ "thiserror",
+ "tracing",
+ "uhr-core",
  "wholesym",
 ]
 

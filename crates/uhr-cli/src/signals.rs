@@ -2,7 +2,7 @@ use std::io;
 use std::mem::MaybeUninit;
 use std::ptr;
 
-use uhr_core::launch::Interrupts;
+use uhr_linux::launch::Interrupts;
 
 /// A signal handler can only reach statics.
 pub static INTERRUPTS: Interrupts = Interrupts::new();

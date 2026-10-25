@@ -17,7 +17,7 @@ use linux_perf_data::{PerfFileReader, PerfFileRecord};
 use super::unwind::Unwinding as UserUnwinding;
 use super::{Error, Result, io_error};
 use crate::kallsyms::{self, Kallsyms};
-use crate::recording::{
+use uhr_core::recording::{
     Clock, Collector, Exit, FORMAT_VERSION, Frame, KERNEL, KernelSymbols, Manifest, Mapping,
     MissingSignal, Mode, OffCPUInterval, Origin, Recording, Sample, Signal, Stream, StreamCoverage,
     Target, Thread, ThreadName, ThreadState, Unwinding,

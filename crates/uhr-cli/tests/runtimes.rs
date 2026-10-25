@@ -1,5 +1,6 @@
 //! End to end: needs perf, and Python 3.12 or later or Node. The test of a
 //! runtime that is missing checks nothing.
+#![cfg(target_os = "linux")]
 
 mod common;
 

@@ -2,6 +2,7 @@
 //! /proc/kallsyms to show the kernel's addresses; where it hides them,
 //! these tests check that results say why. `uhr doctor` shows what is
 //! missing.
+#![cfg(target_os = "linux")]
 
 mod common;
 

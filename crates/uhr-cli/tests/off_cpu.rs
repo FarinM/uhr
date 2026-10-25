@@ -2,6 +2,7 @@
 //! sampling, and their kernel names /proc/kallsyms to show the kernel's
 //! addresses; where those are missing, these tests check what is left.
 //! `uhr doctor` shows what is missing.
+#![cfg(target_os = "linux")]
 
 mod common;
 

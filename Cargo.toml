@@ -9,6 +9,7 @@ publish = false
 
 [workspace.dependencies]
 uhr-core = { path = "crates/uhr-core" }
+uhr-linux = { path = "crates/uhr-linux" }
 addr2line = { version = "0.24", default-features = false, features = ["std", "rustc-demangle", "cpp_demangle"] }
 anyhow = "1.0"
 arrow-array = "60"

@@ -22,7 +22,8 @@ collector must:
 ## Collector interface
 
 Collectors sit behind one interface in the core, so adding one touches no
-analysis tool. A collector:
+analysis tool. Each platform's collectors live in a crate of their own, such
+as `uhr-linux`, so the core builds everywhere. A collector:
 
 - checks a target on this host: which signals it can capture, what blocks
   the rest, and how to fix that. `doctor` shows this, and `record` plans with

@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader};
 
-use crate::recording::{Frame, KERNEL, KernelSymbol, Mapping, Origin};
+use uhr_core::recording::{Frame, KERNEL, KernelSymbol, Mapping, Origin};
 
 const KALLSYMS: &str = "/proc/kallsyms";
 const KPTR_RESTRICT: &str = "/proc/sys/kernel/kptr_restrict";

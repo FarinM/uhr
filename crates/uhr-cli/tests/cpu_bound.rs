@@ -1,5 +1,6 @@
 //! End to end: needs perf and a C compiler. `uhr doctor` shows what is
 //! missing.
+#![cfg(target_os = "linux")]
 
 mod common;
 

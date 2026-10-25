@@ -26,8 +26,10 @@ use crate::doctor;
 use crate::kallsyms::Kallsyms;
 use crate::launch::{self, Held, Interrupts, Process, monotonic_ns};
 use crate::perf_map;
-use crate::recording::{self, Collector, Exit, Recording};
 use crate::runtimes;
+use uhr_core::doctor::Status;
+use uhr_core::perf_map::name_jit_frames;
+use uhr_core::recording::{self, Collector, Exit, Recording};
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -163,7 +165,7 @@ pub fn record(options: &RecordOptions, interrupts: &Interrupts, out: &Path) -> R
     }
     if let Unwind::Dwarf { .. } = options.unwind {
         let check = doctor::check_dwarf_unwinding();
-        if check.status != doctor::Status::Ok {
+        if check.status != Status::Ok {
             return Err(Error::Blocked {
                 detail: check.detail,
                 fix: check.fix,
@@ -276,7 +278,12 @@ pub fn record(options: &RecordOptions, interrupts: &Interrupts, out: &Path) -> R
         Ready::Attach { owner, .. } => owner,
     };
     let owners = |pid| map_owners.of(pid, started_as);
-    let named = perf_map::name_jit_frames(&mut recording, since_for, owners);
+    let named = name_jit_frames(&mut recording, |pid| {
+        perf_map::read(pid, since_for(pid), &owners(pid)).unwrap_or_else(|error| {
+            warn!(pid, %error, "reading the perf map");
+            None
+        })
+    });
     if !named.is_empty() {
         info!(
             processes = named.len(),

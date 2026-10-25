@@ -1,6 +1,7 @@
 //! Agents pipe output into `head` and the like, which stop reading early.
 //! The tests use a pipe whose read end is already closed: a closed fd would
 //! not do, because Rust reopens closed stdio on /dev/null at startup.
+#![cfg(target_os = "linux")]
 
 mod common;
 

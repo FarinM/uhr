@@ -1,8 +1,10 @@
+#[cfg(target_os = "linux")]
 mod signals;
 
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+#[cfg(target_os = "linux")]
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -11,19 +13,23 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::LevelFilter;
 use uhr_core::call_paths::{self, CallPaths, Node, Omitted};
 use uhr_core::coverage::{Coverage, SymbolCoverage};
-use uhr_core::doctor::{self, Report, Status};
+#[cfg(not(target_os = "linux"))]
+use uhr_core::doctor::Check;
+use uhr_core::doctor::{Report, Status};
 use uhr_core::filter::Filter;
 use uhr_core::functions::Function;
 use uhr_core::metric::Metric;
 use uhr_core::overview::{self, CPUTime, Overview};
-use uhr_core::perf::{self, RecordOptions, Target, Unwind};
 use uhr_core::query::{
     self, FunctionRow, GroupBy, ModuleRow, Query, QueryResult, Rows, SyscallRow,
 };
 use uhr_core::recording::{Exit, Mode};
 use uhr_core::symbols;
 
+#[cfg(target_os = "linux")]
 use signals::{Handlers, INTERRUPTS};
+#[cfg(target_os = "linux")]
+use uhr_linux::perf::{self, RecordOptions, Target, Unwind};
 
 #[derive(Parser)]
 #[command(
@@ -45,46 +51,7 @@ enum Command {
     },
     /// Record a command, or a running process, with perf and write a
     /// recording
-    Record {
-        /// Directory for the recording. Must not exist
-        #[arg(short, long)]
-        output: PathBuf,
-        /// Samples per second
-        #[arg(short = 'F', long, default_value_t = 999, value_parser = clap::value_parser!(u64).range(1..))]
-        frequency: u64,
-        /// Skip resolving function names. Run `uhr symbolize` later
-        #[arg(long)]
-        no_symbolize: bool,
-        /// How to walk user stacks. `dwarf` needs no frame pointers and finds
-        /// callers that frame pointers miss, but copies part of the stack
-        /// with every sample
-        #[arg(long, value_enum, default_value_t = UnwindArg::Fp)]
-        unwind: UnwindArg,
-        /// Bytes of user stack to copy with each sample, for `--unwind
-        /// dwarf`. Deeper stacks lose their outer callers [default: 32768]
-        #[arg(long, value_name = "BYTES", value_parser = clap::value_parser!(u32).range(8..=65528))]
-        stack_size: Option<u32>,
-        /// Don't record context switches. Saves their cost in programs that
-        /// switch often, but then nothing says why threads were off CPU
-        #[arg(long)]
-        no_off_cpu: bool,
-        /// Don't set the variables that make runtimes, such as Python 3.12
-        /// and later and Node, name the code they compile. That costs them
-        /// a little time, and without it their functions have no names
-        #[arg(long, conflicts_with = "pid")]
-        no_runtime_support: bool,
-        /// Record this running process, and the threads and processes it
-        /// starts, rather than a command. It is not signalled
-        #[arg(long, conflicts_with = "command")]
-        pid: Option<u32>,
-        /// With --pid, stop after this long, such as 10s or 500ms, rather
-        /// than at Ctrl-C or when the process exits
-        #[arg(long, value_name = "DURATION", requires = "pid", value_parser = parse_offset)]
-        duration: Option<u64>,
-        /// Command to profile, after `--`
-        #[arg(required_unless_present = "pid", last = true)]
-        command: Vec<String>,
-    },
+    Record(RecordArgs),
     /// Resolve function names in a recording against the files on this machine
     Symbolize { recording: PathBuf },
     /// Show CPU time by mode and time off CPU, by process and thread, against
@@ -144,6 +111,49 @@ enum Command {
     },
 }
 
+#[derive(Args)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+struct RecordArgs {
+    /// Directory for the recording. Must not exist
+    #[arg(short, long)]
+    output: PathBuf,
+    /// Samples per second
+    #[arg(short = 'F', long, default_value_t = 999, value_parser = clap::value_parser!(u64).range(1..))]
+    frequency: u64,
+    /// Skip resolving function names. Run `uhr symbolize` later
+    #[arg(long)]
+    no_symbolize: bool,
+    /// How to walk user stacks. `dwarf` needs no frame pointers and finds
+    /// callers that frame pointers miss, but copies part of the stack
+    /// with every sample
+    #[arg(long, value_enum, default_value_t = UnwindArg::Fp)]
+    unwind: UnwindArg,
+    /// Bytes of user stack to copy with each sample, for `--unwind
+    /// dwarf`. Deeper stacks lose their outer callers [default: 32768]
+    #[arg(long, value_name = "BYTES", value_parser = clap::value_parser!(u32).range(8..=65528))]
+    stack_size: Option<u32>,
+    /// Don't record context switches. Saves their cost in programs that
+    /// switch often, but then nothing says why threads were off CPU
+    #[arg(long)]
+    no_off_cpu: bool,
+    /// Don't set the variables that make runtimes, such as Python 3.12
+    /// and later and Node, name the code they compile. That costs them
+    /// a little time, and without it their functions have no names
+    #[arg(long, conflicts_with = "pid")]
+    no_runtime_support: bool,
+    /// Record this running process, and the threads and processes it
+    /// starts, rather than a command. It is not signalled
+    #[arg(long, conflicts_with = "command")]
+    pid: Option<u32>,
+    /// With --pid, stop after this long, such as 10s or 500ms, rather
+    /// than at Ctrl-C or when the process exits
+    #[arg(long, value_name = "DURATION", requires = "pid", value_parser = parse_offset)]
+    duration: Option<u64>,
+    /// Command to profile, after `--`
+    #[arg(required_unless_present = "pid", last = true)]
+    command: Vec<String>,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum UnwindArg {
     /// Frame pointers
@@ -154,6 +164,7 @@ enum UnwindArg {
 
 /// Covers most C, C++ and Rust stacks, including deep async ones, at half
 /// the cost of perf's maximum.
+#[cfg(target_os = "linux")]
 const STACK_COPY_BYTES: u32 = 32 * 1024;
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -275,34 +286,7 @@ fn main() -> ExitCode {
     init_logging();
     let result = match cli.command {
         Command::Doctor { json } => run_doctor(json),
-        Command::Record {
-            output,
-            frequency,
-            no_symbolize,
-            unwind,
-            stack_size,
-            no_off_cpu,
-            no_runtime_support,
-            pid,
-            duration,
-            command,
-        } => unwind_of(unwind, stack_size).and_then(|unwind| {
-            let target = match pid {
-                Some(pid) => Target::Attach {
-                    pid,
-                    duration: duration.map(Duration::from_nanos),
-                },
-                None => Target::Launch(command),
-            };
-            let options = RecordOptions {
-                target,
-                frequency_hz: frequency,
-                unwind,
-                off_cpu: !no_off_cpu,
-                runtime_support: !no_runtime_support,
-            };
-            run_record(&output, &options, no_symbolize)
-        }),
+        Command::Record(args) => run_record(args),
         Command::Symbolize { recording } => run_symbolize(&recording),
         Command::Overview {
             recording,
@@ -370,7 +354,7 @@ fn write_output(write: impl FnOnce(&mut io::StdoutLock) -> io::Result<()>) -> Re
 }
 
 fn run_doctor(json: bool) -> Result<ExitCode> {
-    let report = doctor::check_perf();
+    let report = host_report();
     if json {
         let text = serde_json::to_string_pretty(&report)?;
         write_output(|out| writeln!(out, "{text}"))?;
@@ -382,6 +366,26 @@ fn run_doctor(json: bool) -> Result<ExitCode> {
     } else {
         ExitCode::SUCCESS
     })
+}
+
+#[cfg(target_os = "linux")]
+fn host_report() -> Report {
+    uhr_linux::doctor::check_perf()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn host_report() -> Report {
+    Report {
+        checks: vec![Check {
+            status: Status::Blocked,
+            detail: format!(
+                "uhr records on Linux only, so far, not on {}",
+                std::env::consts::OS
+            ),
+            fix: None,
+        }],
+        notes: Vec::new(),
+    }
 }
 
 fn write_report(out: &mut impl Write, report: &Report) -> io::Result<()> {
@@ -402,25 +406,42 @@ fn write_report(out: &mut impl Write, report: &Report) -> io::Result<()> {
     Ok(())
 }
 
-fn unwind_of(unwind: UnwindArg, stack_size: Option<u32>) -> Result<Unwind> {
-    Ok(match (unwind, stack_size) {
+#[cfg(target_os = "linux")]
+fn run_record(args: RecordArgs) -> Result<ExitCode> {
+    let unwind = match (args.unwind, args.stack_size) {
         (UnwindArg::Fp, None) => Unwind::FramePointers,
         (UnwindArg::Fp, Some(_)) => bail!("--stack-size only applies to --unwind dwarf"),
         (UnwindArg::Dwarf, stack_size) => Unwind::Dwarf {
             stack_bytes: stack_size.unwrap_or(STACK_COPY_BYTES),
         },
-    })
-}
-
-fn run_record(output: &Path, options: &RecordOptions, no_symbolize: bool) -> Result<ExitCode> {
+    };
+    let target = match args.pid {
+        Some(pid) => Target::Attach {
+            pid,
+            duration: args.duration.map(Duration::from_nanos),
+        },
+        None => Target::Launch(args.command),
+    };
+    let options = RecordOptions {
+        target,
+        frequency_hz: args.frequency,
+        unwind,
+        off_cpu: !args.no_off_cpu,
+        runtime_support: !args.no_runtime_support,
+    };
     let handlers = Handlers::install().context("installing the signal handlers")?;
-    let recorded = perf::record(options, &INTERRUPTS, output);
+    let recorded = perf::record(&options, &INTERRUPTS, &args.output);
     drop(handlers);
     recorded?;
-    if no_symbolize {
+    if args.no_symbolize {
         return Ok(ExitCode::SUCCESS);
     }
-    run_symbolize(output)
+    run_symbolize(&args.output)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn run_record(_: RecordArgs) -> Result<ExitCode> {
+    bail!("uhr records on Linux only, so far")
 }
 
 fn run_symbolize(recording: &Path) -> Result<ExitCode> {

@@ -18,7 +18,7 @@ use wholesym::samply_symbols::object::{
 };
 use wholesym::samply_symbols::relative_address_base;
 
-use crate::recording::Mapping;
+use uhr_core::recording::Mapping;
 
 type Data = Arc<[u8]>;
 
