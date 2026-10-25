@@ -3,12 +3,13 @@ use std::io::{self, Read};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
 
 use rustix::io::Errno;
 use rustix::pipe::{PipeFlags, pipe_with};
+use rustix::process::Signal;
 
 /// Why a target could not be started.
 #[derive(Debug, thiserror::Error)]
@@ -156,6 +157,7 @@ impl Held {
 pub struct Interrupts {
     count: AtomicU32,
     first_ns: AtomicU64,
+    sent: AtomicI32,
 }
 
 impl Interrupts {
@@ -163,10 +165,13 @@ impl Interrupts {
         Self {
             count: AtomicU32::new(0),
             first_ns: AtomicU64::new(0),
+            sent: AtomicI32::new(0),
         }
     }
 
-    /// Async-signal-safe: it only reads the clock and changes atomics.
+    /// An interrupt the target got too, as a terminal's Ctrl-C reaches the
+    /// whole process group. Async-signal-safe: it only reads the clock and
+    /// changes atomics.
     pub fn interrupt(&self) {
         let _ =
             self.first_ns
@@ -174,8 +179,20 @@ impl Interrupts {
         self.count.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// An interrupt that another process sent to uhr alone, by the number
+    /// of its signal, which is passed on to the target. Async-signal-safe.
+    pub fn interrupt_sent(&self, signal: i32) {
+        self.interrupt();
+        self.sent.store(signal, Ordering::Relaxed);
+    }
+
     pub(crate) fn count(&self) -> u32 {
         self.count.load(Ordering::Relaxed)
+    }
+
+    /// The signal of the last one another process sent, once.
+    pub(crate) fn take_sent(&self) -> Option<Signal> {
+        Signal::from_named_raw(self.sent.swap(0, Ordering::Relaxed))
     }
 
     /// When the first came, on CLOCK_MONOTONIC.

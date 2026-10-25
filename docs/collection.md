@@ -138,13 +138,13 @@ Debian and Ubuntu its package must match the running kernel.
   straight through. The target has uhr's stderr itself, as it would without
   uhr.
 - The capture ends when the target exits; processes it leaves running are
-  not followed after that. Terminal Ctrl-C reaches uhr and the target: uhr
-  stops perf at once and counts the interrupt as the end of the capture, then
-  waits for the target, so the recording has its exit status. A second
-  interrupt kills the target. If perf stops first, uhr asks the target to
-  stop with SIGTERM. Signals sent to uhr alone don't reach the target yet:
-  SIGTERM ends uhr without writing the recording, and SIGINT waits for a
-  target that never got it.
+  not followed after that. A SIGINT or SIGTERM ends it too: uhr stops perf at
+  once and counts the signal as the end of the capture, then waits for the
+  target, so the recording has its exit status. Terminal Ctrl-C reaches the
+  target itself, and uhr passes on a signal another process sent it. That
+  includes one sent to uhr's whole process group, which the target then gets
+  twice. A second interrupt kills the target. If perf stops first, uhr asks
+  the target to stop with SIGTERM.
 
 ### eBPF on Linux
 

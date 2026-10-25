@@ -457,9 +457,9 @@ const POLL: Duration = Duration::from_millis(10);
 
 /// Waits for the target to exit, and stops perf then. Processes the target
 /// leaves running are not followed after that. An interrupt stops perf at
-/// once, but uhr still waits for the target, which got the interrupt too:
-/// a second one kills it. If perf stops on its own first, the target is
-/// asked to stop.
+/// once, but uhr still waits for the target: a terminal's Ctrl-C reaches it
+/// too, and one sent to uhr alone is passed on. A second interrupt kills
+/// it. If perf stops on its own first, the target is asked to stop.
 fn supervise(
     program: &Path,
     target: &mut Child,
@@ -496,9 +496,12 @@ fn supervise(
             let _ = kill_process(pid, Signal::TERM);
             target_stopped = true;
         }
+        let sent = interrupts.take_sent();
         if interrupted >= 2 && target_status.is_none() && !killed {
             let _ = kill_process(pid, Signal::KILL);
             killed = true;
+        } else if let Some(signal) = sent.filter(|_| target_status.is_none()) {
+            let _ = kill_process(pid, signal);
         }
         if let (Some(target), Some(perf)) = (target_status, perf_status) {
             return Ok((target, perf));
