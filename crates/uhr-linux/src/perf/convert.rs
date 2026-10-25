@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs::File;
 use std::io::BufReader;
@@ -14,6 +14,7 @@ use linux_perf_data::linux_perf_event_reader::{
     SamplingPolicy, SoftwareCounterType, TaskWasPreempted,
 };
 use linux_perf_data::{PerfFileReader, PerfFileRecord};
+use tracing::warn;
 
 use super::unwind::Unwinding as UserUnwinding;
 use super::{Error, Result, io_error};
@@ -126,11 +127,17 @@ pub(super) fn convert(input: Input) -> Result<Recording> {
         switch_stacks_excluded = attr.flags.contains(AttrFlags::EXCLUDE_KERNEL);
     }
 
+    let ours: HashSet<u64> = all
+        .iter()
+        .flat_map(|a| a.event_ids.iter().copied())
+        .collect();
+
     let mut state = State::new(input.max_stack_depth);
     if stack_copy_bytes.is_some() {
         state.unwinding = Some(UserUnwinding::new());
     }
     let mut held = input.launched_pid;
+    let mut foreign = 0;
     while let Some(record) = record_iter
         .next_record(&mut perf_file)
         .map_err(Error::PerfData)?
@@ -138,6 +145,14 @@ pub(super) fn convert(input: Input) -> Result<Recording> {
         let PerfFileRecord::EventRecord { attr_index, record } = record else {
             continue;
         };
+        // Another perf that watches the same processes, as a uhr that uhr
+        // records runs, can have its records land here, and the reader would
+        // take them for the first event's. perf gives the records it
+        // synthesizes the id 0, which the kernel gives no event.
+        if record.id().is_some_and(|id| id != 0 && !ours.contains(&id)) {
+            foreign += 1;
+            continue;
+        }
         let parsed = record
             .parse()
             .map_err(io_error("parsing a record in", input.perf_data))?;
@@ -223,6 +238,12 @@ pub(super) fn convert(input: Input) -> Result<Recording> {
             EventRecord::Throttle(_) => state.throttle_events += 1,
             _ => {}
         }
+    }
+    if foreign > 0 {
+        warn!(
+            records = foreign,
+            "left out records of events perf did not open for this recording, which another perf that watches the same processes wrote"
+        );
     }
 
     // Stopping perf ends the capture, which can be long after the last

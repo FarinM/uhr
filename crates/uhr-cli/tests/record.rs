@@ -577,3 +577,35 @@ fn refuses_a_staging_directory_left_behind() {
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("rec.partial exists"));
 }
+
+/// The perf of a uhr that uhr records watches the same processes, and some
+/// of its records land in the outer recording's data.
+#[test]
+fn records_a_uhr_that_records() {
+    let dir = common::scratch("records_a_uhr_that_records");
+    let (outer, inner) = (dir.join("outer"), dir.join("inner"));
+    let inner_arg = inner.to_str().unwrap();
+    let target = [
+        common::UHR,
+        "record",
+        "--no-symbolize",
+        "-o",
+        inner_arg,
+        "--",
+        "sh",
+        "-c",
+        "sleep 0.1; sleep 0.1",
+    ];
+    let output = record(&outer, &["--no-symbolize"], &target);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for recording in [&outer, &inner] {
+        assert_eq!(
+            manifest(recording)["target"]["exit"],
+            serde_json::json!({"code": 0})
+        );
+    }
+}

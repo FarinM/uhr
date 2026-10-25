@@ -172,6 +172,9 @@ Debian and Ubuntu its package must match the running kernel.
   twice. A second interrupt kills the target. If perf stops first, uhr asks
   the target to stop with SIGTERM. An interrupt before the capture starts
   ends uhr without a recording, and a target to launch never runs.
+- Another perf that watches the same processes, such as that of a uhr that
+  uhr records, can have some of its records land in uhr's data. uhr reads
+  only the records of its own perf, and logs how many others it left out.
 
 ### eBPF on Linux
 
