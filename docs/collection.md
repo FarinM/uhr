@@ -67,7 +67,7 @@ asks otherwise. Deeper signals are added when the question needs them.
 | On-CPU stack sampling, user and kernel | time levels 2-5 | perf, eBPF | samply, xctrace Time Profiler | ETW, samply |
 | Off-CPU and thread state | time level 0, locks, I/O | perf context switches, eBPF on scheduler tracepoints and wakeups | xctrace System Trace | ETW context switches |
 | Syscalls | time level 1 | eBPF on `raw_syscalls` tracepoints, `perf trace` | xctrace System Trace | ETW syscall events |
-| Mixed native and runtime stacks | time levels 2-4 for runtimes | OpenTelemetry eBPF profiler, py-spy `--native` | runtime profilers (limited) | runtime profilers |
+| Mixed native and runtime stacks | time levels 2-4 for runtimes | uhr's eBPF collector, perf with runtime perf maps, py-spy `--native` | runtime profilers (limited) | runtime profilers |
 | Runtime CPU profiles | time levels 2-4 | async-profiler, V8 `--cpu-prof`, Go pprof, rbspy, dotnet-trace | same | same |
 | Allocations | memory level 2 | heaptrack-style `LD_PRELOAD`, memray, async-profiler alloc, V8 sampling heap profiler, Go heap profile | xctrace Allocations, runtime profilers | ETW heap events, runtime profilers |
 | Heap snapshots | memory level 3 | V8 heap snapshot, hprof, gcdump | same | same |
@@ -137,6 +137,14 @@ Debian and Ubuntu its package must match the running kernel.
   SIGINT is not forwarded and SIGTERM can leave perf and the target running.
   The installed SIGINT handler also remains ineffective after perf exits.
   Fixing this requires a supervisor that preserves terminal job control.
+
+### eBPF on Linux
+
+The second Linux collector is uhr's own eBPF programs, written in Rust with
+aya. They run at each sample in the context of the interrupted thread, so
+they can walk an interpreter's frames in its memory without runtime flags,
+also in processes uhr attaches to. They can also capture what perf gets only
+from tracepoints, such as wakeups and syscall latency.
 
 ## Cost control
 
@@ -223,6 +231,8 @@ still launches the target.
   `kptr_restrict` and `perf_event_paranoid`: recording as root works unless
   `kptr_restrict` is 2, and every user sees them only with `kptr_restrict`
   at 0 and `perf_event_paranoid` at most 1.
+- eBPF needs root, or CAP_BPF and CAP_PERFMON. For now that means running
+  `uhr record` under sudo.
 - The agent-facing server must not run as root. Privileged work (eBPF, perf)
   goes through a narrow helper with a fixed set of operations. Its shape is
   not decided.
