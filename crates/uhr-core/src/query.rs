@@ -17,6 +17,8 @@ pub enum GroupBy {
     Function,
     /// Function and source line, from debug info.
     Line,
+    /// Binary or library, or the kernel or one of its modules.
+    Module,
 }
 
 #[derive(Debug, Clone)]
@@ -50,6 +52,8 @@ pub struct QueryResult {
 pub enum Rows {
     /// Grouped by function or line. Sorted by self time, then total time.
     Functions(Vec<FunctionRow>),
+    /// Sorted by self time, then total time.
+    Modules(Vec<ModuleRow>),
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -65,6 +69,23 @@ pub struct FunctionRow {
     /// Time with this row anywhere on the stack, counted once per sample or
     /// interval even when it recurses. For a caller's line, the line of the
     /// call.
+    pub total_ns: u64,
+    pub total_share: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ModuleRow {
+    /// Path of the file the code was mapped from, the first one seen when
+    /// copies of one binary ran from several paths. `[kernel]` for the
+    /// kernel, and a kernel module's name in brackets, as in `[ext4]` or
+    /// `[bpf]`. `None` for code outside every known mapping.
+    pub module: Option<String>,
+    pub build_id: Option<String>,
+    pub origin: Origin,
+    /// Time running the module's code.
+    pub self_ns: u64,
+    pub self_share: f64,
+    /// Time with the module anywhere on the stack.
     pub total_ns: u64,
     pub total_share: f64,
 }
@@ -127,6 +148,7 @@ pub fn run(
             &times.ns,
             &share,
         )),
+        GroupBy::Module => Rows::Modules(module_rows(recording, &functions, &times.ns, &share)),
     };
     let rows_omitted = rows.truncate(query.top);
 
@@ -170,6 +192,7 @@ impl Rows {
     fn truncate(&mut self, top: usize) -> usize {
         match self {
             Rows::Functions(rows) => truncate(rows, top),
+            Rows::Modules(rows) => truncate(rows, top),
         }
     }
 }
@@ -227,6 +250,56 @@ fn function_rows(
                 let place = |row: &FunctionRow| row.line.as_ref().map(|l| (l.file.clone(), l.line));
                 place(a).cmp(&place(b))
             })
+    });
+    rows
+}
+
+/// Modules are told apart by build-id, or by path without one, as
+/// functions are.
+fn module_rows(
+    recording: &Recording,
+    functions: &Functions,
+    stack_ns: &[u64],
+    share: &impl Fn(u64) -> f64,
+) -> Vec<ModuleRow> {
+    let mut ids = HashMap::new();
+    let mut modules: Vec<&Function> = Vec::new();
+    let module_of: Vec<u32> = (0..functions.len() as u32)
+        .map(|id| {
+            let function = functions.get(id);
+            let key = (
+                function.origin,
+                function.build_id.as_ref().or(function.module.as_ref()),
+            );
+            *ids.entry(key).or_insert_with(|| {
+                modules.push(function);
+                modules.len() as u32 - 1
+            })
+        })
+        .collect();
+    let mut rows: Vec<ModuleRow> = tally(recording, stack_ns, |stack, keys| {
+        keys.extend(functions.expand(stack).map(|f| module_of[f as usize]))
+    })
+    .into_iter()
+    .map(|(module, (self_ns, total_ns))| {
+        let function = modules[module as usize];
+        ModuleRow {
+            module: function.module.clone(),
+            build_id: function.build_id.clone(),
+            origin: function.origin,
+            self_ns,
+            self_share: share(self_ns),
+            total_ns,
+            total_share: share(total_ns),
+        }
+    })
+    .collect();
+    rows.sort_by(|a, b| {
+        (b.self_ns, b.total_ns)
+            .cmp(&(a.self_ns, a.total_ns))
+            .then_with(|| a.module.cmp(&b.module))
+            .then_with(|| a.build_id.cmp(&b.build_id))
+            .then_with(|| a.origin.cmp(&b.origin))
     });
     rows
 }

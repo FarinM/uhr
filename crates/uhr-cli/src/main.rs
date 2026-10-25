@@ -14,7 +14,7 @@ use uhr_core::functions::Function;
 use uhr_core::metric::Metric;
 use uhr_core::overview::{self, CPUTime, Overview};
 use uhr_core::perf::{self, RecordOptions, Unwind};
-use uhr_core::query::{self, FunctionRow, GroupBy, Query, QueryResult, Rows};
+use uhr_core::query::{self, FunctionRow, GroupBy, ModuleRow, Query, QueryResult, Rows};
 use uhr_core::recording::{Exit, Mode};
 use uhr_core::symbols;
 
@@ -140,6 +140,9 @@ enum GroupByArg {
     Function,
     /// Function and source line, from debug info
     Line,
+    /// Binary or library, or the kernel or one of its modules: self time
+    /// runs its code, total time has it anywhere on the stack
+    Module,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -668,6 +671,7 @@ fn run_query(
         group_by: match group_by {
             GroupByArg::Function => GroupBy::Function,
             GroupByArg::Line => GroupBy::Line,
+            GroupByArg::Module => GroupBy::Module,
         },
         metric,
         top,
@@ -687,6 +691,7 @@ fn write_query(out: &mut impl Write, result: &QueryResult) -> io::Result<()> {
     let by = match result.group_by {
         GroupBy::Function => "function",
         GroupBy::Line => "line",
+        GroupBy::Module => "module",
     };
     writeln!(
         out,
@@ -703,6 +708,7 @@ fn write_query(out: &mut impl Write, result: &QueryResult) -> io::Result<()> {
     }
     match &result.rows {
         Rows::Functions(rows) => write_function_rows(out, result.group_by == GroupBy::Line, rows)?,
+        Rows::Modules(rows) => write_module_rows(out, rows)?,
     }
     if result.rows_omitted > 0 {
         writeln!(
@@ -749,6 +755,20 @@ fn write_function_rows(
             row.total_share * 100.0,
             function_name(&row.function),
             module_name(&row.function),
+        )?;
+    }
+    Ok(())
+}
+
+fn write_module_rows(out: &mut impl Write, rows: &[ModuleRow]) -> io::Result<()> {
+    writeln!(out, "{:>7} {:>7}  module", "self", "total")?;
+    for row in rows {
+        writeln!(
+            out,
+            "{:>6.1}% {:>6.1}%  {}",
+            row.self_share * 100.0,
+            row.total_share * 100.0,
+            row.module.as_deref().unwrap_or(row.origin.as_str()),
         )?;
     }
     Ok(())

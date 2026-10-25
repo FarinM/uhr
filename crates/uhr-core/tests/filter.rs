@@ -76,7 +76,9 @@ fn cpu_ns(recording: &Recording, filter: Filter) -> u64 {
         filter,
     };
     let result = run(recording, None, &query).unwrap();
-    let Rows::Functions(rows) = &result.rows;
+    let Rows::Functions(rows) = &result.rows else {
+        panic!("rows of another grouping: {:?}", result.rows)
+    };
     let self_ns: u64 = rows.iter().map(|r| r.self_ns).sum();
     assert_eq!(self_ns, result.time_ns);
     result.time_ns

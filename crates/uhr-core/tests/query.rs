@@ -1,7 +1,7 @@
 use uhr_core::filter::Filter;
 use uhr_core::functions;
 use uhr_core::metric::{self, Metric};
-use uhr_core::query::{Error, FunctionRow, GroupBy, Query, QueryResult, Rows, run};
+use uhr_core::query::{Error, FunctionRow, GroupBy, ModuleRow, Query, QueryResult, Rows, run};
 use uhr_core::recording::*;
 use uhr_core::symbols::{FrameName, InlineFrame, Source, SourceStatus, Symbols};
 
@@ -104,7 +104,9 @@ fn symbols() -> Symbols {
 }
 
 fn function_rows(result: &QueryResult) -> &[FunctionRow] {
-    let Rows::Functions(rows) = &result.rows;
+    let Rows::Functions(rows) = &result.rows else {
+        panic!("rows of another grouping: {:?}", result.rows)
+    };
     rows
 }
 
@@ -807,4 +809,51 @@ fn needs_context_switches_for_off_cpu_time() {
             Err(Error::Metric(metric::Error::NoContextSwitches))
         ));
     }
+}
+
+fn module_rows(result: &QueryResult) -> &[ModuleRow] {
+    let Rows::Modules(rows) = &result.rows else {
+        panic!("rows of another grouping: {:?}", result.rows)
+    };
+    rows
+}
+
+#[test]
+fn groups_by_module() {
+    let mut recording = recording();
+    // One libc, mapped from two paths.
+    let libc = |start, path: &str| Mapping {
+        pid: Some(1),
+        start,
+        end: start + 0x1000,
+        file_offset: 0,
+        path: path.into(),
+        build_id: Some("abcd".into()),
+        time_ns: None,
+    };
+    recording.mappings.push(libc(0x1000, "/lib/libc.so.6"));
+    recording.mappings.push(libc(0x2000, "/other/libc.so.6"));
+    recording.frames.push(frame(0x1010, Some(1)));
+    recording.frames.push(frame(0x2010, Some(2)));
+    recording.stacks.push(vec![6, 7, 3]);
+    recording.samples.push(sample(3, 4));
+    let query = Query {
+        group_by: GroupBy::Module,
+        ..query(10)
+    };
+    let result = run(&recording, None, &query).unwrap();
+    let rows: Vec<_> = module_rows(&result)
+        .iter()
+        .map(|r| (r.module.as_deref(), r.origin, r.self_ns, r.total_ns))
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            (Some("/bin/app"), Origin::Binary, 9, 14),
+            (Some("/lib/libc.so.6"), Origin::Binary, 4, 4),
+            (None, Origin::Kernel, 1, 1),
+        ]
+    );
+    assert_eq!(module_rows(&result)[1].build_id.as_deref(), Some("abcd"));
+    assert_eq!(module_rows(&result)[1].self_share, 4.0 / 14.0);
 }

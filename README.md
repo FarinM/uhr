@@ -32,6 +32,8 @@ uhr overview rec                           # computing or waiting? CPU time by m
                                            # by process and thread, against time alive
 uhr query rec --group-by function          # top functions, with coverage
 uhr query rec --group-by function --json   # the same, for agents
+uhr query rec --group-by module            # which binaries, libraries and
+                                           # kernel modules the time is in
 uhr query rec --group-by function --thread 'worker-*' --mode kernel --from 1s
                                            # only some samples
 uhr query rec --group-by function --metric off-cpu
