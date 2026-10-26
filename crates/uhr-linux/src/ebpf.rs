@@ -7,8 +7,9 @@ use std::path::Path;
 
 use aya::Ebpf;
 use aya::maps::{HashMap, MapData, PerCpuArray};
-use aya::programs::TracePoint;
+use aya::programs::raw_trace_point::RawTracePointLinkId;
 use aya::programs::trace_point::TracePointLinkId;
+use aya::programs::{RawTracePoint, TracePoint};
 use syscalls::Sysno;
 use uhr_core::recording::SyscallCalls;
 use uhr_ebpf::{ACTIVE, CallKey, Calls, HELD, Start};
@@ -68,13 +69,15 @@ impl Error {
 #[cfg(uhr_ebpf)]
 static PROGRAMS: &[u8] = aya::include_bytes_aligned!(concat!(env!("OUT_DIR"), "/uhr-ebpf"));
 
-/// Each program, and the tracepoint it runs at.
-const TRACEPOINTS: [(&str, &str, &str); 4] = [
-    ("sys_enter", "raw_syscalls", "sys_enter"),
-    ("sys_exit", "raw_syscalls", "sys_exit"),
+/// The programs that follow the processes the target starts, and the
+/// tracepoints they run at.
+const FOLLOWERS: [(&str, &str, &str); 2] = [
     ("task_newtask", "task", "task_newtask"),
     ("sched_process_exec", "sched", "sched_process_exec"),
 ];
+
+/// The programs that count syscalls, at the raw tracepoints of their names.
+const SYSCALLS: [&str; 2] = ["sys_enter", "sys_exit"];
 
 /// What the programs counted.
 pub(crate) struct Counted {
@@ -87,7 +90,8 @@ pub(crate) struct Counted {
 
 pub(crate) struct Syscalls {
     ebpf: Ebpf,
-    links: Vec<(&'static str, TracePointLinkId)>,
+    tracepoints: Vec<(&'static str, TracePointLinkId)>,
+    syscalls: Vec<(&'static str, RawTracePointLinkId)>,
 }
 
 /// The counts, and the programs: detached, but loaded until unloaded, so
@@ -116,25 +120,50 @@ impl Syscalls {
         targets
             .insert(pid, state, 0)
             .map_err(|e| Error::Map("TARGETS", e).or_not_permitted())?;
-        let mut links = Vec::new();
-        for (program, category, name) in TRACEPOINTS {
+        let mut tracepoints = Vec::new();
+        for (program, category, name) in FOLLOWERS {
             let tracepoint = tracepoint(&mut ebpf, program)?;
             let link = tracepoint
                 .load()
                 .and_then(|()| tracepoint.attach(category, name))
                 .map_err(|e| Error::Program(program, e).or_not_permitted())?;
-            links.push((program, link));
+            tracepoints.push((program, link));
         }
-        Ok(Self { ebpf, links })
+        let mut syscalls = Vec::new();
+        for program in SYSCALLS {
+            let tracepoint = raw_tracepoint(&mut ebpf, program)?;
+            let link = tracepoint
+                .load()
+                .and_then(|()| tracepoint.attach(program))
+                .map_err(|e| Error::Program(program, e).or_not_permitted())?;
+            syscalls.push((program, link));
+        }
+        Ok(Self {
+            ebpf,
+            tracepoints,
+            syscalls,
+        })
     }
 
     /// Stops counting, and reads what was counted.
     pub(crate) fn stop(self) -> Result<Stopped, Error> {
         let now = monotonic_ns();
-        let Self { mut ebpf, links } = self;
+        let Self {
+            mut ebpf,
+            tracepoints,
+            syscalls,
+        } = self;
         let mut programs = Vec::new();
-        for (program, link) in links {
+        for (program, link) in tracepoints {
             let tracepoint = tracepoint(&mut ebpf, program)?;
+            tracepoint
+                .detach(link)
+                .map_err(|e| Error::Program(program, e))?;
+            let info = tracepoint.info().map_err(|e| Error::Program(program, e))?;
+            programs.push(format!("{:016x}", info.tag()));
+        }
+        for (program, link) in syscalls {
+            let tracepoint = raw_tracepoint(&mut ebpf, program)?;
             // So the maps stay as they are while read.
             tracepoint
                 .detach(link)
@@ -197,8 +226,13 @@ impl Syscalls {
 /// Loads the programs without running them, as recording would.
 pub fn check() -> Result<(), Error> {
     let mut ebpf = load()?;
-    for (program, ..) in TRACEPOINTS {
+    for (program, ..) in FOLLOWERS {
         tracepoint(&mut ebpf, program)?
+            .load()
+            .map_err(|e| Error::Program(program, e).or_not_permitted())?;
+    }
+    for program in SYSCALLS {
+        raw_tracepoint(&mut ebpf, program)?
             .load()
             .map_err(|e| Error::Program(program, e).or_not_permitted())?;
     }
@@ -206,6 +240,16 @@ pub fn check() -> Result<(), Error> {
 }
 
 fn tracepoint<'a>(ebpf: &'a mut Ebpf, program: &'static str) -> Result<&'a mut TracePoint, Error> {
+    ebpf.program_mut(program)
+        .ok_or(Error::Missing(program))?
+        .try_into()
+        .map_err(|e| Error::Program(program, e))
+}
+
+fn raw_tracepoint<'a>(
+    ebpf: &'a mut Ebpf,
+    program: &'static str,
+) -> Result<&'a mut RawTracePoint, Error> {
     ebpf.program_mut(program)
         .ok_or(Error::Missing(program))?
         .try_into()

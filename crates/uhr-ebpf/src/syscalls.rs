@@ -2,9 +2,9 @@
 //! syscall, from their first after exec.
 
 use aya_ebpf::helpers::{bpf_get_current_pid_tgid, bpf_ktime_get_ns};
-use aya_ebpf::macros::{map, tracepoint};
+use aya_ebpf::macros::{map, raw_tracepoint, tracepoint};
 use aya_ebpf::maps::{HashMap, LruHashMap, PerCpuArray};
-use aya_ebpf::programs::TracePointContext;
+use aya_ebpf::programs::{RawTracePointContext, TracePointContext};
 use uhr_ebpf::{ACTIVE, BUCKETS, CallKey, Calls, HELD, Start};
 
 const CLONE_THREAD: u64 = 0x10000;
@@ -35,17 +35,17 @@ fn current() -> (u32, u32) {
     ((pid_tgid >> 32) as u32, pid_tgid as u32)
 }
 
-#[tracepoint]
-pub fn sys_enter(ctx: TracePointContext) -> u32 {
+// Raw tracepoints, for which the kernel builds no trace record, and whose
+// programs don't keep other BPF programs from running meanwhile, as
+// tracepoints' do.
+#[raw_tracepoint(tracepoint = "sys_enter")]
+pub fn sys_enter(ctx: RawTracePointContext) -> i32 {
     let (tgid, tid) = current();
     if unsafe { TARGETS.get(tgid) } != Some(&ACTIVE) {
         return 0;
     }
-    // raw_syscalls:sys_enter has the syscall's number after 8 bytes of
-    // fields every event has.
-    let Ok(nr) = (unsafe { ctx.read_at::<i64>(8) }) else {
-        return 0;
-    };
+    // The registers, then the syscall's number.
+    let nr: i64 = ctx.arg(1);
     let start = Start {
         ns: unsafe { bpf_ktime_get_ns() },
         tgid,
@@ -55,8 +55,8 @@ pub fn sys_enter(ctx: TracePointContext) -> u32 {
     0
 }
 
-#[tracepoint]
-pub fn sys_exit(_ctx: TracePointContext) -> u32 {
+#[raw_tracepoint(tracepoint = "sys_exit")]
+pub fn sys_exit(_ctx: RawTracePointContext) -> i32 {
     let (_, tid) = current();
     let Some(&start) = (unsafe { STARTS.get(tid) }) else {
         return 0;
