@@ -1081,6 +1081,9 @@ pub(crate) fn finished(status: ExitStatus) -> bool {
 /// How often supervision looks at the target, perf and the interrupts.
 const POLL: Duration = Duration::from_millis(10);
 
+/// How long a target has to be seen exiting once perf has.
+const TARGET_GRACE: Duration = Duration::from_millis(200);
+
 /// Waits for the target to exit, and stops the capture then. Processes the
 /// target leaves running are not followed after that. An interrupt stops it
 /// at once, but uhr still waits for the target: a terminal's Ctrl-C reaches it
@@ -1096,6 +1099,7 @@ fn supervise(
     let pid = Pid::from_child(target);
     let (mut target_status, mut perf_status) = (None, None);
     let (mut perf_stopped, mut target_stopped, mut killed) = (false, false, false);
+    let mut perf_ended = None;
     loop {
         if target_status.is_none() {
             target_status = target
@@ -1111,6 +1115,7 @@ fn supervise(
         }
         if perf_status.is_some() {
             capture.end();
+            perf_ended.get_or_insert_with(Instant::now);
         }
         let interrupted = interrupts.count();
         if (interrupted > 0 || target_status.is_some()) && perf_status.is_none() && !perf_stopped {
@@ -1122,7 +1127,10 @@ fn supervise(
                 );
             }
         }
-        if perf_status.is_some() && target_status.is_none() && interrupted == 0 && !target_stopped {
+        // perf stops by itself when the target exits, and can be seen to
+        // first.
+        let perf_first = perf_ended.is_some_and(|ended| ended.elapsed() >= TARGET_GRACE);
+        if perf_first && target_status.is_none() && interrupted == 0 && !target_stopped {
             warn!("perf stopped before the target exited; asking the target to stop");
             let _ = kill_process(pid, Signal::TERM);
             target_stopped = true;
