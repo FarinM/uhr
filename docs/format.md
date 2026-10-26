@@ -197,7 +197,7 @@ the first.
 | `runtime` | string | As in `python` |
 | `address` | uint64 | Where the process kept it |
 | `name` | string, nullable | The function's name, as in `Pool.acquire`. Null if the code could not be read, as when the process freed it before uhr read it |
-| `file` | string, nullable | Its source file |
+| `file` | string, nullable | Its source file. In this and `name`, `\` is written `\\`, and what the runtime keeps that is no character, as CPython keeps the bytes of a file name that are not UTF-8, as `\u` and four hex digits |
 | `first_line` | uint32, nullable | The line it starts at |
 
 `syscall_calls`, one row per thread and syscall, from uhr's eBPF programs.

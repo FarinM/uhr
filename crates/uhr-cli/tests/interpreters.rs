@@ -1,0 +1,583 @@
+//! End to end: uhr's eBPF programs reading CPython's frames. Needs root
+//! through sudo without a password, perf, a C compiler and Python 3.11 or
+//! later, and skips without sudo. The test of a Python that is missing
+//! checks nothing.
+#![cfg(target_os = "linux")]
+
+mod common;
+
+use std::env;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::Duration;
+
+use serde_json::Value;
+
+use common::{compile, scratch, uhr, uhr_as_root};
+
+const PROGRAMS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../test-programs");
+
+fn json(args: &[&str]) -> Value {
+    let mut args = args.to_vec();
+    args.push("--json");
+    serde_json::from_slice(&uhr(&args).stdout).unwrap()
+}
+
+/// `program` found in `PATH`.
+fn find(program: &str) -> Option<PathBuf> {
+    let path = env::var_os("PATH")?;
+    env::split_paths(&path)
+        .map(|dir| dir.join(program))
+        .find(|candidate| candidate.is_file())
+}
+
+/// Records `command` as root, `None` where sudo asks for a password or uhr
+/// was built without its eBPF programs. Without perf maps, so the names can
+/// only come from the interpreter's frames.
+fn record(dir: &Path, flags: &[&str], command: &[&str]) -> Option<String> {
+    record_as_root(dir, flags, command, false)
+}
+
+fn record_as_root(dir: &Path, flags: &[&str], command: &[&str], maps: bool) -> Option<String> {
+    let recording = dir.join("rec");
+    let rec = recording.to_str().unwrap();
+    let mut args = vec!["record", "-o", rec];
+    args.extend(flags);
+    if !command.is_empty() {
+        if !maps {
+            args.push("--no-runtime-support");
+        }
+        args.push("--");
+        args.extend(command);
+    }
+    if uhr_as_root(&args, &recording).is_none() {
+        eprintln!("skipped: needs root through sudo without a password");
+        return None;
+    }
+    if interpreters(rec).is_none() {
+        eprintln!("skipped: uhr was built without its eBPF programs");
+        return None;
+    }
+    Some(rec.to_owned())
+}
+
+/// What the eBPF stream says of the interpreters it read, `None` if they
+/// did not sample.
+fn interpreters(recording: &str) -> Option<Vec<Value>> {
+    let manifest: Value =
+        serde_json::from_slice(&fs::read(Path::new(recording).join("manifest.json")).unwrap())
+            .unwrap();
+    let streams = manifest["streams"].as_array().unwrap();
+    let ebpf = streams
+        .iter()
+        .find(|s| s["id"] == "ebpf" && !s["collector"]["sampling"].is_null())?;
+    Some(
+        ebpf["coverage"]["stacks"]["interpreters"]
+            .as_array()
+            .unwrap()
+            .clone(),
+    )
+}
+
+fn functions(recording: &str) -> Vec<Value> {
+    let result = json(&[
+        "query",
+        recording,
+        "--group-by",
+        "function",
+        "--top",
+        "1000",
+    ]);
+    result["rows"].as_array().unwrap().clone()
+}
+
+/// The row of the Python function `name`, read from the interpreter's
+/// frames or named in a perf map, which are one function.
+fn python_function<'a>(rows: &'a [Value], name: &str) -> &'a Value {
+    rows.iter()
+        .find(|r| r["module"] == "[python]" && r["function"] == name)
+        .unwrap_or_else(|| panic!("no Python function {name}"))
+}
+
+fn share(row: &Value, which: &str) -> f64 {
+    row[which].as_f64().unwrap()
+}
+
+/// The program's known split: hot() does four times the work of warm(),
+/// all under work().
+fn has_the_split_of_jit_py(recording: &str) {
+    has_the_split_of_hot_and_warm(recording);
+    let rows = functions(recording);
+    assert!(share(python_function(&rows, "work"), "total_share") > 0.85);
+}
+
+fn has_the_split_of_hot_and_warm(recording: &str) {
+    let rows = functions(recording);
+    let hot = python_function(&rows, "hot");
+    assert_eq!(hot["module"], "[python]", "{hot}");
+    let file = hot["file"].as_str().unwrap();
+    assert!(file.ends_with("test-programs/jit.py"), "{hot}");
+    assert_eq!(hot["id"], format!("jit+python:hot:{file}"));
+    let (hot, warm) = (
+        share(hot, "self_share"),
+        share(python_function(&rows, "warm"), "self_share"),
+    );
+    let split = hot / (hot + warm);
+    assert!(hot + warm > 0.7, "hot {hot}, warm {warm}");
+    assert!((0.7..0.9).contains(&split), "hot gets {split} of the two");
+}
+
+#[test]
+fn reads_the_frames_of_each_python() {
+    let pythons: Vec<_> = ["python3.11", "python3.12", "python3.13", "python3.14"]
+        .into_iter()
+        .filter_map(|name| Some((name, find(name)?)))
+        .collect();
+    if pythons.is_empty() {
+        eprintln!("skipped: needs Python 3.11 or later");
+        return;
+    }
+    let program = format!("{PROGRAMS}/jit.py");
+    for (name, python) in pythons {
+        let dir = scratch(&format!("interpreters_{name}"));
+        let command = [python.to_str().unwrap(), &program, "50"];
+        let Some(recording) = record(&dir, &[], &command) else {
+            return;
+        };
+        has_the_split_of_jit_py(&recording);
+        let found = interpreters(&recording).unwrap();
+        let [found] = &found[..] else {
+            panic!("{name}: {found:?}");
+        };
+        let version = found["version"].as_str().unwrap();
+        assert!(
+            version.starts_with(&name["python".len()..]),
+            "{name}: {found}"
+        );
+        // Code a module ran on import is freed once the import is done,
+        // which can be before uhr reads it.
+        let (frames, unread) = (found["frames"].as_u64(), found["unread_frames"].as_u64());
+        assert!(unread.unwrap() * 50 <= frames.unwrap(), "{name}: {found}");
+        assert_eq!(found["failed"], 0, "{name}: {found}");
+
+        // The loop of hot() is its lines 13 and 14.
+        let lines = json(&["query", &recording, "--group-by", "line", "--top", "1000"]);
+        let hot_lines: Vec<u64> = lines["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| r["origin"] == "interpreted" && r["function"] == "hot")
+            .filter(|r| share(r, "self_share") > 0.05)
+            .map(|r| r["line"]["line"].as_u64().unwrap())
+            .collect();
+        assert!(
+            !hot_lines.is_empty() && hot_lines.iter().all(|l| (13..=14).contains(l)),
+            "{name}: {hot_lines:?}"
+        );
+
+        // work's generator calls hot, out of sum(), which the generator's
+        // native frames run in.
+        let paths = call_paths(&recording, &id_of(&recording, "hot"));
+        let outer = |node: &Value| {
+            let name = node["function"].as_str().unwrap_or_default();
+            name == "builtin_sum" || name.contains("gen_iternext") || name == "work"
+        };
+        assert!(!has(&paths["callees"], &outer), "{name}: {paths}");
+    }
+}
+
+#[test]
+fn reads_python_frames_when_attached() {
+    let Some(python) = find("python3.12").or_else(|| find("python3")) else {
+        eprintln!("skipped: needs Python");
+        return;
+    };
+    let dir = scratch("interpreters_attached");
+    let program = format!("{PROGRAMS}/jit.py");
+    let mut target = Command::new(&python)
+        .args([&program, "300"])
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    // Running the program's own code by then.
+    thread::sleep(Duration::from_millis(300));
+    let pid = target.id().to_string();
+    let recording = record(&dir, &["--pid", &pid, "--duration", "1s"], &[]);
+    let _ = target.kill();
+    let _ = target.wait();
+    let Some(recording) = recording else {
+        return;
+    };
+    has_the_split_of_jit_py(&recording);
+}
+
+#[test]
+fn reads_the_frames_of_the_pythons_a_target_starts() {
+    let Some(python) = find("python3.12").or_else(|| find("python3")) else {
+        eprintln!("skipped: needs Python");
+        return;
+    };
+    let dir = scratch("interpreters_started");
+    let program = format!("{PROGRAMS}/jit.py");
+    let start =
+        format!("import subprocess, sys; subprocess.run([sys.executable, {program:?}, '50'])");
+    let command = [python.to_str().unwrap(), "-c", &start];
+    let Some(recording) = record(&dir, &[], &command) else {
+        return;
+    };
+    has_the_split_of_jit_py(&recording);
+    let found = interpreters(&recording).unwrap();
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0]["processes"], 2, "{found:?}");
+}
+
+/// A Python 3.13 with a shared library to embed, as uv's builds have: where
+/// its headers are, the library's directory and its version.
+fn shared_python() -> Option<(String, String, String)> {
+    let python = find("python3.13")?;
+    let config = |name: &str| {
+        let query = format!("import sysconfig; print(sysconfig.get_config_var({name:?}))");
+        let output = Command::new(&python).args(["-c", &query]).output().unwrap();
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    };
+    let (include, libdir, version) = (config("INCLUDEPY"), config("LIBDIR"), config("LDVERSION"));
+    let library = Path::new(&libdir).join(format!("libpython{version}.so"));
+    library.exists().then_some((include, libdir, version))
+}
+
+#[test]
+fn reads_the_frames_of_python_a_program_embeds() {
+    let Some((include, libdir, version)) = shared_python() else {
+        eprintln!("skipped: needs Python 3.13 with a shared library");
+        return;
+    };
+    let dir = scratch("interpreters_embedded");
+    let program = dir.join("embed");
+    let status = Command::new("cc")
+        .args(["-O2", "-fno-omit-frame-pointer", "-I", &include, "-o"])
+        .arg(&program)
+        .arg(format!("{PROGRAMS}/embed.c"))
+        .args([format!("-L{libdir}"), format!("-lpython{version}")])
+        .arg(format!("-Wl,-rpath,{libdir}"))
+        .status()
+        .unwrap();
+    assert!(status.success(), "cc failed");
+    let Some(recording) = record(&dir, &[], &[program.to_str().unwrap()]) else {
+        return;
+    };
+    let rows = functions(&recording);
+    let spin = python_function(&rows, "spin");
+    assert!(share(spin, "self_share") > 0.6, "{spin}");
+    let found = interpreters(&recording).unwrap();
+    assert!(
+        found[0]["version"].as_str().unwrap().starts_with("3.13"),
+        "{found:?}"
+    );
+}
+
+#[test]
+fn reads_the_frames_of_python_a_program_loads_later() {
+    let Some((_, libdir, version)) = shared_python() else {
+        eprintln!("skipped: needs Python 3.13 with a shared library");
+        return;
+    };
+    let dir = scratch("interpreters_loaded_later");
+    let program = dir.join("dlopen_python");
+    compile("dlopen_python", &program, "-O2");
+    let library = format!("{libdir}/libpython{version}.so");
+    let Some(recording) = record(&dir, &[], &[program.to_str().unwrap(), &library]) else {
+        return;
+    };
+    // It loads Python once uhr has looked for it, and runs it for about
+    // half the time.
+    let rows = functions(&recording);
+    let spin = python_function(&rows, "spin");
+    assert!(share(spin, "self_share") > 0.25, "{spin}");
+}
+
+/// Whether a node of a call-paths tree, or one under it, is the Python
+/// function `name`.
+fn has_python(nodes: &Value, name: &str) -> bool {
+    has(nodes, &|node| {
+        node["origin"] == "interpreted" && node["function"] == name
+    })
+}
+
+fn has(nodes: &Value, wanted: &dyn Fn(&Value) -> bool) -> bool {
+    let nodes = nodes.as_array().unwrap();
+    nodes
+        .iter()
+        .any(|node| wanted(node) || has(&node["children"], wanted))
+}
+
+fn call_paths(recording: &str, function: &str) -> Value {
+    json(&[
+        "call-paths",
+        recording,
+        "--function",
+        function,
+        "--mode",
+        "user",
+        "--depth",
+        "30",
+        "--top",
+        "20",
+    ])
+}
+
+/// The id of the Python function `name`.
+fn id_of(recording: &str, name: &str) -> String {
+    let rows = functions(recording);
+    python_function(&rows, name)["id"]
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+
+#[test]
+fn puts_python_frames_around_the_native_code_they_call() {
+    let Some(python) = find("python3.12").or_else(|| find("python3")) else {
+        eprintln!("skipped: needs Python");
+        return;
+    };
+    let program = format!("{PROGRAMS}/callback.py");
+    for unwind in ["fp", "dwarf"] {
+        let dir = scratch(&format!("interpreters_callback_{unwind}"));
+        let command = [python.to_str().unwrap(), &program, "60"];
+        let Some(recording) = record(&dir, &["--unwind", unwind], &command) else {
+            return;
+        };
+        // sort() calls qsort(), which calls compare(). Of libc's functions
+        // named so, the one that does: another can have a sample of its own.
+        let rows = functions(&recording);
+        let qsort = rows
+            .iter()
+            .filter(|r| r["function"].as_str().is_some_and(|f| f.contains("qsort")))
+            .max_by(|a, b| share(a, "total_share").total_cmp(&share(b, "total_share")))
+            .unwrap_or_else(|| panic!("{unwind}: no qsort"));
+        let id = qsort["id"].as_str().unwrap();
+        let paths = json(&[
+            "call-paths",
+            &recording,
+            "--function",
+            id,
+            "--mode",
+            "user",
+            "--depth",
+            "20",
+            "--top",
+            "20",
+        ]);
+        assert!(has_python(&paths["callers"], "sort"), "{unwind}: {paths}");
+        assert!(
+            !has_python(&paths["callers"], "compare"),
+            "{unwind}: {paths}"
+        );
+        assert!(
+            has_python(&paths["callees"], "compare"),
+            "{unwind}: {paths}"
+        );
+    }
+}
+
+#[test]
+fn names_the_python_functions_that_wait() {
+    let Some(python) = find("python3.12") else {
+        eprintln!("skipped: needs Python 3.12");
+        return;
+    };
+    let dir = scratch("interpreters_off_cpu");
+    let program = "import time\ndef sleeping():\n    time.sleep(0.75)\nsleeping()\n";
+    let command = [python.to_str().unwrap(), "-c", program];
+    let Some(recording) = record_as_root(&dir, &[], &command, true) else {
+        return;
+    };
+    let result = json(&[
+        "query",
+        &recording,
+        "--metric",
+        "off-cpu",
+        "--group-by",
+        "function",
+        "--top",
+        "1000",
+    ]);
+    let rows = result["rows"].as_array().unwrap();
+    let sleeping = rows.iter().find(|r| r["function"] == "sleeping");
+    let waited = sleeping.map_or(0, |r| r["total_ns"].as_u64().unwrap());
+    assert!(waited > 700_000_000, "{result}");
+}
+
+#[test]
+fn counts_a_call_a_perf_map_names_once() {
+    let Some(python) = find("python3.12") else {
+        eprintln!("skipped: needs Python 3.12");
+        return;
+    };
+    let dir = scratch("interpreters_perf_maps");
+    let program = format!("{PROGRAMS}/jit.py");
+    let command = [python.to_str().unwrap(), &program, "50"];
+    let Some(recording) = record_as_root(&dir, &[], &command, true) else {
+        return;
+    };
+    has_the_split_of_jit_py(&recording);
+    for name in ["hot", "warm", "work"] {
+        let id = id_of(&recording, name);
+        let paths = call_paths(&recording, &id);
+        let again = |node: &Value| node["id"].as_str() == Some(&id);
+        assert!(!has(&paths["callees"], &again), "{name}: {paths}");
+    }
+}
+
+#[test]
+fn reads_the_frames_of_a_thread_beside_another_interpreter() {
+    let Some(python) = find("python3.12") else {
+        eprintln!("skipped: needs Python 3.12");
+        return;
+    };
+    let dir = scratch("interpreters_subinterpreter");
+    let program = format!(
+        "import _xxsubinterpreters, runpy, sys\n\
+         idle = _xxsubinterpreters.create()\n\
+         sys.argv = ['jit.py', '50']\n\
+         runpy.run_path({:?}, run_name='__main__')\n",
+        format!("{PROGRAMS}/jit.py")
+    );
+    let command = [python.to_str().unwrap(), "-c", &program];
+    let Some(recording) = record(&dir, &[], &command) else {
+        return;
+    };
+    has_the_split_of_jit_py(&recording);
+}
+
+#[test]
+fn reads_the_frames_of_python_in_another_pid_namespace() {
+    let (Some(python), Some(unshare)) = (find("python3.12"), find("unshare")) else {
+        eprintln!("skipped: needs Python 3.12 and unshare");
+        return;
+    };
+    let dir = scratch("interpreters_pid_namespace");
+    let program = format!("{PROGRAMS}/jit.py");
+    let command = [
+        unshare.to_str().unwrap(),
+        "--pid",
+        "--fork",
+        python.to_str().unwrap(),
+        &program,
+        "50",
+    ];
+    let Some(recording) = record(&dir, &[], &command) else {
+        return;
+    };
+    has_the_split_of_jit_py(&recording);
+}
+
+#[test]
+fn reads_the_frames_of_python_execed_from_one_it_cannot_read() {
+    let (Some(old), Some(python)) = (find("python3.10"), find("python3.12")) else {
+        eprintln!("skipped: needs Python 3.10 and 3.12");
+        return;
+    };
+    let dir = scratch("interpreters_exec");
+    let program = format!("{PROGRAMS}/jit.py");
+    let exec = format!(
+        "import os\nos.execv({python:?}, [{python:?}, {program:?}, '50'])\n",
+        python = python.to_str().unwrap()
+    );
+    let command = [old.to_str().unwrap(), "-c", &exec];
+    let Some(recording) = record(&dir, &[], &command) else {
+        return;
+    };
+    has_the_split_of_jit_py(&recording);
+}
+
+#[test]
+fn reads_the_frames_of_threads_past_the_search() {
+    let Some(python) = find("python3.12") else {
+        eprintln!("skipped: needs Python 3.12");
+        return;
+    };
+    let dir = scratch("interpreters_many_threads");
+    // The main thread's state is the oldest, at the end of the list, past
+    // the 256 the programs search.
+    let program = format!(
+        "import runpy, sys, threading\n\
+         stop = threading.Event()\n\
+         waiting = [threading.Thread(target=stop.wait) for _ in range(300)]\n\
+         [t.start() for t in waiting]\n\
+         sys.argv = ['jit.py', '80']\n\
+         runpy.run_path({:?}, run_name='__main__')\n\
+         stop.set()\n",
+        format!("{PROGRAMS}/jit.py")
+    );
+    let command = [python.to_str().unwrap(), "-c", &program];
+    let Some(recording) = record(&dir, &[], &command) else {
+        return;
+    };
+    // Starting the threads takes time too.
+    has_the_split_of_hot_and_warm(&recording);
+    let found = interpreters(&recording).unwrap();
+    let count = |what: &str| found[0][what].as_u64().unwrap();
+    assert!(count("unsearched") * 50 < count("samples"), "{found:?}");
+}
+
+#[test]
+fn puts_python_frames_past_the_most_walked_inside_the_stack() {
+    let Some(python) = find("python3.12") else {
+        eprintln!("skipped: needs Python 3.12");
+        return;
+    };
+    let dir = scratch("interpreters_deep");
+    let program = format!("{PROGRAMS}/callback.py");
+    // sort() calls itself past the 127 frames walked, then qsort calls
+    // compare().
+    let command = [python.to_str().unwrap(), &program, "60", "150"];
+    let Some(recording) = record(&dir, &[], &command) else {
+        return;
+    };
+    let rows = functions(&recording);
+    let start = rows.iter().find(|r| {
+        r["function"]
+            .as_str()
+            .is_some_and(|f| f.contains("libc_start_call_main"))
+    });
+    let start = start.expect("no __libc_start_call_main")["id"]
+        .as_str()
+        .unwrap();
+    let paths = call_paths(&recording, start);
+    let python = |node: &Value| node["origin"] == "interpreted";
+    assert!(!has(&paths["callers"], &python), "{paths}");
+    let compare = call_paths(&recording, &id_of(&recording, "compare"));
+    assert!(has_python(&compare["callers"], "sort"), "{compare}");
+}
+
+#[test]
+fn counts_each_program_a_process_runs_apart() {
+    let (Some(old), Some(new)) = (find("python3.12"), find("python3.14")) else {
+        eprintln!("skipped: needs Python 3.12 and 3.14");
+        return;
+    };
+    let dir = scratch("interpreters_programs");
+    let program = format!("{PROGRAMS}/jit.py");
+    let exec = format!(
+        "import os\nos.execv({new:?}, [{new:?}, {program:?}, '100'])\n",
+        new = new.to_str().unwrap()
+    );
+    let command = [old.to_str().unwrap(), "-c", &exec];
+    let Some(recording) = record(&dir, &[], &command) else {
+        return;
+    };
+    has_the_split_of_jit_py(&recording);
+    let found = interpreters(&recording).unwrap();
+    let of = |version: &str| {
+        found
+            .iter()
+            .find(|i| i["version"].as_str().unwrap().starts_with(version))
+            .map(|i| i["samples"].as_u64().unwrap())
+    };
+    // 3.12 only starts up before its exec.
+    let (old, new) = (of("3.12").unwrap_or(0), of("3.14").unwrap());
+    assert!(old < 50 && new > 300, "{found:?}");
+}

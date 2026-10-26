@@ -2,9 +2,9 @@
 
 How observations get into the [model](model.md). This doc lists what
 collectors must do and the candidate tools for each signal. The first
-milestone is in the [README](../README.md#status). Next, uhr's eBPF programs
-are to read interpreters' frames (see [runtimes](#runtimes)). The order after
-that is not decided.
+milestone is in the [README](../README.md#status). Since it, uhr's eBPF
+programs read the frames of CPython 3.11 to 3.14, with the limits
+[runtimes](#runtimes) gives. What comes next is not decided.
 
 ## Collector contract
 
@@ -268,9 +268,17 @@ for a native sampler, in perf map files or jitdump; a collector can read the
 interpreter's frames from its memory; or the runtime's own profiler can
 record them. Which way a runtime uses is decided when it is supported, and
 each supported runtime gets a test program. Python 3.12 and later and Node
-name their code in perf maps. uhr detects the runtimes in a
-target and records their versions. What it knows about a runtime's frames is
-kept apart from how it reads memory, so other platforms can use it too.
+name their code in perf maps. uhr's eBPF programs read the frames of
+CPython 3.11 to 3.14 with the GIL, in a `python3` program or a `libpython`
+another program embeds it with, from offsets 3.13 and later publish and
+from the headers of 3.11 and 3.12. Off-CPU stacks come from perf's context
+switches, which read no frames, so only perf maps name Python's code in
+them. 3.12 and later keep the frame that starts each call into the
+interpreter in the call's native frame, and mark the state each thread runs
+in, among those of its interpreters. 3.11 does neither. uhr detects the
+runtimes in a target and records their versions. What it knows about a
+runtime's frames is kept apart from how it reads memory, so other platforms
+can use it too.
 
 uhr's eBPF programs walk interpreters' frames at each CPU sample, and know
 no runtime. Each runtime uhr supports is a module of `uhr-core`. One whose

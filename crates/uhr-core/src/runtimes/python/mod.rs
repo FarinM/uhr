@@ -1,6 +1,8 @@
 //! CPython.
 
-use super::{JitCode, JitFunction, PerfMaps, Runtime, Setting};
+use super::{Error, Interpreter, JitCode, JitFunction, PerfMaps, Process, Runtime, Setting};
+
+mod interpreter;
 
 pub(super) struct Python;
 
@@ -23,6 +25,10 @@ impl Runtime for Python {
 
     fn perf_maps(&self) -> Option<&PerfMaps> {
         Some(&PERF_MAPS)
+    }
+
+    fn interpreter(&self, process: &dyn Process) -> Result<Option<Box<dyn Interpreter>>, Error> {
+        interpreter::find(self, process)
     }
 }
 
