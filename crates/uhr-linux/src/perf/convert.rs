@@ -26,7 +26,7 @@ use uhr_core::recording::{
     MissingSignal, Mode, OffCPUInterval, Origin, Platform, Recording, Sample, Sampling, Signal,
     StackCoverage, Stream, StreamCoverage, Target, Thread, ThreadName, ThreadState, Unwinding,
 };
-use uhr_ebpf::{MAX_FRAMES, SampleHeader, mode};
+use uhr_ebpf::{MAX_FRAMES, SampleHeader, UserRegisters, mode};
 
 pub(super) struct Input<'a> {
     pub perf_data: &'a Path,
@@ -54,6 +54,9 @@ pub(super) struct Input<'a> {
 pub(super) struct EbpfSamples<'a> {
     pub path: &'a Path,
     pub period_ns: u64,
+    /// The bytes of user stack copied with each sample, `None` where they
+    /// walked user stacks with frame pointers.
+    pub stack_bytes: Option<u32>,
 }
 
 pub(super) const TIMER_BIAS: &str = "cpu-clock samples come from a timer interrupt, so code \
@@ -62,7 +65,7 @@ pub(super) const TIMER_BIAS: &str = "cpu-clock samples come from a timer interru
 pub(super) const FRAME_POINTER_BIAS: &str = "Frame-pointer unwinding cuts stacks short in code \
      built without frame pointers, and misses the caller of a leaf function that has no frame \
      setup.";
-const DWARF_BIAS: &str = "DWARF unwinding falls back to frame pointers in code without unwind \
+pub(super) const DWARF_BIAS: &str = "DWARF unwinding falls back to frame pointers in code without unwind \
      tables, such as JIT code, and stops at the end of each sample's stack copy.";
 const OFF_CPU_BIAS: &str = "Off-CPU time comes from context switches, without wakeups, so the \
      time a woken thread waits for a CPU counts as blocked rather than runnable.";
@@ -169,7 +172,8 @@ pub(super) fn convert(input: Input) -> Result<(Recording, Option<EbpfStacks>)> {
         .collect();
 
     let mut state = State::new(input.max_stack_depth);
-    if stack_copy_bytes.is_some() {
+    let ebpf_copies = input.ebpf_samples.and_then(|s| s.stack_bytes);
+    if stack_copy_bytes.is_some() || ebpf_copies.is_some() {
         state.unwinding = Some(UserUnwinding::new());
     }
     let mut ebpf = input.ebpf_samples.map(EbpfReader::open).transpose()?;
@@ -381,8 +385,8 @@ pub(super) fn convert(input: Input) -> Result<(Recording, Option<EbpfStacks>)> {
             known_biases: known_biases.iter().map(|b| b.to_string()).collect(),
         },
     };
-    let ebpf_stacks = input.ebpf_samples.map(|_| EbpfStacks {
-        coverage: ebpf_coverage(&state, input.max_stack_depth),
+    let ebpf_stacks = input.ebpf_samples.map(|samples| EbpfStacks {
+        coverage: ebpf_coverage(&state, input.max_stack_depth, samples.stack_bytes),
         untracked: state.ebpf_untracked,
     });
 
@@ -432,10 +436,13 @@ pub(super) fn convert(input: Input) -> Result<(Recording, Option<EbpfStacks>)> {
     Ok((recording, ebpf_stacks))
 }
 
-fn ebpf_coverage(state: &State, max_stack_depth: u32) -> StackCoverage {
+fn ebpf_coverage(state: &State, max_stack_depth: u32, stack_bytes: Option<u32>) -> StackCoverage {
     StackCoverage {
-        unwinding: Unwinding::FramePointers,
-        stack_copy_bytes: None,
+        unwinding: match stack_bytes {
+            Some(_) => Unwinding::Dwarf,
+            None => Unwinding::FramePointers,
+        },
+        stack_copy_bytes: stack_bytes,
         samples: state.ebpf_samples,
         off_cpu_intervals: None,
         // The kernel reports throttling in an event's buffer, and the
@@ -443,8 +450,8 @@ fn ebpf_coverage(state: &State, max_stack_depth: u32) -> StackCoverage {
         throttle_events: None,
         max_stack_depth: ebpf_depth(max_stack_depth),
         stacks_at_stack_limit: state.ebpf_at_limit,
-        stacks_cut_at_stack_copy: None,
-        stacks_not_unwound: None,
+        stacks_cut_at_stack_copy: stack_bytes.map(|_| state.ebpf_cut_at_copy),
+        stacks_not_unwound: stack_bytes.map(|_| state.ebpf_not_unwound),
     }
 }
 
@@ -464,6 +471,8 @@ struct EbpfReader<'a> {
     index: Vec<(u64, u64, u32)>,
     next: usize,
     period_ns: u64,
+    /// The bytes of user stack each copy was asked for.
+    stack_bytes: Option<u32>,
     buffer: Vec<u8>,
 }
 
@@ -502,6 +511,7 @@ impl<'a> EbpfReader<'a> {
             index,
             next: 0,
             period_ns: samples.period_ns,
+            stack_bytes: samples.stack_bytes,
             buffer: Vec::new(),
         })
     }
@@ -521,17 +531,36 @@ impl<'a> EbpfReader<'a> {
             // numbers, any bits of which are valid.
             let header: SampleHeader =
                 unsafe { std::ptr::read_unaligned(self.buffer.as_ptr().cast()) };
-            let frames = &self.buffer[size_of::<SampleHeader>()..];
+            let rest = &self.buffer[size_of::<SampleHeader>()..];
             let count = header.kernel_frames as usize + header.user_frames as usize;
-            if frames.len() != count * 8 {
+            let copied = match header.copy {
+                0 => 0,
+                _ => size_of::<UserRegisters>() + header.stack_bytes as usize,
+            };
+            if rest.len() != count * 8 + copied {
                 return Err(unexpected(format!(
-                    "an eBPF sample of {len} bytes with {count} frames"
+                    "an eBPF sample of {len} bytes with {count} frames and a {copied}-byte copy"
                 )));
             }
+            let (frames, rest) = rest.split_at(count * 8);
             let frames = frames
                 .chunks_exact(8)
                 .map(|word| u64::from_ne_bytes(word.try_into().unwrap()));
-            state.ebpf_sample(&header, frames, self.period_ns);
+            let copy = (header.copy != 0).then(|| {
+                let (registers, stack) = rest.split_at(size_of::<UserRegisters>());
+                // SAFETY: as for the header, plain numbers, as many bytes.
+                let registers: UserRegisters =
+                    unsafe { std::ptr::read_unaligned(registers.as_ptr().cast()) };
+                UserCopy {
+                    ip: registers.ip,
+                    sp: registers.sp,
+                    bp: registers.bp,
+                    compat: registers.compat != 0,
+                    stack,
+                    full: Some(header.stack_bytes) == self.stack_bytes,
+                }
+            });
+            state.ebpf_sample(&header, frames, copy, self.period_ns);
             self.next += 1;
         }
         Ok(())
@@ -635,6 +664,8 @@ struct State {
     ebpf_samples: u64,
     ebpf_at_limit: u64,
     ebpf_untracked: u64,
+    ebpf_cut_at_copy: u64,
+    ebpf_not_unwound: u64,
     /// Only for recordings with a stack copy in each sample.
     unwinding: Option<UserUnwinding>,
     stacks_cut_at_stack_copy: u64,
@@ -678,6 +709,8 @@ impl State {
             ebpf_samples: 0,
             ebpf_at_limit: 0,
             ebpf_untracked: 0,
+            ebpf_cut_at_copy: 0,
+            ebpf_not_unwound: 0,
             unwinding: None,
             stacks_cut_at_stack_copy: 0,
             stacks_not_unwound: 0,
@@ -834,11 +867,13 @@ impl State {
     }
 
     /// A sample of uhr's eBPF programs, with its kernel frames and then its
-    /// user frames, each leaf first.
+    /// user frames, each leaf first, or with the user registers and stack
+    /// to unwind instead of the user frames.
     fn ebpf_sample(
         &mut self,
         header: &SampleHeader,
         frames: impl Iterator<Item = u64>,
+        copy: Option<UserCopy>,
         period_ns: u64,
     ) {
         let (pid, tid, time_ns) = (header.tgid, header.tid, header.time_ns);
@@ -868,6 +903,17 @@ impl State {
             let first = i == 0 || i == kernel;
             stack.push(self.frame(pid, context, address, !first));
         }
+        let limit = ebpf_depth(self.max_stack_depth) as usize;
+        if let (Some(copy), Some(unwinding)) = (copy, self.unwinding.as_mut()) {
+            let ids = self.processes.get(&pid).map_or(&[][..], Vec::as_slice);
+            let room = limit.saturating_sub(stack.len());
+            let user = unwinding.unwind(&copy, pid, ids, &self.mappings, room);
+            self.ebpf_cut_at_copy += u64::from(user.cut);
+            self.ebpf_not_unwound += u64::from(user.not_unwound);
+            for (address, return_address) in user.frames {
+                stack.push(self.frame(pid, ChainContext::User, address, return_address));
+            }
+        }
         let (mode, context) = match header.mode {
             mode::KERNEL => (Mode::Kernel, ChainContext::Kernel),
             mode::USER => (Mode::User, ChainContext::User),
@@ -877,7 +923,7 @@ impl State {
         if stack.is_empty() {
             stack.push(self.frame(pid, context, header.ip, false));
         }
-        if stack.len() >= ebpf_depth(self.max_stack_depth) as usize {
+        if stack.len() >= limit {
             self.ebpf_at_limit += 1;
         }
         let stack = intern(&mut self.stacks, &mut self.stack_ids, stack);
@@ -1348,9 +1394,11 @@ mod tests {
             mode: mode::KERNEL,
             kernel_frames: 1,
             user_frames: 0,
+            stack_bytes: 0,
+            copy: 0,
         };
         for pid in [1, 2, 3] {
-            state.ebpf_sample(&header(pid), [0xffff_0000_1000].into_iter(), 1000);
+            state.ebpf_sample(&header(pid), [0xffff_0000_1000].into_iter(), None, 1000);
         }
         assert_eq!((state.samples.len(), state.ebpf_untracked), (1, 2));
         assert_eq!(state.samples[0].pid, 1);
@@ -1373,8 +1421,10 @@ mod tests {
             mode: mode::USER,
             kernel_frames: 0,
             user_frames: 1,
+            stack_bytes: 0,
+            copy: 0,
         };
-        state.ebpf_sample(&header, [0x1010].into_iter(), 1000);
+        state.ebpf_sample(&header, [0x1010].into_iter(), None, 1000);
         assert_eq!((state.samples.len(), state.ebpf_untracked), (1, 0));
         let threads = state.take_threads();
         let main: Vec<_> = threads

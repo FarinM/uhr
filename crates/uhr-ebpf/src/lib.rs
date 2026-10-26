@@ -48,8 +48,12 @@ pub mod mode {
     pub const GUEST: u32 = 2;
 }
 
+/// The most bytes of user stack a sample copies, as perf's limit.
+pub const MAX_STACK_COPY: usize = 65528;
+
 /// What precedes a sample's frames in the ring buffer: its kernel frames,
-/// then its user frames, each leaf first.
+/// then its user frames, each leaf first. A sample with a stack copy has
+/// no user frames, but then `UserRegisters` and the copy.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct SampleHeader {
@@ -63,6 +67,21 @@ pub struct SampleHeader {
     pub mode: u32,
     pub kernel_frames: u32,
     pub user_frames: u32,
+    /// Bytes of user stack copied, after the user registers.
+    pub stack_bytes: u32,
+    /// Whether `UserRegisters` and the copy follow the frames.
+    pub copy: u32,
+}
+
+/// The user registers a stack copy is unwound from.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct UserRegisters {
+    pub ip: u64,
+    pub sp: u64,
+    pub bp: u64,
+    /// Whether they are those of 32-bit code.
+    pub compat: u64,
 }
 
 #[cfg(feature = "user")]

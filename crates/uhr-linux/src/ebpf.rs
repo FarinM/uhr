@@ -19,7 +19,7 @@ use aya::programs::perf_event::{
 use aya::programs::raw_trace_point::RawTracePointLinkId;
 use aya::programs::trace_point::TracePointLinkId;
 use aya::programs::{PerfEvent, RawTracePoint, TracePoint};
-use aya::util::online_cpus;
+use aya::util::{nr_cpus, online_cpus};
 use aya::{Ebpf, EbpfLoader};
 use syscalls::Sysno;
 use uhr_core::recording::SyscallCalls;
@@ -125,6 +125,13 @@ pub(crate) const CAN_SAMPLE: bool = cfg!(any(target_arch = "x86_64", target_arch
 /// Room for samples while uhr is between reads, a few milliseconds apart.
 const SAMPLE_BUFFER: u32 = 16 << 20;
 
+/// Room for each CPU's samples with stack copies, for a few times as long.
+const COPY_BUFFER_PER_CPU: u32 = 2 << 20;
+
+/// The most kernel memory, which it can't swap out, that samples with
+/// stack copies take.
+const MAX_COPY_BUFFER: u32 = 1 << 30;
+
 /// How often the samples are copied out of the ring buffer.
 const READ_EVERY: Duration = Duration::from_millis(20);
 
@@ -139,6 +146,9 @@ pub(crate) struct Sampling {
     pub(crate) period_ns: u64,
     pub(crate) path: PathBuf,
     pub(crate) max_stack: u32,
+    /// The bytes of user stack to copy with each sample, for uhr to unwind.
+    /// `None` to walk user stacks with frame pointers.
+    pub(crate) stack_bytes: Option<u32>,
 }
 
 /// What the syscall programs counted.
@@ -593,7 +603,8 @@ impl Drop for Reader {
 }
 
 /// Only its owner may read it, as perf's data: samples give away where the
-/// kernel and the target keep their code.
+/// kernel and the target keep their code, and copies of the target's
+/// stack.
 fn create_private(path: &Path) -> io::Result<File> {
     let mut options = OpenOptions::new();
     options.write(true).create_new(true).mode(0o600).open(path)
@@ -688,12 +699,31 @@ impl Layout {
     }
 }
 
+/// The ring buffer's size for samples with stack copies from `cpus` CPUs,
+/// a power of two as the kernel wants.
+fn copy_buffer(cpus: usize) -> u32 {
+    let size = (cpus as u64).saturating_mul(COPY_BUFFER_PER_CPU.into());
+    let size = size.clamp(SAMPLE_BUFFER.into(), MAX_COPY_BUFFER.into());
+    size.next_power_of_two() as u32
+}
+
 fn load(sampling: Option<&Sampling>, layout: Layout) -> Result<Ebpf, Error> {
-    let size = match sampling {
-        Some(_) => SAMPLE_BUFFER,
-        None => rustix::param::page_size() as u32,
+    let stack_bytes = sampling.and_then(|s| s.stack_bytes);
+    // A copy of the stack for each CPU, which the kernel wants room for in
+    // every one it may bring online.
+    let copies = match stack_bytes {
+        Some(_) => nr_cpus().map_err(|(_, e)| Error::Cpus(e))? as u32,
+        None => 1,
+    };
+    let size = match (sampling, stack_bytes) {
+        // By the CPUs online: the kernel may say it could bring up many
+        // more, and one it brings up later shares the room.
+        (Some(_), Some(_)) => copy_buffer(online_cpus().map_err(|(_, e)| Error::Cpus(e))?.len()),
+        (Some(_), None) => SAMPLE_BUFFER,
+        (None, _) => rustix::param::page_size() as u32,
     };
     let max_stack = sampling.map_or(uhr_ebpf::MAX_FRAMES as u32, |s| s.max_stack);
+    let stack_bytes = stack_bytes.unwrap_or(0);
     let task_flags = layout.task_flags.unwrap_or(u32::MAX);
     let (signal, live) = layout.exits.unwrap_or((u32::MAX, u32::MAX));
     #[cfg(uhr_ebpf)]
@@ -701,7 +731,9 @@ fn load(sampling: Option<&Sampling>, layout: Layout) -> Result<Ebpf, Error> {
         check_namespace()?;
         EbpfLoader::new()
             .map_max_entries("SAMPLES", size)
+            .map_max_entries("COPIES", copies)
             .override_global("MAX_STACK", &max_stack, CAN_SAMPLE)
+            .override_global("STACK_BYTES", &stack_bytes, CAN_SAMPLE)
             .override_global("TASK_FLAGS", &task_flags, CAN_SAMPLE)
             .override_global("TASK_SIGNAL", &signal, true)
             .override_global("SIGNAL_LIVE", &live, true)
@@ -710,7 +742,8 @@ fn load(sampling: Option<&Sampling>, layout: Layout) -> Result<Ebpf, Error> {
     }
     #[cfg(not(uhr_ebpf))]
     {
-        let _ = (size, max_stack, task_flags, signal, live, EbpfLoader::new);
+        let _ = (size, max_stack, stack_bytes, task_flags, signal, live);
+        let _ = EbpfLoader::new;
         Err(Error::NotBuilt)
     }
 }
@@ -749,6 +782,15 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     use super::*;
+
+    #[test]
+    fn sizes_the_buffer_for_stack_copies_within_bounds() {
+        assert_eq!(copy_buffer(1), SAMPLE_BUFFER);
+        assert_eq!(copy_buffer(12), 32 << 20);
+        for cpus in [1025, 1536, 2048, usize::MAX] {
+            assert_eq!(copy_buffer(cpus), MAX_COPY_BUFFER);
+        }
+    }
 
     #[test]
     fn creates_the_samples_file_for_its_owner_only() {

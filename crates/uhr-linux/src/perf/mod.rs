@@ -183,12 +183,6 @@ pub fn record(options: &RecordOptions, interrupts: &Interrupts, out: &Path) -> R
             fix: Some("Record with --sampler perf.".into()),
         });
     }
-    if let (Some(Sampler::Ebpf), Unwind::Dwarf { .. }) = (options.sampler, options.unwind) {
-        return Err(Error::Blocked {
-            detail: "uhr's eBPF programs walk frame pointers, and copy no stacks to unwind".into(),
-            fix: Some("Record with --sampler perf to unwind with DWARF.".into()),
-        });
-    }
     if let Unwind::Dwarf { .. } = options.unwind {
         let check = doctor::check_dwarf_unwinding();
         if check.status != Status::Ok {
@@ -276,6 +270,7 @@ pub fn record(options: &RecordOptions, interrupts: &Interrupts, out: &Path) -> R
         Some(tick) => Some(convert::EbpfSamples {
             path: &samples,
             period_ns: tick.period_ns,
+            stack_bytes: tick.stack_bytes,
         }),
         None => None,
     };
@@ -423,7 +418,13 @@ fn add_ebpf(
         known_biases.extend(
             [
                 convert::TIMER_BIAS,
-                convert::FRAME_POINTER_BIAS,
+                match sampled
+                    .as_ref()
+                    .map(|(stacks, _)| stacks.coverage.unwinding)
+                {
+                    Some(recording::Unwinding::Dwarf) => convert::DWARF_BIAS,
+                    _ => convert::FRAME_POINTER_BIAS,
+                },
                 "Time in BPF programs at kprobes and tracepoints, which other tools load, has no \
                  samples: the kernel runs no program at a perf event while one of those runs.",
             ]
@@ -842,6 +843,7 @@ fn start_ebpf(
         period_ns: tick.period_ns,
         path: samples.to_owned(),
         max_stack: tick.max_stack,
+        stack_bytes: tick.stack_bytes,
     });
     if !options.syscalls && sampling.is_none() {
         return Ok(None);
@@ -916,20 +918,22 @@ impl Capture<'_> {
 }
 
 /// When uhr's eBPF programs sample: every `period_ns` of each CPU's clock,
-/// stacks of up to `max_stack` frames.
+/// stacks of up to `max_stack` frames, and `stack_bytes` of each user stack
+/// copied to unwind, if not by frame pointers.
 struct Tick {
     period_ns: u64,
     frequency_hz: u64,
     max_stack: u32,
+    stack_bytes: Option<u32>,
 }
 
 /// Where uhr's eBPF programs are to sample, at the frequency asked for,
 /// lowered to the kernel's limit as perf lowers it. `None` where perf is to
 /// sample.
 fn tick(options: &RecordOptions) -> Result<Option<Tick>> {
-    match (options.sampler, options.unwind) {
-        (Some(Sampler::Perf), _) | (None, Unwind::Dwarf { .. }) => return Ok(None),
-        (None, _) if !ebpf::CAN_SAMPLE => return Ok(None),
+    match options.sampler {
+        Some(Sampler::Perf) => return Ok(None),
+        None if !ebpf::CAN_SAMPLE => return Ok(None),
         _ => {}
     }
     let frequency_hz = options.frequency_hz.clamp(1, read_number(MAX_SAMPLE_RATE)?);
@@ -939,6 +943,10 @@ fn tick(options: &RecordOptions) -> Result<Option<Tick>> {
         period_ns,
         frequency_hz: 1_000_000_000 / period_ns,
         max_stack: max_stack.min(uhr_ebpf::MAX_FRAMES as u32),
+        stack_bytes: match options.unwind {
+            Unwind::FramePointers => None,
+            Unwind::Dwarf { stack_bytes } => Some(stack_bytes),
+        },
     }))
 }
 

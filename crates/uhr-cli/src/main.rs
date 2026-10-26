@@ -148,8 +148,7 @@ struct RecordArgs {
     #[arg(long)]
     no_syscalls: bool,
     /// What samples CPU time. By default uhr's eBPF programs do, when uhr
-    /// may load them and stacks are walked with frame pointers, and perf
-    /// does otherwise
+    /// may load them, and perf does otherwise
     #[arg(long, value_enum)]
     sampler: Option<SamplerArg>,
     /// Record this running process, and the threads and processes it

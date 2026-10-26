@@ -276,3 +276,76 @@ fn samples_a_command_another_thread_ran() {
     let hot = self_share(&result, "hot");
     assert!((hot - 0.8).abs() < 0.05, "hot has {hot}: {result}");
 }
+
+#[test]
+fn unwinds_copies_of_stacks_without_frame_pointers() {
+    let dir = scratch("sampler_dwarf");
+    let program = dir.join("paths");
+    common::compile_without_frame_pointers("paths", &program, "-O2");
+    let recording = dir.join("rec");
+    let rec = recording.to_str().unwrap();
+    let args = [
+        "record",
+        "-o",
+        rec,
+        "--unwind",
+        "dwarf",
+        "--",
+        program.to_str().unwrap(),
+        "100",
+    ];
+    if uhr_as_root(&args, &recording).is_none() {
+        eprintln!("skipped: needs root through sudo without a password");
+        return;
+    }
+    let Some(streams) = sampled_by_ebpf(&recording) else {
+        return;
+    };
+    let ebpf = streams.iter().find(|s| s["id"] == "ebpf").unwrap();
+    let stacks = &ebpf["coverage"]["stacks"];
+    assert_eq!(stacks["unwinding"], "dwarf", "{stacks}");
+    assert_eq!(stacks["stack_copy_bytes"], 32768, "{stacks}");
+    assert_eq!(stacks["stacks_cut_at_stack_copy"], 0, "{stacks}");
+
+    let paths = json(&["call-paths", rec, "--function", "spin", "--mode", "user"]);
+    let share = |caller: &str| {
+        let callers = paths["callers"].as_array().unwrap();
+        let found = callers.iter().find(|c| c["function"] == caller);
+        found.map_or(0.0, |c| c["share"].as_f64().unwrap())
+    };
+    assert!((0.7..=0.8).contains(&share("from_a")), "{paths}");
+    assert!((0.2..=0.3).contains(&share("from_b")), "{paths}");
+}
+
+#[test]
+fn does_not_unwind_32_bit_code_from_the_ldt() {
+    let dir = scratch("sampler_ldt");
+    let program = dir.join("ldt");
+    common::compile_with_flags("ldt", &program, &["-m32", "-static", "-nostdlib", "-O2"]);
+    let recording = dir.join("rec");
+    let rec = recording.to_str().unwrap();
+    let args = [
+        "record",
+        "-o",
+        rec,
+        "--unwind",
+        "dwarf",
+        "--",
+        program.to_str().unwrap(),
+    ];
+    if uhr_as_root(&args, &recording).is_none() {
+        eprintln!("skipped: needs root through sudo without a password");
+        return;
+    }
+    let Some(streams) = sampled_by_ebpf(&recording) else {
+        return;
+    };
+    let ebpf = streams.iter().find(|s| s["id"] == "ebpf").unwrap();
+    let stacks = &ebpf["coverage"]["stacks"];
+    let samples = stacks["samples"].as_u64().unwrap();
+    let not_unwound = stacks["stacks_not_unwound"].as_u64().unwrap();
+    assert!(samples > 100, "{stacks}");
+    // A few samples can come from before the exec.
+    assert!(not_unwound * 100 >= samples * 99, "{stacks}");
+    assert_eq!(stacks["stacks_cut_at_stack_copy"], 0, "{stacks}");
+}

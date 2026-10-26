@@ -35,6 +35,26 @@ fn manifest(recording: &Path) -> Value {
     serde_json::from_slice(&fs::read(recording.join("manifest.json")).unwrap()).unwrap()
 }
 
+/// The stack counts of the streams that took stacks, added up: perf's, or
+/// as root, perf's of the context switches and the samples of uhr's eBPF
+/// programs.
+fn stacks(recording: &Path, count: &str) -> u64 {
+    let manifest = manifest(recording);
+    let streams = manifest["streams"].as_array().unwrap();
+    let counts = streams.iter().map(|s| &s["coverage"]["stacks"][count]);
+    counts.filter_map(Value::as_u64).sum()
+}
+
+/// The stream that sampled CPU time.
+fn sampler(recording: &Path) -> Value {
+    let manifest = manifest(recording);
+    let streams = manifest["streams"].as_array().unwrap();
+    let sampled = streams
+        .iter()
+        .find(|s| !s["collector"]["sampling"].is_null());
+    sampled.unwrap().clone()
+}
+
 /// User mode only: a timer interrupt in a function adds kernel frames
 /// below it, and these tests are about the C call structure.
 fn callers(recording: &Path, function: &str) -> Vec<(String, f64)> {
@@ -80,7 +100,7 @@ fn unwinds_binaries_built_without_frame_pointers() {
     compile_without_frame_pointers("paths", &program, "-O2");
     let recording = record(&dir, &program, &[], &["100"]);
 
-    let stream = &manifest(&recording)["streams"][0];
+    let stream = sampler(&recording);
     let stacks = &stream["coverage"]["stacks"];
     assert_eq!(stacks["unwinding"], "dwarf");
     assert_eq!(stacks["stack_copy_bytes"], 32768);
@@ -147,11 +167,9 @@ fn counts_the_stacks_cut_at_the_stack_copy() {
     let program = dir.join("paths");
     compile_without_frame_pointers("paths", &program, "-O2");
     let recording = record(&dir, &program, &["--stack-size", "64"], &["30"]);
-    let coverage = &manifest(&recording)["streams"][0]["coverage"]["stacks"];
-    let stacks =
-        coverage["samples"].as_f64().unwrap() + coverage["off_cpu_intervals"].as_f64().unwrap();
-    let cut = coverage["stacks_cut_at_stack_copy"].as_f64().unwrap();
-    assert!(cut > 0.9 * stacks, "{coverage}");
+    let all = stacks(&recording, "samples") + stacks(&recording, "off_cpu_intervals");
+    let cut = stacks(&recording, "stacks_cut_at_stack_copy");
+    assert!(cut as f64 > 0.9 * all as f64, "{cut} of {all} cut");
     // What fits in the copy is still there.
     assert_eq!(callers(&recording, "spin").len(), 2);
 }
@@ -163,12 +181,11 @@ fn does_not_unwind_32_bit_code_whose_file_is_gone() {
     compile_with_flags("i386", &program, &["-m32", "-static", "-nostdlib", "-O2"]);
     let recording = record(&dir, &program, &[], &[]);
     assert!(!program.exists(), "the program deletes itself");
-    let coverage = &manifest(&recording)["streams"][0]["coverage"]["stacks"];
-    let samples = coverage["samples"].as_u64().unwrap();
-    assert!(samples > 0, "{coverage}");
-    let stacks = samples + coverage["off_cpu_intervals"].as_u64().unwrap();
-    assert_eq!(coverage["stacks_not_unwound"], stacks, "{coverage}");
-    assert_eq!(coverage["stacks_cut_at_stack_copy"], 0, "{coverage}");
+    let samples = stacks(&recording, "samples");
+    assert!(samples > 0);
+    let all = samples + stacks(&recording, "off_cpu_intervals");
+    assert_eq!(stacks(&recording, "stacks_not_unwound"), all);
+    assert_eq!(stacks(&recording, "stacks_cut_at_stack_copy"), 0);
 }
 
 #[test]
