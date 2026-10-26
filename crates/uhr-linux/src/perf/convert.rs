@@ -5,8 +5,8 @@ use std::io::BufReader;
 use std::path::Path;
 
 use linux_perf_data::linux_perf_event_reader::constants::{
-    PERF_CONTEXT_KERNEL, PERF_CONTEXT_MAX, PERF_CONTEXT_USER, PERF_SAMPLE_REGS_ABI_32,
-    PERF_SAMPLE_REGS_ABI_64,
+    PERF_CONTEXT_KERNEL, PERF_CONTEXT_MAX, PERF_CONTEXT_USER, PERF_REG_X86_BP, PERF_REG_X86_IP,
+    PERF_REG_X86_SP, PERF_SAMPLE_REGS_ABI_32, PERF_SAMPLE_REGS_ABI_64,
 };
 use linux_perf_data::linux_perf_event_reader::{
     AttrFlags, ClockId, ContextSwitchRecord, CpuMode, Endianness, EventRecord, Mmap2FileId,
@@ -16,7 +16,7 @@ use linux_perf_data::linux_perf_event_reader::{
 use linux_perf_data::{PerfFileReader, PerfFileRecord};
 use tracing::warn;
 
-use super::unwind::Unwinding as UserUnwinding;
+use super::unwind::{Unwinding as UserUnwinding, UserCopy};
 use super::{Error, Result, io_error};
 use crate::kallsyms::{self, Kallsyms};
 use uhr_core::recording::{
@@ -809,9 +809,19 @@ impl State {
         let user = match self.unwinding.as_mut() {
             Some(unwinding) => {
                 let abi = user_regs_abi(record, sample)?;
-                let ids = self.processes.get(&pid).map_or(&[][..], Vec::as_slice);
-                let room = (self.max_stack_depth as usize).saturating_sub(stack.len());
-                unwinding.unwind(sample, abi, pid, ids, &self.mappings, room)
+                let bytes = sample.user_stack.as_ref().map(|(bytes, valid)| {
+                    let bytes = bytes.as_slice();
+                    let valid = (*valid as usize).min(bytes.len());
+                    (bytes, valid)
+                });
+                let copy = bytes
+                    .as_ref()
+                    .and_then(|(bytes, valid)| user_copy(sample, abi, &bytes[..*valid]));
+                copy.map(|copy| {
+                    let ids = self.processes.get(&pid).map_or(&[][..], Vec::as_slice);
+                    let room = (self.max_stack_depth as usize).saturating_sub(stack.len());
+                    unwinding.unwind(&copy, pid, ids, &self.mappings, room)
+                })
             }
             None => None,
         };
@@ -919,6 +929,19 @@ impl State {
             m.start <= address && address < m.end
         })
     }
+}
+
+/// The user registers and stack copy perf took with a sample, in `abi`.
+/// `None` without them, as for a kernel thread.
+fn user_copy<'a>(sample: &SampleRecord, abi: u64, stack: &'a [u8]) -> Option<UserCopy<'a>> {
+    let regs = sample.user_regs.as_ref()?;
+    Some(UserCopy {
+        ip: regs.get(PERF_REG_X86_IP)?,
+        sp: regs.get(PERF_REG_X86_SP)?,
+        bp: regs.get(PERF_REG_X86_BP)?,
+        compat: abi == PERF_SAMPLE_REGS_ABI_32,
+        stack,
+    })
 }
 
 /// The ABI perf recorded the sample's user registers in, which tells 32-bit

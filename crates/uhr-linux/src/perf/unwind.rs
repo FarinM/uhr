@@ -8,10 +8,6 @@ use framehop::{Error as UnwindError, ExplicitModuleSectionInfo, FrameAddress, Mo
 use gimli::{
     BaseAddresses, CieOrFde, DebugFrame, EhFrame, EndianSlice, LittleEndian, UnwindSection,
 };
-use linux_perf_data::linux_perf_event_reader::SampleRecord;
-use linux_perf_data::linux_perf_event_reader::constants::{
-    PERF_REG_X86_BP, PERF_REG_X86_IP, PERF_REG_X86_SP, PERF_SAMPLE_REGS_ABI_32,
-};
 use tracing::debug;
 use wholesym::samply_symbols::object::{
     self, Object, ObjectSection, ObjectSegment, SegmentFlags, elf,
@@ -64,6 +60,17 @@ struct Segment {
     executable: bool,
 }
 
+/// A sample's user registers, and its copy of the user stack from the
+/// stack pointer up.
+pub(super) struct UserCopy<'a> {
+    pub(super) ip: u64,
+    pub(super) sp: u64,
+    pub(super) bp: u64,
+    /// The registers are those of 32-bit code.
+    pub(super) compat: bool,
+    pub(super) stack: &'a [u8],
+}
+
 pub(super) struct UserStack {
     /// Leaf first, and whether each is a return address.
     pub(super) frames: Vec<(u64, bool)>,
@@ -84,27 +91,29 @@ impl Unwinding {
         }
     }
 
-    /// `abi` is the one perf recorded the user registers in, and `ids` are
-    /// the process's mappings, oldest first. `None` if the sample has no
-    /// user registers or stack, as in a kernel thread.
+    /// `ids` are the process's mappings, oldest first.
     pub(super) fn unwind(
         &mut self,
-        sample: &SampleRecord,
-        abi: u64,
+        copy: &UserCopy,
         pid: u32,
         ids: &[u32],
         mappings: &[Mapping],
         max_frames: usize,
-    ) -> Option<UserStack> {
-        let regs = sample.user_regs.as_ref()?;
-        let ip = regs.get(PERF_REG_X86_IP)?;
+    ) -> UserStack {
+        let UserCopy {
+            ip,
+            sp,
+            bp,
+            compat,
+            stack,
+        } = *copy;
         // The x86-64 unwinder would read a 32-bit stack as 8-byte words.
-        if abi == PERF_SAMPLE_REGS_ABI_32 {
-            return Some(UserStack {
+        if compat {
+            return UserStack {
                 frames: vec![(ip, false)],
                 cut: false,
                 not_unwound: true,
-            });
+            };
         }
         let built_from = (ids.len(), ids.last().copied());
         let process = match self.processes.get_mut(&pid) {
@@ -122,10 +131,6 @@ impl Unwinding {
             }
         };
 
-        let (sp, bp) = (regs.get(PERF_REG_X86_SP)?, regs.get(PERF_REG_X86_BP)?);
-        let (stack, valid) = sample.user_stack.as_ref()?;
-        let stack = stack.as_slice();
-        let stack = &stack[..(*valid as usize).min(stack.len())];
         let end = sp.saturating_add(stack.len() as u64);
         let mut read_stack = |address: u64| {
             let offset = address.checked_sub(sp).ok_or(())? as usize;
@@ -155,11 +160,11 @@ impl Unwinding {
                 Err(_) => break,
             }
         }
-        Some(UserStack {
+        UserStack {
             frames,
             cut,
             not_unwound: false,
-        })
+        }
     }
 }
 
