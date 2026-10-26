@@ -69,8 +69,9 @@ count whole threads over the whole capture, so a filter by time, mode,
 stack or thread name leaves them out. Where only the code every syscall
 passes through is on the stack, as on the way back to user space, where
 threads are often preempted, the time is in a syscall, but which one is
-unknown. User code, faults and interrupts from user space, and the start of
-a thread are not in a syscall.
+unknown. Time in uhr's own eBPF programs, which run as syscalls enter and
+leave the kernel, is a row of its own. User code, faults and interrupts from
+user space, and the start of a thread are not in a syscall.
 Where the stack does not show how the kernel was entered, that is unknown:
 its kernel functions have no names, or it reached the depth limit, which can
 cut a fault or interrupt off from the syscall it happened in, since x86

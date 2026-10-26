@@ -880,6 +880,7 @@ fn write_syscall_rows(out: &mut impl Write, rows: &[SyscallRow]) -> io::Result<(
     }
     for row in rows {
         let syscall = match (row.in_syscall, &row.syscall) {
+            _ if row.own_programs => "(uhr's eBPF programs)",
             (_, Some(name)) => name,
             (Some(true), None) => "(in a syscall, unknown which)",
             (Some(false), None) => "(not in a syscall)",

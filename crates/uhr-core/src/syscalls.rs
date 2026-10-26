@@ -10,6 +10,9 @@ use crate::recording::{Origin, Recording, Signal, SyscallCalls};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum InSyscall<'a> {
     Named(&'a str),
+    /// In uhr's own eBPF programs, which run as syscalls enter and leave
+    /// the kernel. Their stacks don't show which syscall.
+    OwnPrograms,
     /// In a syscall whose own function is not on the stack, as on its way
     /// back to user space.
     Unnamed,
@@ -61,10 +64,15 @@ pub(crate) fn of_stacks<'a>(
         .filter_map(|s| s.coverage.stacks.as_ref())
         .map(|s| s.max_stack_depth as usize)
         .min();
+    let own_programs = recording.in_own_programs();
     recording
         .stacks
         .iter()
-        .map(|stack| {
+        .enumerate()
+        .map(|(id, stack)| {
+            if own_programs.as_ref().is_some_and(|own| own[id]) {
+                return Some(InSyscall::OwnPrograms);
+            }
             let whole = depth_limit.is_some_and(|limit| stack.len() < limit);
             let (mut syscall, mut path, mut outermost) = (None, false, None);
             // Leaf first, so the last kernel function is where the kernel

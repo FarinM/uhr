@@ -304,4 +304,9 @@ fn tells_its_own_programs_apart() {
         (share * time_ns - overhead).abs() < 1.0,
         "{share} of {time_ns}, {ebpf}"
     );
+
+    let syscalls = json(&["query", rec, "--group-by", "syscall", "--top", "100"]);
+    let rows = syscalls["rows"].as_array().unwrap();
+    let own = rows.iter().find(|r| r["own_programs"] == true).unwrap();
+    assert_eq!(own["share"].as_f64().unwrap(), share, "{syscalls}");
 }

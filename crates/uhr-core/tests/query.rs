@@ -497,6 +497,38 @@ fn tells_the_time_in_uhrs_own_programs_apart() {
 }
 
 #[test]
+fn gives_the_time_in_uhrs_own_programs_a_syscall_row() {
+    let (recording, symbols) = with_own_programs();
+    let query = Query {
+        group_by: GroupBy::Syscall,
+        ..query(10)
+    };
+    let result = run(&recording, Some(&symbols), &query).unwrap();
+    let Rows::Syscalls(rows) = &result.rows else {
+        panic!("rows of another grouping: {:?}", result.rows)
+    };
+    let rows: Vec<_> = rows
+        .iter()
+        .map(|r| {
+            (
+                r.in_syscall,
+                r.syscall.as_deref(),
+                r.own_programs,
+                r.time_ns,
+            )
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            (Some(false), None, false, 9),
+            (Some(true), None, true, 6),
+            (None, None, false, 3),
+        ]
+    );
+}
+
+#[test]
 fn merges_the_same_function_across_mappings_and_counts_recursion_once() {
     let mut recording = recording();
     recording.mappings[0].build_id = Some("abcd".into());

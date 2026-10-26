@@ -111,6 +111,9 @@ pub struct SyscallRow {
     /// `__x64_sys_read`. `None` outside syscalls, and in a syscall whose
     /// function is not on the stack, as on its way back to user space.
     pub syscall: Option<String>,
+    /// Time in uhr's own eBPF programs, which run as syscalls enter and
+    /// leave the kernel. Their stacks don't show which syscall.
+    pub own_programs: bool,
     pub time_ns: u64,
     pub share: f64,
     /// The calls uhr's eBPF programs counted, for a named syscall. `None`
@@ -386,9 +389,10 @@ fn syscall_rows(
     let mut rows: Vec<SyscallRow> = ns
         .into_iter()
         .map(|(syscall, time_ns)| {
+            let own_programs = syscall == InSyscall::OwnPrograms;
             let (in_syscall, syscall) = match syscall {
                 InSyscall::Named(name) => (Some(true), Some(name.to_owned())),
-                InSyscall::Unnamed => (Some(true), None),
+                InSyscall::OwnPrograms | InSyscall::Unnamed => (Some(true), None),
                 InSyscall::Outside => (Some(false), None),
                 InSyscall::Unknown => (None, None),
             };
@@ -399,6 +403,7 @@ fn syscall_rows(
             });
             SyscallRow {
                 in_syscall,
+                own_programs,
                 syscall,
                 time_ns,
                 share: share(time_ns),
@@ -413,6 +418,7 @@ fn syscall_rows(
             .flatten()
             .map(|(name, calls)| SyscallRow {
                 in_syscall: Some(true),
+                own_programs: false,
                 syscall: Some(name),
                 time_ns: 0,
                 share: 0.0,
@@ -426,6 +432,7 @@ fn syscall_rows(
             .then_with(|| calls(b).cmp(&calls(a)))
             .then_with(|| a.syscall.cmp(&b.syscall))
             .then_with(|| a.in_syscall.cmp(&b.in_syscall))
+            .then_with(|| a.own_programs.cmp(&b.own_programs))
     });
     rows
 }
