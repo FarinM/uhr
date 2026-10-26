@@ -3,8 +3,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error as _;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -555,7 +556,7 @@ impl Reader {
             path: path.to_owned(),
             source,
         };
-        let file = File::create_new(path).map_err(error)?;
+        let file = create_private(path).map_err(error)?;
         let stop = Arc::new(AtomicBool::new(false));
         let thread = {
             let stop = stop.clone();
@@ -589,6 +590,13 @@ impl Drop for Reader {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
     }
+}
+
+/// Only its owner may read it, as perf's data: samples give away where the
+/// kernel and the target keep their code.
+fn create_private(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true).mode(0o600).open(path)
 }
 
 fn copy(mut ring: RingBuf<MapData>, mut out: BufWriter<File>, stop: &AtomicBool) -> io::Result<()> {
@@ -732,5 +740,22 @@ fn row(pid: u32, tid: u32, number: u32, calls: u64, ns: u64, buckets: &[u64]) ->
         time_ns: ns,
         latency: buckets.to_vec(),
         unfinished_ns: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::*;
+
+    #[test]
+    fn creates_the_samples_file_for_its_owner_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("samples");
+        create_private(&path).unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
     }
 }
