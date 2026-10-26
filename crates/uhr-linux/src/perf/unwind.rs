@@ -110,7 +110,7 @@ impl Unwinding {
         // The x86-64 unwinder would read a 32-bit stack as 8-byte words.
         if compat {
             return UserStack {
-                frames: vec![(ip, false)],
+                frames: [(ip, false)].into_iter().take(max_frames).collect(),
                 cut: false,
                 not_unwound: true,
             };
@@ -572,6 +572,23 @@ mod tests {
         let user = Unwinding::new().unwind(&copy, 1, &[], &[], 10);
         assert_eq!(user.frames, [(0x1000, false)]);
         assert!(user.cut);
+    }
+
+    #[test]
+    fn keeps_32_bit_code_within_the_frames_left() {
+        let copy = UserCopy {
+            ip: 0x1000,
+            sp: 0x7000,
+            bp: 0x7000,
+            compat: true,
+            stack: &[],
+        };
+        let mut unwinding = Unwinding::new();
+        for (max_frames, kept) in [(0, 0), (5, 1)] {
+            let user = unwinding.unwind(&copy, 1, &[], &[], max_frames);
+            assert_eq!(user.frames.len(), kept);
+            assert!(user.not_unwound);
+        }
     }
 
     fn object(dir: &std::path::Path, name: &str, flags: &[&str]) -> String {
