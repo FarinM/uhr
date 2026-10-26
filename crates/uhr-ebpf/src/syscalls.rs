@@ -1,7 +1,10 @@
 //! Counts and times the syscalls of the target's processes, per thread and
 //! syscall, from their first after exec.
 
-use aya_ebpf::helpers::{bpf_get_current_pid_tgid, bpf_ktime_get_ns};
+use aya_ebpf::Global;
+use aya_ebpf::helpers::{
+    bpf_get_current_pid_tgid, bpf_get_current_task, bpf_ktime_get_ns, bpf_probe_read_kernel,
+};
 use aya_ebpf::macros::{map, raw_tracepoint, tracepoint};
 use aya_ebpf::maps::{HashMap, LruHashMap, PerCpuArray};
 use aya_ebpf::programs::{RawTracePointContext, TracePointContext};
@@ -29,6 +32,10 @@ static EMPTY: PerCpuArray<Calls> = PerCpuArray::with_max_entries(1, 0);
 /// Calls that found `CALLS` full.
 #[map]
 static LOST: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
+
+/// Processes the target started that found `TARGETS` full.
+#[map]
+static UNFOLLOWED: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
 
 fn current() -> (u32, u32) {
     let pid_tgid = bpf_get_current_pid_tgid();
@@ -123,9 +130,56 @@ pub fn task_newtask(ctx: TracePointContext) -> u32 {
     }) else {
         return 0;
     };
-    if flags & CLONE_THREAD == 0 {
-        let _ = TARGETS.insert(pid as u32, state, 0);
+    if flags & CLONE_THREAD == 0
+        && TARGETS.insert(pid as u32, state, 0).is_err()
+        && let Some(unfollowed) = UNFOLLOWED.get_ptr_mut(0)
+    {
+        unsafe { *unfollowed += 1 };
     }
+    0
+}
+
+/// Where a task's `signal` is in its `task_struct`, and the count of the
+/// process's live threads in that `signal_struct`, which uhr sets at load
+/// from the kernel's BTF.
+#[unsafe(no_mangle)]
+static TASK_SIGNAL: Global<u32> = Global::new(u32::MAX);
+#[unsafe(no_mangle)]
+static SIGNAL_LIVE: Global<u32> = Global::new(u32::MAX);
+
+/// Lets go of a process when its last thread exits, so `TARGETS` can't fill
+/// with old ones. Its id is still its own then: the kernel frees it only
+/// once the process is reaped.
+#[tracepoint]
+pub fn sched_process_exit(_ctx: TracePointContext) -> u32 {
+    let (tgid, _) = current();
+    if unsafe { TARGETS.get(tgid) }.is_none() {
+        return 0;
+    }
+    let task = unsafe { bpf_get_current_task() } as *const u8;
+    let signal = task.wrapping_add(TASK_SIGNAL.load() as usize);
+    let Ok(signal) = (unsafe { bpf_probe_read_kernel(signal.cast::<u64>()) }) else {
+        return 0;
+    };
+    let live = (signal as *const u8).wrapping_add(SIGNAL_LIVE.load() as usize);
+    // The exiting thread is no longer counted.
+    if unsafe { bpf_probe_read_kernel(live.cast::<i32>()) } == Ok(0) {
+        let _ = TARGETS.remove(tgid);
+    }
+    0
+}
+
+/// Lets go of a process once it is freed, where the kernel's BTF does not
+/// say how to see its last thread exit. By then a new process can have
+/// taken its id, and with it its place.
+#[tracepoint]
+pub fn sched_process_free(ctx: TracePointContext) -> u32 {
+    // sched:sched_process_free has the task's id at 24. A process's last
+    // task freed is its leader, whose id is the process's.
+    let Ok(pid) = (unsafe { ctx.read_at::<i32>(24) }) else {
+        return 0;
+    };
+    let _ = TARGETS.remove(pid as u32);
     0
 }
 

@@ -341,3 +341,66 @@ fn counts_no_syscalls_in_a_pid_namespace_of_its_own() {
         "{manifest}"
     );
 }
+
+#[test]
+fn follows_processes_after_many_have_come_and_gone() {
+    let _turn = one_at_a_time();
+    let dir = scratch("syscalls_churn");
+    let program = dir.join("churn");
+    compile("churn", &program, "-O2");
+    let recording = dir.join("rec");
+    let rec = recording.to_str().unwrap();
+    // More processes than uhr's eBPF programs can follow at once.
+    let args = [
+        "record",
+        "-o",
+        rec,
+        "--",
+        program.to_str().unwrap(),
+        "20000",
+    ];
+    if uhr_as_root(&args, &recording).is_none() {
+        eprintln!("skipped: needs root through sudo without a password");
+        return;
+    }
+    let result = json(&["query", rec, "--group-by", "syscall", "--top", "100"]);
+    let rows = result["rows"].as_array().unwrap();
+    let Some(read) = rows.iter().find(|r| r["syscall"] == "read") else {
+        eprintln!("skipped: no syscall counts: {result}");
+        return;
+    };
+    // The last process reads 1000 times, and the loader reads too.
+    let calls = read["calls"]["calls"].as_u64().unwrap();
+    assert!(calls >= 1000, "{read}");
+}
+
+#[test]
+fn follows_a_process_that_took_the_id_of_one_gone() {
+    let _turn = one_at_a_time();
+    let dir = scratch("syscalls_reused_id");
+    let program = dir.join("reuse");
+    compile("reuse", &program, "-O2");
+    let recording = dir.join("rec");
+    let rec = recording.to_str().unwrap();
+    let args = [
+        "record",
+        "-o",
+        rec,
+        "--",
+        program.to_str().unwrap(),
+        "100000",
+    ];
+    if uhr_as_root(&args, &recording).is_none() {
+        eprintln!("skipped: needs root through sudo without a password");
+        return;
+    }
+    let result = json(&["query", rec, "--group-by", "syscall", "--top", "100"]);
+    let rows = result["rows"].as_array().unwrap();
+    let Some(read) = rows.iter().find(|r| r["syscall"] == "read") else {
+        eprintln!("skipped: no syscall counts: {result}");
+        return;
+    };
+    // The second process reads 100000 times, and the loader reads too.
+    let calls = read["calls"]["calls"].as_u64().unwrap();
+    assert!(calls >= 100000, "{read}");
+}

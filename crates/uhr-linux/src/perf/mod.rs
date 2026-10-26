@@ -357,6 +357,21 @@ fn add_syscalls(
                     "Calls a thread was already in when uhr attached are left out.".to_owned(),
                 );
             }
+            if counted.let_go_late {
+                known_biases.push(
+                    "A process that took the id of one of the target's just after it was reaped \
+                     can have gone uncounted: without the kernel's BTF, uhr's eBPF programs let \
+                     go of a process only once the kernel frees it."
+                        .to_owned(),
+                );
+            }
+            if counted.unfollowed > 0 {
+                known_biases.push(format!(
+                    "The calls of {} processes the target started are left out: uhr's eBPF \
+                     programs had no room left to follow them.",
+                    counted.unfollowed
+                ));
+            }
             let overhead_ns = recording.in_programs(&counted.programs).map(|own| {
                 recording
                     .samples

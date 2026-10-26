@@ -5,15 +5,16 @@ use std::error::Error as _;
 use std::io;
 use std::path::Path;
 
-use aya::Ebpf;
 use aya::maps::{HashMap, MapData, PerCpuArray};
 use aya::programs::raw_trace_point::RawTracePointLinkId;
 use aya::programs::trace_point::TracePointLinkId;
 use aya::programs::{RawTracePoint, TracePoint};
+use aya::{Ebpf, EbpfLoader};
 use syscalls::Sysno;
 use uhr_core::recording::SyscallCalls;
 use uhr_ebpf::{ACTIVE, CallKey, Calls, HELD, Start};
 
+use crate::btf;
 use crate::launch::monotonic_ns;
 
 /// Why the eBPF collector could not run.
@@ -83,6 +84,12 @@ const FOLLOWERS: [(&str, &str, &str); 2] = [
     ("sched_process_exec", "sched", "sched_process_exec"),
 ];
 
+/// The programs that let go of a process: when its last thread exits, or,
+/// where the kernel's BTF does not say how to see that, once it is freed,
+/// by when a new process can have taken its id.
+const LET_GO: (&str, &str, &str) = ("sched_process_exit", "sched", "sched_process_exit");
+const LET_GO_LATE: (&str, &str, &str) = ("sched_process_free", "sched", "sched_process_free");
+
 /// The programs that count syscalls, at the raw tracepoints of their names.
 const SYSCALLS: [&str; 2] = ["sys_enter", "sys_exit"];
 
@@ -91,6 +98,11 @@ pub(crate) struct Counted {
     pub(crate) calls: Vec<SyscallCalls>,
     /// Calls that found the programs' table of calls full.
     pub(crate) lost: u64,
+    /// Processes the target started that found the programs' table of
+    /// processes full, which they then did not follow.
+    pub(crate) unfollowed: u64,
+    /// Whether the programs let go of a process only once it was freed.
+    pub(crate) let_go_late: bool,
     /// The programs' tags, in hex.
     pub(crate) programs: Vec<String>,
 }
@@ -99,6 +111,7 @@ pub(crate) struct Syscalls {
     ebpf: Ebpf,
     tracepoints: Vec<(&'static str, TracePointLinkId)>,
     syscalls: Vec<(&'static str, RawTracePointLinkId)>,
+    let_go_late: bool,
 }
 
 /// The counts, and the programs: detached, but loaded until unloaded, so
@@ -119,7 +132,8 @@ impl Syscalls {
     /// Counts the syscalls of `pid` and of the processes it starts: at once,
     /// or for a target `held` before its exec, from the exec.
     pub(crate) fn start(pid: u32, held: bool) -> Result<Self, Error> {
-        let mut ebpf = load()?;
+        let exits = exits();
+        let mut ebpf = load(exits)?;
         let targets = ebpf.map_mut("TARGETS").ok_or(Error::Missing("TARGETS"))?;
         let mut targets: HashMap<_, u32, u8> =
             HashMap::try_from(targets).map_err(|e| Error::Map("TARGETS", e))?;
@@ -128,7 +142,8 @@ impl Syscalls {
             .insert(pid, state, 0)
             .map_err(|e| Error::Map("TARGETS", e).or_not_permitted())?;
         let mut tracepoints = Vec::new();
-        for (program, category, name) in FOLLOWERS {
+        let let_go = if exits.is_some() { LET_GO } else { LET_GO_LATE };
+        for (program, category, name) in FOLLOWERS.into_iter().chain([let_go]) {
             let tracepoint = tracepoint(&mut ebpf, program)?;
             let link = tracepoint
                 .load()
@@ -149,6 +164,7 @@ impl Syscalls {
             ebpf,
             tracepoints,
             syscalls,
+            let_go_late: exits.is_none(),
         })
     }
 
@@ -159,6 +175,7 @@ impl Syscalls {
             mut ebpf,
             tracepoints,
             syscalls,
+            let_go_late,
         } = self;
         let mut programs = Vec::new();
         for (program, link) in tracepoints {
@@ -179,7 +196,7 @@ impl Syscalls {
             programs.push(format!("{:016x}", info.tag()));
         }
         let mut take = |name| ebpf.take_map(name).ok_or(Error::Missing(name));
-        let (calls, starts, lost) = (take("CALLS")?, take("STARTS")?, take("LOST")?);
+        let (calls, starts) = (take("CALLS")?, take("STARTS")?);
 
         let calls: HashMap<MapData, CallKey, Calls> =
             HashMap::try_from(calls).map_err(|e| Error::Map("CALLS", e))?;
@@ -212,17 +229,12 @@ impl Syscalls {
                 .or_insert_with(|| row(start.tgid, tid, start.nr, 0, 0, &[0; uhr_ebpf::BUCKETS]))
                 .unfinished_ns = Some(now.saturating_sub(start.ns));
         }
-        let lost: PerCpuArray<MapData, u64> =
-            PerCpuArray::try_from(lost).map_err(|e| Error::Map("LOST", e))?;
-        let lost = lost
-            .get(&0, 0)
-            .map_err(|e| Error::Map("LOST", e))?
-            .iter()
-            .sum();
         Ok(Stopped {
             counted: Counted {
                 calls: rows.into_values().collect(),
-                lost,
+                lost: sum(&mut ebpf, "LOST")?,
+                unfollowed: sum(&mut ebpf, "UNFOLLOWED")?,
+                let_go_late,
                 programs,
             },
             programs: ebpf,
@@ -230,10 +242,19 @@ impl Syscalls {
     }
 }
 
+/// The total of a per-CPU counter.
+fn sum(ebpf: &mut Ebpf, name: &'static str) -> Result<u64, Error> {
+    let map = ebpf.take_map(name).ok_or(Error::Missing(name))?;
+    let counter: PerCpuArray<MapData, u64> =
+        PerCpuArray::try_from(map).map_err(|e| Error::Map(name, e))?;
+    let values = counter.get(&0, 0).map_err(|e| Error::Map(name, e))?;
+    Ok(values.iter().sum())
+}
+
 /// Loads the programs without running them, as recording would.
 pub fn check() -> Result<(), Error> {
-    let mut ebpf = load()?;
-    for (program, ..) in FOLLOWERS {
+    let mut ebpf = load(None)?;
+    for (program, ..) in FOLLOWERS.into_iter().chain([LET_GO, LET_GO_LATE]) {
         tracepoint(&mut ebpf, program)?
             .load()
             .map_err(|e| Error::Program(program, e).or_not_permitted())?;
@@ -263,14 +284,29 @@ fn raw_tracepoint<'a>(
         .map_err(|e| Error::Program(program, e))
 }
 
-fn load() -> Result<Ebpf, Error> {
+/// Where the kernel's structures say how many threads a process has live:
+/// the offsets of `task_struct.signal` and of `signal_struct.live`.
+fn exits() -> Option<(u32, u32)> {
+    let signal = btf::kernel_member_offset("task_struct", "signal")?;
+    Some((signal, btf::kernel_member_offset("signal_struct", "live")?))
+}
+
+fn load(exits: Option<(u32, u32)>) -> Result<Ebpf, Error> {
+    let (signal, live) = exits.unwrap_or((u32::MAX, u32::MAX));
     #[cfg(uhr_ebpf)]
     {
         check_namespace()?;
-        Ebpf::load(PROGRAMS).map_err(|e| Error::Load(e).or_not_permitted())
+        EbpfLoader::new()
+            .override_global("TASK_SIGNAL", &signal, true)
+            .override_global("SIGNAL_LIVE", &live, true)
+            .load(PROGRAMS)
+            .map_err(|e| Error::Load(e).or_not_permitted())
     }
     #[cfg(not(uhr_ebpf))]
-    Err(Error::NotBuilt)
+    {
+        let _ = (signal, live, EbpfLoader::new);
+        Err(Error::NotBuilt)
+    }
 }
 
 /// The inode of the kernel's first PID namespace, which is fixed.

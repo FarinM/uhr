@@ -2,6 +2,7 @@
 //! and the kernel's symbols. Elsewhere this crate is empty.
 #![cfg(target_os = "linux")]
 
+mod btf;
 pub mod doctor;
 pub mod ebpf;
 pub mod kallsyms;

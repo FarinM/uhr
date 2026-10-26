@@ -189,8 +189,8 @@ from tracepoints, such as wakeups and syscall latency.
   histogram of times in the kernel, so nothing is written per call. Each call
   still runs them, which a program making millions of quick calls notices,
   and while they run every process's syscalls take the kernel's slower path
-  for traced ones. They follow the processes the target starts, and count a
-  launched target from its exec on.
+  for traced ones. They follow the processes the target starts until the
+  last thread of each exits, and count a launched target from its exec on.
 - `uhr record` runs them when it may load eBPF, as root or with CAP_BPF and
   CAP_PERFMON, unless `--no-syscalls`. They know processes by their ids in
   the kernel's first PID namespace, so uhr also has to run there, not in a
