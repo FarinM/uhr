@@ -673,8 +673,6 @@ fn sampler_program(ebpf: &mut Ebpf) -> Result<&mut PerfEvent, Error> {
         .map_err(|e| Error::Program(SAMPLER, e))
 }
 
-/// Without sampling, the ring buffer gets the smallest size the kernel
-/// allows, a page.
 /// Where the kernel keeps what the programs read of its tasks, from its BTF.
 #[derive(Clone, Copy, Default)]
 struct Layout {
@@ -720,6 +718,7 @@ fn load(sampling: Option<&Sampling>, layout: Layout) -> Result<Ebpf, Error> {
         // more, and one it brings up later shares the room.
         (Some(_), Some(_)) => copy_buffer(online_cpus().map_err(|(_, e)| Error::Cpus(e))?.len()),
         (Some(_), None) => SAMPLE_BUFFER,
+        // Without sampling, the smallest size the kernel allows, a page.
         (None, _) => rustix::param::page_size() as u32,
     };
     let max_stack = sampling.map_or(uhr_ebpf::MAX_FRAMES as u32, |s| s.max_stack);
