@@ -1305,6 +1305,11 @@ fn hex(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use linux_perf_data::linux_perf_event_reader::constants::PERF_RECORD_MISC_USER;
+    use linux_perf_data::linux_perf_event_reader::{
+        BranchSampleFormat, RawData, ReadFormat, RecordIdParseInfo, RecordParseInfo, RecordType,
+    };
+
     use super::*;
 
     fn mmap(pid: i32, start: u64, path: &str, kernel: bool, executable: bool) -> Mmap {
@@ -1562,13 +1567,12 @@ mod tests {
             .iter()
             .map(|i| (i.tid, i.start_ns, i.end_ns, i.state, i.stack))
             .collect();
-        use ThreadState::*;
         assert_eq!(
             intervals,
             [
-                (2, 11, 20, Blocked, Some(0)),
-                (2, 26, 30, Blocked, Some(1)),
-                (2, 45, 60, Blocked, None),
+                (2, 11, 20, ThreadState::Blocked, Some(0)),
+                (2, 26, 30, ThreadState::Blocked, Some(1)),
+                (2, 45, 60, ThreadState::Blocked, None),
             ]
         );
     }
@@ -1666,13 +1670,6 @@ mod tests {
     /// The ABI perf records for a sample of a recording with a stack copy,
     /// and the registers BP, SP and IP after it unless the ABI is none.
     fn user_regs_abi_of(abi: u64) -> Result<u64> {
-        use linux_perf_data::linux_perf_event_reader::constants::{
-            PERF_RECORD_MISC_USER, PERF_REG_X86_BP, PERF_REG_X86_IP, PERF_REG_X86_SP,
-        };
-        use linux_perf_data::linux_perf_event_reader::{
-            BranchSampleFormat, RawData, ReadFormat, RecordIdParseInfo, RecordParseInfo, RecordType,
-        };
-
         let pid_and_tid = 7 << 32 | 7;
         let mut words = vec![0x1010, pid_and_tid, 100, 0, 1_000_000];
         words.extend([2, PERF_CONTEXT_USER, 0x1010]);

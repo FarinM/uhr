@@ -761,7 +761,9 @@ fn chain(error: &dyn std::error::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::recording::{Clock, FORMAT_VERSION, Frame, Manifest, Platform, Target};
+    use crate::recording::{
+        Clock, FORMAT_VERSION, Frame, KernelSymbol, Manifest, Mapping, Platform, Target,
+    };
     use std::process::Command;
 
     fn compile(dir: &Path, filename: &str, name: &str, value: u32) -> std::path::PathBuf {
@@ -1095,7 +1097,6 @@ mod tests {
 
     #[test]
     fn names_kernel_frames_from_the_saved_symbols() {
-        use crate::recording::{Frame, KernelSymbol, Mapping};
         let mut recording = recording(4);
         let frame = |address, mapping, return_address| Frame {
             origin: Origin::Kernel,
