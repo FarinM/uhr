@@ -246,6 +246,20 @@ name their code in perf maps. uhr detects the runtimes in a
 target and records their versions. What it knows about a runtime's frames is
 kept apart from how it reads memory, so other platforms can use it too.
 
+uhr's eBPF programs walk interpreters' frames at each CPU sample, and know
+no runtime. For each process, uhr gives them a description in numbers:
+where the current frame is (a thread-local, a global, or a slot next to the
+frame pointer), which offset holds the next one, and which words to copy
+from each. The programs copy those words with the native stack, and uhr
+turns them into functions and lines, reading the runtime's code objects from
+the process's memory while it runs. The offsets come from what the runtime
+publishes, such as CPython's `_Py_DebugOffsets` and V8's `v8dbg_` symbols,
+from debug info, or from tables by version. A runtime whose frames are on the
+native stack, as V8's are, needs only the copy of the stack. Frames of a
+version uhr does not know stay the interpreter's own, and the recording says
+why. A process that starts during the capture gets interpreter frames once
+uhr has found its runtime.
+
 ## Unwinding and symbols
 
 Most bad profiles come from here, not from the sampler.
