@@ -433,6 +433,7 @@ fn follows_off_cpu_time_through_the_paths() {
                 stacks_at_stack_limit: 0,
                 stacks_cut_at_stack_copy: None,
                 stacks_not_unwound: None,
+                interpreters: Vec::new(),
             }),
             overhead_ns: None,
             known_biases: Vec::new(),

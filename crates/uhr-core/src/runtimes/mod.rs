@@ -1,9 +1,15 @@
 //! What uhr knows of each runtime it supports, a module each: the files it
-//! runs from, and how it names the code it compiles.
+//! runs from, how it names the code it compiles, and how to read its
+//! interpreter's frames.
 
 use std::ffi::OsString;
+use std::io;
+use std::ops::Range;
+
+pub use process::{Memory, Process};
 
 mod node;
+mod process;
 mod python;
 
 /// A runtime uhr supports.
@@ -17,6 +23,192 @@ pub trait Runtime: Sync {
     fn perf_maps(&self) -> Option<&PerfMaps> {
         None
     }
+    /// The runtime's interpreter in a process, whose frames uhr can read.
+    /// `None` if the process does not run it.
+    fn interpreter(&self, _process: &dyn Process) -> Result<Option<Box<dyn Interpreter>>, Error> {
+        Ok(None)
+    }
+}
+
+/// A runtime's interpreter found in one process: how uhr's sampler walks
+/// its frames, and how to name them.
+pub trait Interpreter: Send {
+    fn runtime(&self) -> &'static str;
+    fn version(&self) -> &str;
+    /// Where the sampled thread's frames are, in numbers.
+    fn walk(&self) -> Walk;
+    /// The native code that runs interpreter frames, sorted. A stack holds
+    /// one run of it each time native code called into the interpreter,
+    /// and the frames that call ran go just above the run.
+    fn eval_loop(&self) -> &[Range<u64>];
+    /// What the bytes the sampler copied of a frame say.
+    fn frame(&self, bytes: &[u8]) -> WalkedFrame;
+    /// The code at `address`, read from the process's memory.
+    fn code(&self, memory: &dyn Memory, address: u64) -> Result<Code, Error>;
+}
+
+/// How uhr's sampler finds and copies an interpreter's frames, which it
+/// keeps in its memory. The thread states are in lists, one for each entry
+/// of an outer list, as CPython keeps one for each interpreter: the first
+/// entry is at the pointer `lists[0]` past `base`, then at the pointer each
+/// next offset past the one before.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Walk {
+    pub base: u64,
+    pub lists: Vec<u32>,
+    /// Where an entry holds the next one, `None` for a single list.
+    pub next_list: Option<u32>,
+    /// Where an entry holds its first thread state, and a state the next
+    /// one.
+    pub first_state: u32,
+    pub next_state: u32,
+    /// Where a state holds its thread's id, as a 64-bit number.
+    pub thread_id: u32,
+    /// Where a state holds a 32-bit word with a bit of the mask set while
+    /// its thread runs in it, for a runtime that marks it so. A thread can
+    /// have a state in several lists. Without a mark, the one with frames
+    /// is it.
+    pub active: Option<(u32, u32)>,
+    /// The pointers to follow from a thread's state to its innermost frame,
+    /// as for `lists`.
+    pub frame: Vec<u32>,
+    /// Where a frame holds the next one outward, and how many of its first
+    /// bytes to copy.
+    pub next_frame: u32,
+    pub frame_bytes: u32,
+    /// Whether the sampler should keep where each native frame is on the
+    /// stack, for an interpreter that keeps its entry frames there.
+    pub frame_pointers: bool,
+}
+
+/// A thread's state, as `Walk::states` reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ThreadState {
+    pub address: u64,
+    /// In the process's PID namespace.
+    pub thread_id: u64,
+    pub active: bool,
+    pub has_frames: bool,
+}
+
+impl Walk {
+    /// The first `limit` thread states, read from the process's memory, as
+    /// the sampler searches them but further.
+    pub fn states(&self, memory: &dyn Memory, limit: usize) -> Result<Vec<ThreadState>, Error> {
+        let word = |address: u64| process::u64_at(memory, "a thread state", address);
+        let follow = |mut address: u64, path: &[u32]| {
+            for &offset in path {
+                if address == 0 {
+                    break;
+                }
+                address = word(address.wrapping_add(u64::from(offset)))?;
+            }
+            Ok::<_, Error>(address)
+        };
+        let mut found = Vec::new();
+        let mut list = follow(self.base, &self.lists)?;
+        // Bounded, as memory that changes as it is read can loop.
+        for _ in 0..limit {
+            if list == 0 || found.len() >= limit {
+                break;
+            }
+            let mut state = word(list.wrapping_add(u64::from(self.first_state)))?;
+            while state != 0 && found.len() < limit {
+                let active = match self.active {
+                    Some((at, mask)) => {
+                        let status =
+                            process::u32_at(memory, "a thread's status", state + u64::from(at))?;
+                        status & mask != 0
+                    }
+                    None => false,
+                };
+                found.push(ThreadState {
+                    address: state,
+                    thread_id: word(state.wrapping_add(u64::from(self.thread_id)))?,
+                    active,
+                    has_frames: follow(state, &self.frame)? != 0,
+                });
+                state = word(state.wrapping_add(u64::from(self.next_state)))?;
+            }
+            let Some(next) = self.next_list else {
+                break;
+            };
+            list = word(list.wrapping_add(u64::from(next)))?;
+        }
+        Ok(found)
+    }
+}
+
+/// A frame the sampler walked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalkedFrame {
+    /// A frame of the program's code: the code it ran and where in it.
+    /// `entered` if native code called into it, so that it is the
+    /// outermost frame of that call.
+    Code {
+        code: u64,
+        instruction: u64,
+        entered: bool,
+    },
+    /// A frame the runtime puts where native code calls into it, which
+    /// ends the frames of that call. `native` if it keeps the frame in the
+    /// native frame of that call, so that where it is says which one.
+    Entry { native: bool },
+}
+
+/// A piece of the program's code, as its interpreter keeps it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Code {
+    pub name: String,
+    pub file: String,
+    pub first_line: u32,
+    /// The line of each range of instructions, by address, sorted.
+    pub lines: Vec<(Range<u64>, u32)>,
+}
+
+impl Code {
+    pub fn line(&self, instruction: u64) -> Option<u32> {
+        let after = self
+            .lines
+            .partition_point(|(range, _)| range.start <= instruction);
+        let (range, line) = self.lines.get(after.checked_sub(1)?)?;
+        range.contains(&instruction).then_some(*line)
+    }
+}
+
+/// Why a runtime's interpreter or code could not be read.
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error("reading {what} at {address:#x}")]
+    Read {
+        what: &'static str,
+        address: u64,
+        #[source]
+        source: io::Error,
+    },
+    #[error("reading {path}")]
+    File {
+        path: String,
+        #[source]
+        source: io::Error,
+    },
+    #[error("{runtime} {version} is not a version uhr can read the frames of")]
+    Unsupported {
+        runtime: &'static str,
+        version: String,
+    },
+    #[error("{0}")]
+    Invalid(String),
+}
+
+/// The interpreter of the first runtime found in `process`.
+pub fn interpreter(process: &dyn Process) -> Result<Option<Box<dyn Interpreter>>, Error> {
+    for runtime in RUNTIMES {
+        if let Some(interpreter) = runtime.interpreter(process)? {
+            return Ok(Some(interpreter));
+        }
+    }
+    Ok(None)
 }
 
 /// How a runtime names the code it compiles in a perf map when its

@@ -75,8 +75,9 @@ pub(super) struct UserCopy<'a> {
 }
 
 pub(super) struct UserStack {
-    /// Leaf first, and whether each is a return address.
-    pub(super) frames: Vec<(u64, bool)>,
+    /// Leaf first, whether each is a return address, and where its frame
+    /// ends on the stack, if unwinding got past it.
+    pub(super) frames: Vec<(u64, bool, Option<u64>)>,
     /// Unwinding stopped at the end of the stack copy, so outer callers are
     /// missing.
     pub(super) cut: bool,
@@ -114,7 +115,7 @@ impl Unwinding {
         // The x86-64 unwinder would read a 32-bit stack as 8-byte words.
         if compat {
             return UserStack {
-                frames: [(ip, false)].into_iter().take(max_frames).collect(),
+                frames: [(ip, false, None)].into_iter().take(max_frames).collect(),
                 cut: false,
                 not_unwound: true,
             };
@@ -145,18 +146,23 @@ impl Unwinding {
         };
         let mut frames = Vec::new();
         let mut cut = false;
-        let mut iter = process.unwinder.iter_frames(
-            ip,
-            UnwindRegsX86_64::new(ip, sp, bp),
-            &mut self.cache,
-            &mut read_stack,
-        );
+        let mut regs = UnwindRegsX86_64::new(ip, sp, bp);
+        let mut frame = FrameAddress::InstructionPointer(ip);
         while frames.len() < max_frames {
-            match iter.next() {
-                Ok(Some(frame)) => frames.push((
-                    frame.address(),
-                    matches!(frame, FrameAddress::ReturnAddress(_)),
-                )),
+            let caller =
+                process
+                    .unwinder
+                    .unwind_frame(frame, &mut regs, &mut self.cache, &mut read_stack);
+            // Unwound, the stack pointer is the caller's: where the frame
+            // ends.
+            let frame_end = matches!(caller, Ok(Some(_))).then(|| regs.sp());
+            let return_address = matches!(frame, FrameAddress::ReturnAddress(_));
+            frames.push((frame.address(), return_address, frame_end));
+            match caller {
+                Ok(Some(address)) => match FrameAddress::from_return_address(address) {
+                    Some(next) => frame = next,
+                    None => break,
+                },
                 Ok(None) => break,
                 Err(UnwindError::CouldNotReadStack(address)) => {
                     // A word can start in the copy and end past it.
@@ -576,7 +582,7 @@ mod tests {
                 full,
             };
             let user = Unwinding::new().unwind(&copy, 1, &[], &[], 10);
-            assert_eq!(user.frames, [(0x1000, false)]);
+            assert_eq!(user.frames, [(0x1000, false, None)]);
             assert_eq!(user.cut, full);
         }
     }

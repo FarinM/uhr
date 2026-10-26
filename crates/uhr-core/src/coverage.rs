@@ -116,6 +116,38 @@ impl Coverage {
                 )),
                 (Unwinding::Dwarf, _) => {}
             }
+            for walks in &stacks.interpreters {
+                let of = format!(
+                    "{} {} in stream {}",
+                    walks.runtime, walks.version, stream.id
+                );
+                let notes = [
+                    (
+                        walks.before_found,
+                        "samples taken before uhr found the runtime",
+                    ),
+                    (walks.failed, "samples whose frames could not be read"),
+                    (
+                        walks.unsearched,
+                        "samples of threads among more than uhr searches",
+                    ),
+                    (
+                        walks.cut,
+                        "samples whose frames went on past the most uhr reads",
+                    ),
+                    (walks.unread_frames, "frames whose code could not be read"),
+                    (
+                        walks.unmatched,
+                        "samples whose native stacks lost the interpreter's frames, so where \
+                         its frames went is a guess",
+                    ),
+                ];
+                for (count, what) in notes.into_iter().filter(|(count, _)| *count > 0) {
+                    coverage
+                        .unknown
+                        .push(format!("frames of {of}: {count} {what}"));
+                }
+            }
         }
         coverage
             .missing_signals

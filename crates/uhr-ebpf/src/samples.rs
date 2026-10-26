@@ -4,7 +4,9 @@
 use core::mem::size_of;
 
 use aya_ebpf::bindings::{BPF_F_USER_STACK, BPF_RB_NO_WAKEUP, bpf_user_pt_regs_t};
-use aya_ebpf::helpers::generated::bpf_probe_read_user;
+use aya_ebpf::helpers::generated::{
+    bpf_probe_read_kernel as bpf_probe_read_kernel_raw, bpf_probe_read_user,
+};
 use aya_ebpf::helpers::{
     bpf_get_current_task, bpf_get_smp_processor_id, bpf_get_stack, bpf_ktime_get_ns,
     bpf_probe_read_kernel,
@@ -12,24 +14,35 @@ use aya_ebpf::helpers::{
 #[cfg(bpf_target_arch = "x86_64")]
 use aya_ebpf::helpers::{bpf_get_current_task_btf, bpf_task_pt_regs};
 use aya_ebpf::macros::{map, perf_event, tracepoint};
-use aya_ebpf::maps::{Array, HashMap, PerCpuArray, RingBuf};
+use aya_ebpf::maps::{Array, HashMap, PerCpuArray, ProgramArray, RingBuf};
 use aya_ebpf::programs::{PerfEventContext, TracePointContext};
 use aya_ebpf::{EbpfContext, Global};
-use uhr_ebpf::{MAX_FRAMES, MAX_STACK_COPY, SampleHeader, UserRegisters, mode};
+use uhr_ebpf::{
+    MAX_FRAMES, MAX_STACK_COPY, SampleHeader, UserRegisters, WALKED_BYTES, Walk, mode, walk,
+};
 
+use crate::mappings;
 use crate::targets::{active, current, running};
+use crate::walk::{self as walker, ROOM};
 
 #[map]
 static SAMPLES: RingBuf = RingBuf::with_byte_size(16 << 20, 0);
 
-/// A sample, and its kernel frames and then its user frames, leaf first.
-/// The frames take at most `MAX_FRAMES`, but the verifier checks where
-/// the user frames start apart from how many there can be.
+/// A sample, and its kernel frames and then its user frames, leaf first,
+/// each user frame with where it ends if the frame pointers were walked,
+/// then its interpreter frames. The frames take at most `MAX_FRAMES`, but
+/// the verifier checks where the user frames start apart from how many
+/// there can be.
 #[repr(C)]
 pub struct Sample {
     header: SampleHeader,
-    frames: [u64; 2 * MAX_FRAMES],
+    frames: [u64; FRAME_WORDS],
+    walked: [u8; ROOM],
 }
+
+/// Room for twice the frames, a power of two for the verifier.
+const FRAME_WORDS: usize = 256;
+const _: () = assert!(FRAME_WORDS >= 2 * MAX_FRAMES);
 
 /// Where a sample is put together, as it is too big for the stack.
 #[map]
@@ -38,13 +51,14 @@ static SCRATCH: PerCpuArray<Sample> = PerCpuArray::with_max_entries(1, 0);
 const PAGE: usize = 4096;
 
 /// A sample with a copy of its user stack: the header, then the kernel
-/// frames, the user registers and the copy, with no room between them.
-/// The room is for the most of each, and a page more, as the verifier
-/// checks where a part starts apart from how long it is.
+/// frames, the user registers and the copy, and the interpreter frames,
+/// with no room between them. The room is for the most of each, and a page
+/// more, as the verifier checks where a part starts apart from how long it
+/// is.
 #[repr(C)]
 pub struct Copy {
     header: SampleHeader,
-    data: [u8; MAX_FRAMES * FRAME + size_of::<UserRegisters>() + MAX_STACK_COPY + PAGE],
+    data: [u8; MAX_FRAMES * FRAME + size_of::<UserRegisters>() + MAX_STACK_COPY + PAGE + ROOM],
 }
 
 /// Where a sample with a copy of its stack is put together, by CPU, as it
@@ -56,6 +70,21 @@ static COPIES: Array<Copy> = Array::with_max_entries(1, 0);
 /// load. 0 to walk user stacks with frame pointers instead.
 #[unsafe(no_mangle)]
 static STACK_BYTES: Global<u32> = Global::new(0);
+
+/// `walk_frames`, which uhr puts at 0.
+#[map]
+static PROGRAMS: ProgramArray = ProgramArray::with_max_entries(1, 0);
+
+/// Where `walk_frames` walks a sample's interpreter frames before it copies
+/// them into the sample, so that the verifier checks the walk once, not for
+/// each kind of sample.
+#[repr(C)]
+pub struct Walked {
+    frames: [u8; ROOM],
+}
+
+#[map]
+static WALKED: PerCpuArray<Walked> = PerCpuArray::with_max_entries(1, 0);
 
 /// Samples that found `SAMPLES` full.
 #[map]
@@ -102,15 +131,32 @@ static MAX_STACK: Global<u32> = Global::new(MAX_FRAMES as u32);
 #[unsafe(no_mangle)]
 static TASK_FLAGS: Global<u32> = Global::new(u32::MAX);
 
+/// Where a task's count of the execs of its process is, as for
+/// `TASK_FLAGS`.
+#[unsafe(no_mangle)]
+static TASK_EXEC_ID: Global<u32> = Global::new(u32::MAX);
+
+/// The current task's count of execs, its low 32 bits, or 0 where unknown.
+fn exec() -> u32 {
+    let offset = TASK_EXEC_ID.load();
+    if offset == u32::MAX {
+        return 0;
+    }
+    let task = unsafe { bpf_get_current_task() } as *const u8;
+    let count = unsafe { bpf_probe_read_kernel(task.wrapping_add(offset as usize).cast::<u32>()) };
+    count.unwrap_or(0)
+}
+
 #[perf_event]
 pub fn sample(ctx: PerfEventContext) -> u32 {
     let (tgid, tid) = current();
     if !running() || !active(tgid) {
         return 0;
     }
+    let process = walker::of(tgid);
     let stack_bytes = (STACK_BYTES.load() as usize).min(MAX_STACK_COPY);
     if stack_bytes > 0 {
-        return sample_with_copy(&ctx, tgid, tid, stack_bytes);
+        return sample_with_copy(&ctx, process, tgid, tid, stack_bytes);
     }
     let Some(sample) = SCRATCH.get_ptr_mut(0) else {
         return 0;
@@ -118,17 +164,17 @@ pub fn sample(ctx: PerfEventContext) -> u32 {
     let sample = unsafe { &mut *sample };
     // A thread running a guest is sampled in the host's code that entered
     // it, which it does not run, so it gets no frames, as in perf.
-    let (ip, mode, kernel, user) = if in_guest() {
-        (0, mode::GUEST, 0, 0)
+    let (ip, mode, kernel, user, ends) = if in_guest() {
+        (0, mode::GUEST, 0, 0, false)
     } else {
-        let (kernel, user) = stacks(&ctx, sample);
         let (ip, kernel_mode) = interrupted(unsafe { &(*ctx.ctx).regs });
+        let (kernel, user, ends) = stacks(&ctx, sample, process, kernel_mode);
         let mode = if kernel_mode {
             mode::KERNEL
         } else {
             mode::USER
         };
-        (ip, mode, kernel, user)
+        (ip, mode, kernel, user, ends)
     };
     sample.header = SampleHeader {
         time_ns: unsafe { bpf_ktime_get_ns() },
@@ -141,17 +187,108 @@ pub fn sample(ctx: PerfEventContext) -> u32 {
         user_frames: user as u32,
         stack_bytes: 0,
         copy: 0,
+        walk: walk::NONE,
+        walked_frames: 0,
+        walked_bytes: 0,
+        frame_ends: u32::from(ends),
+        exec: exec(),
+        mapped: mappings::count(tgid),
     };
-    let len = size_of::<SampleHeader>() + (kernel + user) * FRAME;
+    if mode != mode::GUEST && process.is_some() {
+        walk_next(&ctx, &mut sample.header);
+    }
+    let len = size_of::<SampleHeader>() + native_frames(&sample.header);
     if len <= size_of::<Sample>() {
         output((sample as *const Sample).cast(), len);
     }
     0
 }
 
+/// Has `walk_frames` walk the sampled thread's interpreter frames and write
+/// the sample, which keeps each program short enough for the verifier.
+/// Returns only where it can't, and says so in `header`.
+fn walk_next(ctx: &PerfEventContext, header: &mut SampleHeader) {
+    unsafe { PROGRAMS.tail_call(ctx, 0) };
+    header.walk = walk::FAILED;
+}
+
+/// The bytes of a sample's frames, which interpreter frames go after,
+/// never past the room for them, which the verifier needs to see.
+fn native_frames(header: &SampleHeader) -> usize {
+    let (kernel, user) = (header.kernel_frames as usize, header.user_frames as usize);
+    let words = kernel + user * (1 + header.frame_ends as usize);
+    (words * FRAME) & (FRAME_WORDS * FRAME - 1)
+}
+
+/// The bytes of a sample with a copy of its stack before its interpreter
+/// frames, bounded by the most of each part, as the verifier needs.
+fn copied(header: &SampleHeader) -> usize {
+    let kernel = header.kernel_frames as usize & MAX_FRAMES;
+    let copy = match header.copy {
+        0 => 0,
+        _ => size_of::<UserRegisters>() + (header.stack_bytes as usize & 0xffff),
+    };
+    kernel * FRAME + copy
+}
+
+/// The rest of a sample of a process whose runtime uhr knows: walks the
+/// thread's interpreter frames, after what `sample` put together, and
+/// writes the sample.
+#[perf_event]
+pub fn walk_frames(_ctx: PerfEventContext) -> u32 {
+    let (tgid, tid) = current();
+    let Some(walked) = WALKED.get_ptr_mut(0) else {
+        return 0;
+    };
+    let walked = unsafe { (*walked).frames.as_mut_ptr() };
+    let (status, frames, each) = walker::walk(walker::of(tgid), tid, walked);
+    // Never more than there is room for, which the verifier needs to see.
+    let bytes = (frames as usize * each as usize) & (WALKED_BYTES - 1);
+    let into = |header: &mut SampleHeader, to: *mut u8| {
+        header.walk = status;
+        header.walked_frames = frames;
+        header.walked_bytes = each;
+        unsafe { bpf_probe_read_kernel_raw(to.cast(), bytes as u32, walked.cast()) }
+    };
+    if STACK_BYTES.load() > 0 {
+        let cpu = unsafe { bpf_get_smp_processor_id() };
+        let Some(sample) = COPIES.get_ptr_mut(cpu) else {
+            return 0;
+        };
+        let sample = unsafe { &mut *sample };
+        let at = copied(&sample.header);
+        let copied = into(&mut sample.header, unsafe {
+            sample.data.as_mut_ptr().add(at)
+        });
+        let len = size_of::<SampleHeader>() + at + if copied == 0 { bytes } else { 0 };
+        if len <= size_of::<Copy>() {
+            output((sample as *const Copy).cast(), len);
+        }
+    } else {
+        let Some(sample) = SCRATCH.get_ptr_mut(0) else {
+            return 0;
+        };
+        let sample = unsafe { &mut *sample };
+        let at = native_frames(&sample.header);
+        let frames = sample.frames.as_mut_ptr().cast::<u8>();
+        let copied = into(&mut sample.header, unsafe { frames.add(at) });
+        let len = size_of::<SampleHeader>() + at + if copied == 0 { bytes } else { 0 };
+        if len <= size_of::<Sample>() {
+            output((sample as *const Sample).cast(), len);
+        }
+    }
+    0
+}
+
 /// Samples with the kernel's frames and a copy of the user stack, for uhr
 /// to unwind.
-fn sample_with_copy(ctx: &PerfEventContext, tgid: u32, tid: u32, stack_bytes: usize) -> u32 {
+fn sample_with_copy(
+    ctx: &PerfEventContext,
+    process: Option<&Walk>,
+    tgid: u32,
+    tid: u32,
+    stack_bytes: usize,
+) -> u32 {
     let cpu = unsafe { bpf_get_smp_processor_id() };
     let Some(sample) = COPIES.get_ptr_mut(cpu) else {
         return 0;
@@ -193,7 +330,16 @@ fn sample_with_copy(ctx: &PerfEventContext, tgid: u32, tid: u32, stack_bytes: us
         user_frames: 0,
         stack_bytes: copied as u32,
         copy: u32::from(user.is_some()),
+        walk: walk::NONE,
+        walked_frames: 0,
+        walked_bytes: 0,
+        frame_ends: 0,
+        exec: exec(),
+        mapped: mappings::count(tgid),
     };
+    if mode != mode::GUEST && process.is_some() {
+        walk_next(ctx, &mut sample.header);
+    }
     let len = size_of::<SampleHeader>() + len;
     if len <= size_of::<Copy>() {
         output((sample as *const Copy).cast(), len);
@@ -288,9 +434,75 @@ fn user_registers(_regs: &bpf_user_pt_regs_t, _kernel_mode: bool) -> Option<User
     None
 }
 
+/// The instruction and frame pointer of the sampled thread's 64-bit user
+/// code, as for `user_registers`.
+#[cfg(bpf_target_arch = "x86_64")]
+fn frame_registers(regs: &bpf_user_pt_regs_t, kernel_mode: bool) -> Option<(u64, u64)> {
+    let user = user_registers(regs, kernel_mode)?;
+    (user.compat == 0).then_some((user.ip, user.bp))
+}
+
+/// On arm64 a function's frame record can be anywhere in its frame, so
+/// where it is says nothing of where the frame ends, and the saved return
+/// addresses can carry pointer authentication codes, which the kernel's walk
+/// strips. That walk stays.
+#[cfg(bpf_target_arch = "aarch64")]
+fn frame_registers(_regs: &bpf_user_pt_regs_t, _kernel_mode: bool) -> Option<(u64, u64)> {
+    None
+}
+
+/// Walks the user stack by its frame pointers, from the instruction `ip`
+/// and the frame pointer `fp`, into `frames` after the `kernel` frames:
+/// each frame's address, then where it ends. A function keeps its caller's
+/// frame pointer at its own, and the address it returns to just above, as
+/// the kernel's walk takes them.
+fn walk_frame_pointers(
+    mut ip: u64,
+    mut fp: u64,
+    frames: *mut u64,
+    kernel: usize,
+    room: usize,
+) -> usize {
+    let mut count = 0;
+    while count < room.min(MAX_FRAMES) {
+        // Never past the room for frames, which the verifier needs to see.
+        let at = (kernel + 2 * count) & (FRAME_WORDS - 1);
+        let end = if fp == 0 { 0 } else { fp.wrapping_add(16) };
+        unsafe {
+            frames.add(at).write(ip);
+            frames.add(at + 1).write(end);
+        }
+        count += 1;
+        if fp == 0 || fp % 8 != 0 {
+            break;
+        }
+        let mut record = [0u64; 2];
+        let read = unsafe {
+            bpf_probe_read_user(
+                record.as_mut_ptr().cast(),
+                16,
+                fp as *const core::ffi::c_void,
+            )
+        };
+        let [next, address] = record;
+        // A frame's caller is further up the stack.
+        if read != 0 || address == 0 || (next != 0 && next <= fp) {
+            break;
+        }
+        (ip, fp) = (address, next);
+    }
+    count
+}
+
 /// Fills `sample` with the kernel's frames and then the user's, and
-/// returns how many of each.
-fn stacks(ctx: &PerfEventContext, sample: &mut Sample) -> (usize, usize) {
+/// returns how many of each, and whether each user frame comes with where
+/// it ends, as the walk of `process` asks.
+fn stacks(
+    ctx: &PerfEventContext,
+    sample: &mut Sample,
+    process: Option<&Walk>,
+    kernel_mode: bool,
+) -> (usize, usize, bool) {
     let frames = sample.frames.as_mut_ptr();
     let limit = (MAX_STACK.load() as usize).min(MAX_FRAMES);
     // Like perf's, the user frames get the room the kernel's leave.
@@ -300,6 +512,18 @@ fn stacks(ctx: &PerfEventContext, sample: &mut Sample) -> (usize, usize) {
     // Never more than the difference, but the verifier needs to see it is
     // no more than the room for frames.
     let room = (limit - kernel).min(MAX_FRAMES);
+    let regs = unsafe { &(*ctx.ctx).regs };
+    if process.is_some_and(|walk| walk.frame_pointers != 0)
+        && let Some((ip, fp)) = frame_registers(regs, kernel_mode)
+    {
+        let user = walk_frame_pointers(ip, fp, frames, kernel, room);
+        // Read back from the map, the verifier knows only how many frames
+        // there can be, so it checks what follows once, not once for each
+        // number the walk can stop at.
+        sample.header.user_frames = user as u32;
+        let user = unsafe { core::ptr::read_volatile(&sample.header.user_frames) } as usize;
+        return (kernel, user.min(room), true);
+    }
     let user = match room {
         0 => 0,
         _ => unsafe {
@@ -311,7 +535,7 @@ fn stacks(ctx: &PerfEventContext, sample: &mut Sample) -> (usize, usize) {
             )
         },
     };
-    (kernel, (user.max(0) as usize / FRAME).min(room))
+    (kernel, (user.max(0) as usize / FRAME).min(room), false)
 }
 
 /// Whether the current thread runs a virtual machine's guest, by the task

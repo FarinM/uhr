@@ -193,12 +193,17 @@ from tracepoints, such as wakeups and syscall latency.
   the context switches. It samples instead with `--sampler perf`. The kernel
   runs no program at a perf event while one at a kprobe or a tracepoint runs
   on the same CPU, so the time in those, which other tools load, has no
-  samples. uhr's own run at raw tracepoints, which don't stop it. A thread
-  running a virtual machine's guest has its time in unknown mode and without
-  frames, as with perf, told apart by the task flag the kernel's own
-  accounting uses, which uhr finds in the kernel's BTF. The kernel drops the
-  sampling event of a CPU going offline, as across a suspend, so they see
-  CPUs go and come back, and uhr starts sampling each again once it is back.
+  samples. uhr's own that run at every syscall are at raw tracepoints, which
+  don't stop it, and the rest at rarer events, as a process starting or
+  mapping code. A thread running a virtual machine's guest has its time in
+  unknown mode and without frames, as with perf, told apart by the task flag
+  the kernel's own accounting uses, which uhr finds in the kernel's BTF. The
+  kernel drops the sampling event of a CPU going offline, as across a
+  suspend, so they see CPUs go and come back, and uhr starts sampling each
+  again once it is back.
+- They walk the frames of the interpreters uhr finds in the target's
+  processes, and count the times each maps a file's code, so uhr knows when
+  to look for one again, see [runtimes](#runtimes).
 - They count and time the target's syscalls. At each syscall's entry and
   exit they add, per thread and syscall, the call, its time and a log2
   histogram of times in the kernel, so nothing is written per call. Each
@@ -268,18 +273,51 @@ target and records their versions. What it knows about a runtime's frames is
 kept apart from how it reads memory, so other platforms can use it too.
 
 uhr's eBPF programs walk interpreters' frames at each CPU sample, and know
-no runtime. For each process, uhr gives them a description in numbers:
-where the current frame is (a thread-local, a global, or a slot next to the
-frame pointer), which offset holds the next one, and which words to copy
-from each. The programs copy those words with the native stack, and uhr
-turns them into functions and lines, reading the runtime's code objects from
-the process's memory while it runs. The offsets come from what the runtime
-publishes, such as CPython's `_Py_DebugOffsets` and V8's `v8dbg_` symbols,
-from debug info, or from tables by version. A runtime whose frames are on the
-native stack, as V8's are, needs only the copy of the stack. Frames of a
-version uhr does not know stay the interpreter's own, and the recording says
-why. A process that starts during the capture gets interpreter frames once
-uhr has found its runtime.
+no runtime. Each runtime uhr supports is a module of `uhr-core`. One whose
+frames uhr reads finds its interpreter in a process from the files it maps,
+and gives the programs a description in numbers: how to find the sampled
+thread's state, by searching lists that start at a global, as CPython keeps
+one for each interpreter, for the entries with the thread's id in the
+process's PID namespace, the pointers from there to its innermost frame,
+which offset of a frame holds the next one, and how many bytes of each to
+copy. A thread can have a state in several lists, and the one it runs in is
+marked so where the runtime marks it, or else is the first with frames.
+They search the first 256 states. uhr reads the rest from the process's
+memory, where samples say they did not find a thread's, and tells them.
+Other ways to find frames, such as a thread-local or a slot next to the
+frame pointer, are for the runtimes that need them. The offsets come from
+what the runtime publishes, such as CPython's `_Py_DebugOffsets` and V8's
+`v8dbg_` symbols, from debug info, or from tables by version. A runtime whose
+frames are on the native stack, as V8's are, needs only the copy of the
+stack.
+
+uhr looks for a process's runtime at its first sample, and again each time
+the process maps more code, as a runtime's library can be mapped after the
+exec, as by `dlopen`. The programs count the times each process maps a
+file's code, at the syscall's return, and each sample says the count. uhr
+also looks again a while later until it finds one, for code they don't see
+mapped, as where a mapping is made executable after, or the kernel has no
+tracepoints for syscalls. Samples taken before have only the interpreter's
+native frames, and coverage counts them. Each sample says how many times its
+process had exec'd, as the kernel counts in its task, so each program a
+process runs is looked at and counted apart. While the process runs, uhr
+reads the code its frames run from its memory, and turns them into functions
+and lines. Each time native code called into the interpreter, that call ran
+a group of the frames, which go into the native stack just above the call's
+run of eval-loop frames. An interpreter can keep the frame that starts each
+call in the call's native frame. Then, on x86-64, the programs walk the
+frame pointers themselves, rather than with the kernel's walk, keeping where
+each frame ends on the stack, as uhr's unwinding of the stack copy does too,
+and each group goes just above the native frame its call started in, the
+eval loop's or that of the function it was inlined into. That holds where
+the walk of the native stack lost frames, as it loses the caller of a leaf
+that set up no frame, which is often the eval loop itself, and where it
+ended early, as in code without frame pointers. On arm64 a function's frame
+record can be anywhere in its frame, so where it is says nothing of where
+the frame ends, and there, as for an interpreter that keeps no such frame,
+groups are matched to runs from the end of the stack that stayed whole.
+Coverage counts the samples where one had no run. Frames of a version uhr
+does not know stay the interpreter's own, and the recording says why.
 
 ## Unwinding and symbols
 

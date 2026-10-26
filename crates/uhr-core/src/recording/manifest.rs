@@ -205,4 +205,40 @@ pub struct StackCoverage {
     /// only the instruction they were taken at. `None` without DWARF
     /// unwinding.
     pub stacks_not_unwound: Option<u64>,
+    /// The interpreters whose frames the collector read, by runtime and
+    /// version.
+    pub interpreters: Vec<InterpreterCoverage>,
+}
+
+/// How the frames of one runtime and version were read, over the samples of
+/// the processes that ran it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InterpreterCoverage {
+    pub runtime: String,
+    pub version: String,
+    pub processes: u64,
+    pub samples: u64,
+    /// Samples taken before uhr found the runtime, which have none of its
+    /// frames.
+    pub before_found: u64,
+    /// Samples of threads the runtime keeps no state for, such as ones it
+    /// does not run on, which have none of its frames.
+    pub no_thread: u64,
+    /// Samples of threads whose state the collector did not search as far
+    /// as, of a process with more threads than it searches, which have none
+    /// of its frames.
+    pub unsearched: u64,
+    /// Samples whose frames could not be read, and those whose frames went
+    /// on past the most the collector reads, whose outer frames are missing.
+    pub failed: u64,
+    pub cut: u64,
+    /// Its frames in all samples, and those whose code could not be read.
+    pub frames: u64,
+    pub unread_frames: u64,
+    /// Samples of an interpreter that does not say where its calls start,
+    /// with calls whose eval-loop frames the native stack does not show:
+    /// frame-pointer stacks lose the caller of a leaf that set up no frame,
+    /// often the eval loop. Where those calls' frames go is a guess, just
+    /// above the native leaf.
+    pub unmatched: u64,
 }

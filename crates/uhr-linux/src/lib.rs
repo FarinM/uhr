@@ -5,6 +5,7 @@
 mod btf;
 pub mod doctor;
 pub mod ebpf;
+mod interpreters;
 pub mod kallsyms;
 pub mod launch;
 pub mod perf;

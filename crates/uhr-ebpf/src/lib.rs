@@ -71,6 +71,104 @@ pub struct SampleHeader {
     pub stack_bytes: u32,
     /// Whether `UserRegisters` and the copy follow the frames.
     pub copy: u32,
+    /// How the walk of interpreter frames went, of `walk`.
+    pub walk: u32,
+    /// Interpreter frames copied, innermost first, after all else, and
+    /// the bytes of each: its address, then the bytes copied of it.
+    pub walked_frames: u32,
+    pub walked_bytes: u32,
+    /// Whether each user frame is followed by where it ends on the stack,
+    /// from walking its frame pointers: the frame pointer of its function
+    /// and 16, as the canonical frame address. 0 for the outermost.
+    pub frame_ends: u32,
+    /// How many times the process had exec'd, as its task counts, so that
+    /// samples of one program tell apart from those of the next. 0 where
+    /// uhr can't tell.
+    pub exec: u32,
+    /// How many times the process had mapped a file's code since the
+    /// programs started, its low 32 bits.
+    pub mapped: u32,
+}
+
+/// The most interpreter frames a sample walks. Each frame's address and its
+/// copy take at most `MAX_WALKED_BYTES`, a power of two, and all of them
+/// less than `WALKED_BYTES`, another.
+pub const MAX_WALKED_FRAMES: usize = 127;
+pub const MAX_WALKED_BYTES: usize = 128;
+pub const WALKED_BYTES: usize = 1 << 14;
+const _: () = assert!(MAX_WALKED_FRAMES * MAX_WALKED_BYTES < WALKED_BYTES);
+
+/// The most pointers followed to a process's lists of thread states, or
+/// from a state to its innermost frame.
+pub const MAX_PATH: usize = 4;
+
+/// The most thread states searched for the sampled thread's, and lists of
+/// them gone through.
+pub const MAX_THREADS: usize = 256;
+
+/// `Walk::next_list` for a process with one list of thread states.
+pub const ONE_LIST: u32 = u32::MAX;
+
+/// How uhr's programs find and copy the frames of an interpreter that keeps
+/// them in its memory, as CPython does, in one process. uhr sets it for each
+/// process whose runtime it knows, and the programs know no runtime.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Walk {
+    /// The thread states are in lists, one for each entry of an outer
+    /// list, as CPython keeps one for each interpreter. The first entry is
+    /// at the pointer `lists[0]` past `base`, then at the pointer each next
+    /// offset past the one before, and each next entry at the pointer
+    /// `next_list` past it.
+    pub base: u64,
+    pub lists: [u32; MAX_PATH],
+    pub lists_len: u32,
+    pub next_list: u32,
+    /// Where an entry holds its first state, and a state the next one.
+    pub first_state: u32,
+    pub next_state: u32,
+    /// Where a state holds its thread's id, as a 64-bit number in the
+    /// process's PID namespace.
+    pub thread_id: u32,
+    /// A thread can have a state in several lists. The one it runs in has a
+    /// bit of `active_mask` set in the 32-bit word at `active`, where the
+    /// runtime marks it so, and else is the first with frames. A mask of 0
+    /// for a runtime that does not.
+    pub active: u32,
+    pub active_mask: u32,
+    /// The pointers to follow from a thread's state to its innermost frame,
+    /// as for `lists`.
+    pub frame: [u32; MAX_PATH],
+    pub frame_len: u32,
+    /// Where a frame holds the next one outward, and how many of its first
+    /// bytes to copy.
+    pub next_frame: u32,
+    pub frame_bytes: u32,
+    /// Whether to walk the user stack by its frame pointers, keeping where
+    /// each frame ends, so that the interpreter's frames can be placed by
+    /// where it keeps some of them on the native stack.
+    pub frame_pointers: u32,
+    pub pad: u32,
+    /// The process's PID namespace, by the device and inode of its file,
+    /// which the thread ids in states are in.
+    pub pid_namespace: [u64; 2],
+}
+
+/// How a sample's walk of interpreter frames went.
+pub mod walk {
+    /// Its process has no walk.
+    pub const NONE: u32 = 0;
+    /// The runtime keeps no state for the thread, as for one it does not
+    /// run on.
+    pub const NO_THREAD: u32 = 1;
+    /// To the outermost frame.
+    pub const DONE: u32 = 2;
+    /// Cut at `MAX_WALKED_FRAMES`.
+    pub const CUT: u32 = 3;
+    /// A thread's state or frame could not be read.
+    pub const FAILED: u32 = 4;
+    /// The thread's state was not among the first `MAX_THREADS` searched.
+    pub const UNSEARCHED: u32 = 5;
 }
 
 /// The user registers a stack copy is unwound from.
@@ -90,4 +188,5 @@ mod user {
     unsafe impl aya::Pod for super::Start {}
     unsafe impl aya::Pod for super::CallKey {}
     unsafe impl aya::Pod for super::Calls {}
+    unsafe impl aya::Pod for super::Walk {}
 }

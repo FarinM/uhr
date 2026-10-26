@@ -8,6 +8,8 @@ use aya_ebpf::maps::{Array, HashMap, PerCpuArray};
 use aya_ebpf::programs::TracePointContext;
 use uhr_ebpf::{ACTIVE, HELD};
 
+use crate::{mappings, walk};
+
 const CLONE_THREAD: u64 = 0x10000;
 
 /// By tgid. uhr adds the target.
@@ -88,6 +90,8 @@ pub fn sched_process_exit(_ctx: TracePointContext) -> u32 {
     // The exiting thread is no longer counted.
     if unsafe { bpf_probe_read_kernel(live.cast::<i32>()) } == Ok(0) {
         let _ = TARGETS.remove(tgid);
+        walk::forget(tgid);
+        mappings::forget(tgid);
     }
     0
 }
@@ -103,6 +107,8 @@ pub fn sched_process_free(ctx: TracePointContext) -> u32 {
         return 0;
     };
     let _ = TARGETS.remove(pid as u32);
+    walk::forget(pid as u32);
+    mappings::forget(pid as u32);
     0
 }
 
@@ -113,5 +119,6 @@ pub fn sched_process_exec(_ctx: TracePointContext) -> u32 {
     if unsafe { TARGETS.get(tgid) } == Some(&HELD) {
         let _ = TARGETS.insert(tgid, ACTIVE, 0);
     }
+    walk::forget(tgid);
     0
 }

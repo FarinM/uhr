@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::env;
 use std::fs::File;
 use std::io::{self, BufReader, Read};
@@ -20,13 +20,16 @@ use tracing::warn;
 
 use super::unwind::{Unwinding as UserUnwinding, UserCopy};
 use super::{Error, Result, io_error};
+use crate::interpreters::{Interpreters, Program};
 use crate::kallsyms::{self, Kallsyms};
 use uhr_core::recording::{
-    Clock, Collector, Exit, FORMAT_VERSION, Frame, KERNEL, KernelSymbols, Manifest, Mapping,
-    MissingSignal, Mode, OffCPUInterval, Origin, Platform, Recording, Sample, Sampling, Signal,
-    StackCoverage, Stream, StreamCoverage, Target, Thread, ThreadName, ThreadState, Unwinding,
+    Clock, Collector, Exit, FORMAT_VERSION, Frame, Interpreted, InterpretedCode,
+    InterpreterCoverage, KERNEL, KernelSymbols, Manifest, Mapping, MissingSignal, Mode,
+    OffCPUInterval, Origin, Platform, Recording, Sample, Sampling, Signal, StackCoverage, Stream,
+    StreamCoverage, Target, Thread, ThreadName, ThreadState, Unwinding,
 };
-use uhr_ebpf::{MAX_FRAMES, SampleHeader, UserRegisters, mode};
+use uhr_core::runtimes::{Interpreter, WalkedFrame};
+use uhr_ebpf::{MAX_FRAMES, SampleHeader, UserRegisters, mode, walk};
 
 pub(super) struct Input<'a> {
     pub perf_data: &'a Path,
@@ -57,6 +60,8 @@ pub(super) struct EbpfSamples<'a> {
     /// The bytes of user stack copied with each sample, `None` where they
     /// walked user stacks with frame pointers.
     pub stack_bytes: Option<u32>,
+    /// The interpreters whose frames they walked.
+    pub interpreters: &'a Interpreters,
 }
 
 pub(super) const TIMER_BIAS: &str = "cpu-clock samples come from a timer interrupt, so code \
@@ -380,6 +385,7 @@ pub(super) fn convert(input: Input) -> Result<(Recording, Option<EbpfStacks>)> {
                 stacks_at_stack_limit: state.stacks_at_stack_limit,
                 stacks_cut_at_stack_copy: stack_copy_bytes.map(|_| state.stacks_cut_at_stack_copy),
                 stacks_not_unwound: stack_copy_bytes.map(|_| state.stacks_not_unwound),
+                interpreters: Vec::new(),
             }),
             overhead_ns: None,
             known_biases: known_biases.iter().map(|b| b.to_string()).collect(),
@@ -431,7 +437,7 @@ pub(super) fn convert(input: Input) -> Result<(Recording, Option<EbpfStacks>)> {
         off_cpu: state.off_cpu,
         kernel_symbols,
         jit_symbols: Vec::new(),
-        interpreted_code: Vec::new(),
+        interpreted_code: state.interpreted_code,
         syscall_calls: Vec::new(),
     };
     Ok((recording, ebpf_stacks))
@@ -453,7 +459,144 @@ fn ebpf_coverage(state: &State, max_stack_depth: u32, stack_bytes: Option<u32>) 
         stacks_at_stack_limit: state.ebpf_at_limit,
         stacks_cut_at_stack_copy: stack_bytes.map(|_| state.ebpf_cut_at_copy),
         stacks_not_unwound: stack_bytes.map(|_| state.ebpf_not_unwound),
+        interpreters: state
+            .interpreters
+            .iter()
+            .map(|((runtime, version), walks)| InterpreterCoverage {
+                runtime: (*runtime).to_owned(),
+                version: version.clone(),
+                processes: walks.processes.len() as u64,
+                samples: walks.samples,
+                before_found: walks.before_found,
+                no_thread: walks.no_thread,
+                unsearched: walks.unsearched,
+                failed: walks.failed,
+                cut: walks.cut,
+                frames: walks.frames,
+                unread_frames: walks.unread_frames,
+                unmatched: walks.unmatched,
+            })
+            .collect(),
     }
+}
+
+/// A native frame of a sample, as `place` sees it.
+struct Native {
+    id: u32,
+    /// Whether it is the interpreter's eval loop.
+    eval: bool,
+    /// Where it ends on the stack, if known.
+    end: Option<u64>,
+}
+
+/// The interpreter frames that one call native code made into the
+/// interpreter ran, leaf first, and where the frame is that started the
+/// call, if the interpreter keeps it in the call's native frame.
+#[derive(Debug, Default)]
+struct Group {
+    frames: Vec<u32>,
+    entry: Option<u64>,
+}
+
+/// Puts groups of interpreter frames into a native stack, both leaf first,
+/// each just above its call's eval-loop frame, as the code that ran there.
+///
+/// Where groups say where they started, each goes just above the native
+/// frame that holds where, whose function ran the call, the eval loop or
+/// one it was inlined into. Where the stack's ends come from walking
+/// `frame_pointers`, a user leaf outside the eval loop that holds it set up
+/// no frame, so that the walk lost its caller, the eval loop, and the group
+/// goes just above the leaf. One that started past the native stack's end
+/// goes at its outer end, and one whose start the walk did not reach goes
+/// above the next run of eval-loop frames outward of the group before it.
+///
+/// Otherwise groups are matched to the runs of eval-loop frames from the
+/// outer end, which a whole frame-pointer stack keeps: the ones without a
+/// run go just above the user leaf, at `user`. A stack or walk that lost
+/// its outer end is matched `from_inner` instead. Also says whether a group
+/// had no run, so that where it went is a guess.
+fn place(
+    native: &[Native],
+    user: usize,
+    mut groups: Vec<Group>,
+    from_inner: bool,
+    frame_pointers: bool,
+) -> (Vec<u32>, bool) {
+    // What follows the outermost call's start is no call.
+    while groups.last().is_some_and(|group| group.frames.is_empty()) {
+        groups.pop();
+    }
+    let mut unmatched = false;
+    let mut at: Vec<(usize, Vec<u32>)> = Vec::with_capacity(groups.len());
+    let mut runs = Vec::new();
+    for (i, frame) in native.iter().enumerate() {
+        if frame.eval && !(i > 0 && native[i - 1].eval) {
+            runs.push(i);
+        }
+    }
+    let by_entries = groups.iter().any(|group| group.entry.is_some())
+        && native.iter().skip(user).any(|frame| frame.end.is_some());
+    if by_entries {
+        // Where the group before went, which the next is outward of.
+        let mut outward = user;
+        for group in groups {
+            let holds = |entry: u64| {
+                native
+                    .iter()
+                    .enumerate()
+                    .skip(user)
+                    .find(|(_, frame)| frame.end.is_some_and(|end| end > entry))
+            };
+            let position = match group.entry {
+                Some(entry) => match holds(entry) {
+                    Some((i, frame)) if i == user && !frame.eval && frame_pointers => i + 1,
+                    Some((i, _)) => i,
+                    None => native.len(),
+                },
+                None => match runs.iter().find(|&&run| run >= outward) {
+                    Some(&run) => run,
+                    None => {
+                        unmatched |= !group.frames.is_empty();
+                        native.len()
+                    }
+                },
+            };
+            outward = outward.max(position + 1);
+            at.push((position, group.frames));
+        }
+    } else {
+        let shift = if from_inner {
+            0
+        } else {
+            runs.len() as isize - groups.len() as isize
+        };
+        let lost = (user + 1).min(runs.first().copied().unwrap_or(native.len()));
+        for (k, group) in groups.into_iter().enumerate() {
+            let run = usize::try_from(k as isize + shift)
+                .ok()
+                .and_then(|run| runs.get(run));
+            let position = match run {
+                Some(&position) => position,
+                None => {
+                    unmatched |= !group.frames.is_empty();
+                    if from_inner { native.len() } else { lost }
+                }
+            };
+            at.push((position.min(native.len()), group.frames));
+        }
+    }
+    at.sort_by_key(|(position, _)| *position);
+    let frames: usize = at.iter().map(|(_, frames)| frames.len()).sum();
+    let mut merged = Vec::with_capacity(native.len() + frames);
+    let mut at = at.into_iter().peekable();
+    for (i, frame) in native.iter().enumerate() {
+        while let Some((_, frames)) = at.next_if(|(position, _)| *position == i) {
+            merged.extend(frames);
+        }
+        merged.push(frame.id);
+    }
+    merged.extend(at.flat_map(|(_, frames)| frames));
+    (merged, unmatched)
 }
 
 /// The deepest stack uhr's eBPF programs take, kernel and user frames
@@ -474,6 +617,7 @@ struct EbpfReader<'a> {
     period_ns: u64,
     /// The bytes of user stack each copy was asked for.
     stack_bytes: Option<u32>,
+    interpreters: &'a Interpreters,
     buffer: Vec<u8>,
 }
 
@@ -513,6 +657,7 @@ impl<'a> EbpfReader<'a> {
             next: 0,
             period_ns: samples.period_ns,
             stack_bytes: samples.stack_bytes,
+            interpreters: samples.interpreters,
             buffer: Vec::new(),
         })
     }
@@ -533,20 +678,35 @@ impl<'a> EbpfReader<'a> {
             let header: SampleHeader =
                 unsafe { std::ptr::read_unaligned(self.buffer.as_ptr().cast()) };
             let rest = &self.buffer[size_of::<SampleHeader>()..];
-            let count = header.kernel_frames as usize + header.user_frames as usize;
+            let (kernel, user) = (header.kernel_frames as usize, header.user_frames as usize);
+            let ends = header.frame_ends != 0;
+            let count = kernel + user * (1 + usize::from(ends));
             let copied = match header.copy {
                 0 => 0,
                 _ => size_of::<UserRegisters>() + header.stack_bytes as usize,
             };
-            if rest.len() != count * 8 + copied {
+            let walked = header.walked_frames as usize * header.walked_bytes as usize;
+            if rest.len() != count * 8 + copied + walked {
                 return Err(unexpected(format!(
-                    "an eBPF sample of {len} bytes with {count} frames and a {copied}-byte copy"
+                    "an eBPF sample of {len} bytes with {count} frames, a {copied}-byte copy \
+                     and {walked} bytes of interpreter frames"
                 )));
             }
             let (frames, rest) = rest.split_at(count * 8);
-            let frames = frames
-                .chunks_exact(8)
-                .map(|word| u64::from_ne_bytes(word.try_into().unwrap()));
+            let (rest, walked) = rest.split_at(copied);
+            let word =
+                |at: usize| u64::from_ne_bytes(frames[at * 8..at * 8 + 8].try_into().unwrap());
+            let frames: Vec<(u64, Option<u64>)> = (0..kernel)
+                .map(|i| (word(i), None))
+                .chain((0..user).map(|i| match ends {
+                    // 0 for the outermost.
+                    true => (
+                        word(kernel + 2 * i),
+                        Some(word(kernel + 2 * i + 1)).filter(|&e| e != 0),
+                    ),
+                    false => (word(kernel + i), None),
+                }))
+                .collect();
             let copy = (header.copy != 0).then(|| {
                 let (registers, stack) = rest.split_at(size_of::<UserRegisters>());
                 // SAFETY: as for the header, plain numbers, as many bytes.
@@ -561,7 +721,14 @@ impl<'a> EbpfReader<'a> {
                     full: Some(header.stack_bytes) == self.stack_bytes,
                 }
             });
-            state.ebpf_sample(&header, frames, copy, self.period_ns);
+            let walked = (self.interpreters, walked);
+            state.ebpf_sample(
+                &header,
+                frames.into_iter(),
+                copy,
+                Some(walked),
+                self.period_ns,
+            );
             self.next += 1;
         }
         Ok(())
@@ -671,6 +838,26 @@ struct State {
     unwinding: Option<UserUnwinding>,
     stacks_cut_at_stack_copy: u64,
     stacks_not_unwound: u64,
+    interpreted_code: Vec<InterpretedCode>,
+    /// Rows of `interpreted_code`, by pid and address.
+    code_rows: HashMap<(Program, u64), u32>,
+    /// By runtime and version.
+    interpreters: BTreeMap<(&'static str, String), Walks>,
+}
+
+/// How the frames of one runtime and version were read.
+#[derive(Default)]
+struct Walks {
+    processes: BTreeSet<u32>,
+    samples: u64,
+    before_found: u64,
+    no_thread: u64,
+    unsearched: u64,
+    failed: u64,
+    cut: u64,
+    frames: u64,
+    unread_frames: u64,
+    unmatched: u64,
 }
 
 struct SwitchedOut {
@@ -715,6 +902,9 @@ impl State {
             unwinding: None,
             stacks_cut_at_stack_copy: 0,
             stacks_not_unwound: 0,
+            interpreted_code: Vec::new(),
+            code_rows: HashMap::new(),
+            interpreters: BTreeMap::new(),
         }
     }
 
@@ -873,8 +1063,9 @@ impl State {
     fn ebpf_sample(
         &mut self,
         header: &SampleHeader,
-        frames: impl Iterator<Item = u64>,
+        frames: impl Iterator<Item = (u64, Option<u64>)>,
         copy: Option<UserCopy>,
+        walked: Option<(&Interpreters, &[u8])>,
         period_ns: u64,
     ) {
         let (pid, tid, time_ns) = (header.tgid, header.tid, header.time_ns);
@@ -895,7 +1086,9 @@ impl State {
         self.seen_on_cpu(pid, tid, time_ns);
         let kernel = header.kernel_frames as usize;
         let mut stack = Vec::new();
-        for (i, address) in frames.enumerate() {
+        // Where each frame of `stack` ends on the stack, where known.
+        let mut ends = Vec::new();
+        for (i, (address, end)) in frames.enumerate() {
             let context = if i < kernel {
                 ChainContext::Kernel
             } else {
@@ -903,16 +1096,21 @@ impl State {
             };
             let first = i == 0 || i == kernel;
             stack.push(self.frame(pid, context, address, !first));
+            ends.push(end);
         }
         let limit = ebpf_depth(self.max_stack_depth) as usize;
+        // Whether the native stack lost its outer end.
+        let mut cut_short = false;
         if let (Some(copy), Some(unwinding)) = (copy, self.unwinding.as_mut()) {
             let ids = self.processes.get(&pid).map_or(&[][..], Vec::as_slice);
             let room = limit.saturating_sub(stack.len());
             let user = unwinding.unwind(&copy, pid, ids, &self.mappings, room);
+            cut_short |= user.cut;
             self.ebpf_cut_at_copy += u64::from(user.cut);
             self.ebpf_not_unwound += u64::from(user.not_unwound);
-            for (address, return_address) in user.frames {
+            for (address, return_address, end) in user.frames {
                 stack.push(self.frame(pid, ChainContext::User, address, return_address));
+                ends.push(end);
             }
         }
         let (mode, context) = match header.mode {
@@ -923,9 +1121,14 @@ impl State {
         // In a guest, or both walks failed.
         if stack.is_empty() {
             stack.push(self.frame(pid, context, header.ip, false));
+            ends.push(None);
         }
         if stack.len() >= limit {
             self.ebpf_at_limit += 1;
+            cut_short = true;
+        }
+        if let Some((interpreters, walked)) = walked {
+            self.add_walked(header, &mut stack, &ends, interpreters, walked, cut_short);
         }
         let stack = intern(&mut self.stacks, &mut self.stack_ids, stack);
         self.ebpf_samples += 1;
@@ -938,6 +1141,153 @@ impl State {
             stack,
             cpu_ns: period_ns,
         });
+    }
+
+    /// Puts the interpreter frames a sample walked into its native stack,
+    /// leaf first, as `place` says. `cut_short` if the native stack lost its
+    /// outer end.
+    fn add_walked(
+        &mut self,
+        header: &SampleHeader,
+        stack: &mut Vec<u32>,
+        ends: &[Option<u64>],
+        interpreters: &Interpreters,
+        walked: &[u8],
+        cut_short: bool,
+    ) {
+        let (pid, time_ns) = (header.tgid, header.time_ns);
+        let program = (pid, header.exec);
+        let (at, first) = interpreters.of(program, time_ns);
+        let Some(found) = at.or(first) else {
+            return;
+        };
+        let mut counts = Walks {
+            samples: 1,
+            ..Walks::default()
+        };
+        match header.walk {
+            walk::NONE => counts.before_found = 1,
+            walk::NO_THREAD => counts.no_thread = 1,
+            walk::UNSEARCHED => counts.unsearched = 1,
+            walk::FAILED => counts.failed = 1,
+            walk::CUT => counts.cut = 1,
+            _ => {}
+        }
+        if let (Some(interpreter), true) = (at, header.walked_frames > 0) {
+            // Each frame after its address.
+            let bytes = header.walked_bytes.max(9) as usize;
+            let mut groups = vec![Group::default()];
+            for record in walked.chunks_exact(bytes) {
+                let (address, frame) = record.split_at(8);
+                let address = u64::from_ne_bytes(address.try_into().unwrap());
+                let entry = match interpreter.frame(frame) {
+                    WalkedFrame::Code {
+                        code,
+                        instruction,
+                        entered,
+                    } => {
+                        let read = interpreters
+                            .code
+                            .get(&(program, code))
+                            .and_then(Option::as_ref);
+                        let line = read.and_then(|code| code.line(instruction));
+                        let row = self.code_row(program, interpreter, code, read);
+                        let frame = Frame {
+                            origin: Origin::Interpreted,
+                            address: instruction,
+                            mapping: None,
+                            file_offset: None,
+                            return_address: false,
+                            interpreted: Some(Interpreted { code: row, line }),
+                        };
+                        let id = intern(&mut self.frames, &mut self.frame_ids, frame);
+                        groups.last_mut().expect("never empty").frames.push(id);
+                        counts.frames += 1;
+                        counts.unread_frames += u64::from(read.is_none());
+                        entered.then_some(None)
+                    }
+                    WalkedFrame::Entry { native } => Some(native.then_some(address)),
+                };
+                if let Some(entry) = entry {
+                    groups.last_mut().expect("never empty").entry = entry;
+                    groups.push(Group::default());
+                }
+            }
+            let eval_loop = |id: &u32| {
+                let frame = &self.frames[*id as usize];
+                let address = frame
+                    .address
+                    .saturating_sub(u64::from(frame.return_address));
+                let ranges = interpreter.eval_loop();
+                let after = ranges.partition_point(|range| range.start <= address);
+                frame.origin == Origin::Binary
+                    && after
+                        .checked_sub(1)
+                        .is_some_and(|i| ranges[i].contains(&address))
+            };
+            let native: Vec<Native> = stack
+                .iter()
+                .zip(ends)
+                .map(|(id, end)| Native {
+                    id: *id,
+                    eval: eval_loop(id),
+                    end: *end,
+                })
+                .collect();
+            let user = stack
+                .iter()
+                .position(|id| self.frames[*id as usize].origin != Origin::Kernel)
+                .unwrap_or(stack.len());
+            // A frame-pointer walk that runs into code without frames ends at
+            // an address in no mapping.
+            let lost_outer = cut_short
+                || stack.last().is_some_and(|id| {
+                    let frame = &self.frames[*id as usize];
+                    frame.origin == Origin::Unresolved && frame.mapping.is_none()
+                });
+            let from_inner = lost_outer || header.walk == walk::CUT;
+            let frame_pointers = header.frame_ends != 0;
+            let (merged, unmatched) = place(&native, user, groups, from_inner, frame_pointers);
+            counts.unmatched = u64::from(unmatched);
+            *stack = merged;
+        }
+        let walks = self
+            .interpreters
+            .entry((found.runtime(), found.version().to_owned()))
+            .or_default();
+        walks.processes.insert(pid);
+        walks.samples += counts.samples;
+        walks.before_found += counts.before_found;
+        walks.no_thread += counts.no_thread;
+        walks.unsearched += counts.unsearched;
+        walks.failed += counts.failed;
+        walks.cut += counts.cut;
+        walks.frames += counts.frames;
+        walks.unread_frames += counts.unread_frames;
+        walks.unmatched += counts.unmatched;
+    }
+
+    /// The row of `interpreted_code` for the code at `address` in
+    /// `program`, named if it was read.
+    fn code_row(
+        &mut self,
+        program: Program,
+        interpreter: &dyn Interpreter,
+        address: u64,
+        read: Option<&uhr_core::runtimes::Code>,
+    ) -> u32 {
+        let table = &mut self.interpreted_code;
+        *self.code_rows.entry((program, address)).or_insert_with(|| {
+            table.push(InterpretedCode {
+                pid: program.0,
+                runtime: interpreter.runtime().to_owned(),
+                address,
+                name: read.map(|code| code.name.clone()),
+                file: read.map(|code| code.file.clone()),
+                first_line: read.map(|code| code.first_line),
+            });
+            table.len() as u32 - 1
+        })
     }
 
     /// perf samples a thread right before it goes off CPU, and the switch
@@ -1119,7 +1469,7 @@ impl State {
         if let Some(user) = user {
             self.stacks_cut_at_stack_copy += u64::from(user.cut);
             self.stacks_not_unwound += u64::from(user.not_unwound);
-            for (address, return_address) in user.frames {
+            for (address, return_address, _) in user.frames {
                 stack.push(self.frame(pid, ChainContext::User, address, return_address));
             }
         }
@@ -1384,6 +1734,189 @@ mod tests {
     }
 
     #[test]
+    fn puts_interpreter_frames_above_the_calls_into_the_interpreter() {
+        // Native frames 0..10, interpreter frames 100 and up.
+        let (leaf, c1, c2, eval0, c3, eval1, main) = (0, 1, 2, 3, 4, 5, 6);
+        let frames = |ids: &[(u32, bool)]| -> Vec<Native> {
+            let native = |&(id, eval): &(u32, bool)| Native {
+                id,
+                eval,
+                end: None,
+            };
+            ids.iter().map(native).collect()
+        };
+        let groups = || {
+            vec![
+                Group {
+                    frames: vec![100],
+                    entry: None,
+                },
+                Group {
+                    frames: vec![101, 102],
+                    entry: None,
+                },
+                Group::default(),
+            ]
+        };
+        // Every call shows, the leaf in the eval loop.
+        let whole = frames(&[(eval0, true), (c3, false), (eval1, true), (main, false)]);
+        assert_eq!(
+            place(&whole, 0, groups(), false, false),
+            (vec![100, eval0, c3, 101, 102, eval1, main], false)
+        );
+        // The leaf set up no frame, so its caller, the inner eval loop,
+        // does not show.
+        let lost = frames(&[
+            (leaf, false),
+            (c1, false),
+            (c2, false),
+            (eval1, true),
+            (main, false),
+        ]);
+        assert_eq!(
+            place(&lost, 0, groups(), false, false),
+            (vec![leaf, 100, c1, c2, 101, 102, eval1, main], true)
+        );
+        // Under kernel frames.
+        let kernel = frames(&[
+            (7, false),
+            (8, false),
+            (leaf, false),
+            (c1, false),
+            (eval1, true),
+            (main, false),
+        ]);
+        assert_eq!(
+            place(&kernel, 2, groups(), false, false).0,
+            [7, 8, leaf, 100, c1, 101, 102, eval1, main]
+        );
+        // A walk cut short, or a native stack that lost its outer end.
+        let cut = vec![
+            Group {
+                frames: vec![100],
+                entry: None,
+            },
+            Group {
+                frames: vec![101],
+                entry: None,
+            },
+            Group {
+                frames: vec![102],
+                entry: None,
+            },
+        ];
+        assert_eq!(
+            place(&whole, 0, cut, true, false),
+            (vec![100, eval0, c3, 101, eval1, main, 102], true)
+        );
+        let truncated = frames(&[(eval0, true), (c1, false), (c2, false)]);
+        assert_eq!(
+            place(&truncated, 0, groups(), true, false),
+            (vec![100, eval0, c1, c2, 101, 102], true)
+        );
+        // An inner call that has run none of its frames yet.
+        let empty = vec![
+            Group::default(),
+            Group {
+                frames: vec![101],
+                entry: None,
+            },
+            Group::default(),
+        ];
+        assert_eq!(
+            place(&whole, 0, empty, false, false),
+            (vec![eval0, c3, 101, eval1, main], false)
+        );
+    }
+
+    #[test]
+    fn puts_interpreter_frames_where_their_calls_started() {
+        let native = |id, eval, end| Native { id, eval, end };
+        let group = |frames: &[u32], entry| Group {
+            frames: frames.to_vec(),
+            entry: Some(entry),
+        };
+        // Each call started in its eval loop's frame.
+        let whole = [
+            native(0, false, Some(0x1000)),
+            native(1, true, Some(0x1100)),
+            native(2, false, Some(0x1200)),
+            native(3, true, Some(0x1300)),
+            native(4, false, None),
+        ];
+        let groups = vec![
+            group(&[100], 0x10f0),
+            group(&[101, 102], 0x12f0),
+            Group::default(),
+        ];
+        assert_eq!(
+            place(&whole, 0, groups, false, true),
+            (vec![0, 100, 1, 2, 101, 102, 3, 4], false)
+        );
+        // The eval loop inlined into the function that called it, as 3.14
+        // has it in gen_iternext: the call started in that one's frame.
+        let (op, gen_iternext, sum, call, main) = (0, 1, 2, 3, 4);
+        let inlined = [
+            native(op, true, Some(0x1000)),
+            native(gen_iternext, false, Some(0x1100)),
+            native(sum, false, Some(0x1200)),
+            native(call, true, Some(0x1300)),
+            native(main, false, None),
+        ];
+        let groups = vec![
+            group(&[100, 101], 0x10f0),
+            group(&[102], 0x12f0),
+            Group::default(),
+        ];
+        assert_eq!(
+            place(&inlined, 0, groups, false, false),
+            (
+                vec![op, 100, 101, gen_iternext, sum, 102, call, main],
+                false
+            )
+        );
+        // Python called qsort, which called Python. The leaf set up no
+        // frame, so the inner eval loop's frame is lost, and code without
+        // frame pointers ended the walk before the outer one.
+        let (leaf, msort, qsort, ffi) = (0, 1, 2, 3);
+        let lost = [
+            native(leaf, false, Some(0x1000)),
+            native(msort, false, Some(0x1080)),
+            native(qsort, false, Some(0x1100)),
+            native(ffi, false, None),
+        ];
+        let groups = vec![
+            group(&[100], 0x0ff0),
+            group(&[101, 102], 0x2000),
+            Group::default(),
+        ];
+        assert_eq!(
+            place(&lost, 0, groups, false, true),
+            (vec![leaf, 100, msort, qsort, ffi, 101, 102], false)
+        );
+        // The walk stopped before the outer call's start: it goes above the
+        // next eval loop's frames out, not past the stack's end.
+        let (eval0, qsort, eval1, start) = (0, 1, 2, 3);
+        let cut = [
+            native(eval0, true, Some(0x1000)),
+            native(qsort, false, Some(0x1100)),
+            native(eval1, true, Some(0x1200)),
+            native(start, false, None),
+        ];
+        let groups = vec![
+            group(&[100], 0x0ff0),
+            Group {
+                frames: vec![101, 102],
+                entry: None,
+            },
+        ];
+        assert_eq!(
+            place(&cut, 0, groups, true, true),
+            (vec![100, eval0, qsort, 101, 102, eval1, start], false)
+        );
+    }
+
+    #[test]
     fn leaves_out_ebpf_samples_of_threads_perf_has_no_record_of_then() {
         let mut state = State::new(127);
         // A kernel thread, which has no mappings, and a thread that exits.
@@ -1401,9 +1934,21 @@ mod tests {
             user_frames: 0,
             stack_bytes: 0,
             copy: 0,
+            walk: 0,
+            walked_frames: 0,
+            walked_bytes: 0,
+            frame_ends: 0,
+            exec: 0,
+            mapped: 0,
         };
         for pid in [1, 2, 3] {
-            state.ebpf_sample(&header(pid), [0xffff_0000_1000].into_iter(), None, 1000);
+            state.ebpf_sample(
+                &header(pid),
+                [(0xffff_0000_1000, None)].into_iter(),
+                None,
+                None,
+                1000,
+            );
         }
         assert_eq!((state.samples.len(), state.ebpf_untracked), (1, 2));
         assert_eq!(state.samples[0].pid, 1);
@@ -1428,8 +1973,14 @@ mod tests {
             user_frames: 1,
             stack_bytes: 0,
             copy: 0,
+            walk: 0,
+            walked_frames: 0,
+            walked_bytes: 0,
+            frame_ends: 0,
+            exec: 0,
+            mapped: 0,
         };
-        state.ebpf_sample(&header, [0x1010].into_iter(), None, 1000);
+        state.ebpf_sample(&header, [(0x1010, None)].into_iter(), None, None, 1000);
         assert_eq!((state.samples.len(), state.ebpf_untracked), (1, 0));
         let threads = state.take_threads();
         let main: Vec<_> = threads

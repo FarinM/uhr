@@ -9,10 +9,11 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::Sender;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use aya::maps::{Array, HashMap, MapData, PerCpuArray, RingBuf};
+use aya::maps::{Array, HashMap, MapData, PerCpuArray, ProgramArray, RingBuf};
 use aya::programs::perf_event::{
     PerfEventConfig, PerfEventLinkId, PerfEventScope, SamplePolicy, SoftwareEvent,
 };
@@ -22,10 +23,12 @@ use aya::programs::{PerfEvent, RawTracePoint, TracePoint};
 use aya::util::{nr_cpus, online_cpus};
 use aya::{Ebpf, EbpfLoader};
 use syscalls::Sysno;
+use tracing::warn;
 use uhr_core::recording::SyscallCalls;
-use uhr_ebpf::{ACTIVE, CallKey, Calls, HELD, Start};
+use uhr_ebpf::{ACTIVE, CallKey, Calls, HELD, SampleHeader, Start, UserRegisters};
 
 use crate::btf;
+use crate::interpreters::{Finder, Interpreters, Maps, Walked};
 use crate::launch::monotonic_ns;
 
 /// Why the eBPF collector could not run.
@@ -114,9 +117,19 @@ const SYSCALLS: [&str; 2] = ["sys_enter", "sys_exit"];
 
 const SAMPLER: &str = "sample";
 
+/// The program the sampler goes on in to walk interpreter frames.
+const WALKER: &str = "walk_frames";
+
 /// The program that sees CPUs go offline and online, and the tracepoint it
 /// runs at.
 const HOTPLUG: (&str, &str, &str) = ("cpuhp_enter", "cpuhp", "cpuhp_enter");
+
+/// The programs that count the times each process maps a file's code, and
+/// the tracepoints they run at.
+const MAPPINGS: [(&str, &str, &str); 2] = [
+    ("sys_enter_mmap", "syscalls", "sys_enter_mmap"),
+    ("sys_exit_mmap", "syscalls", "sys_exit_mmap"),
+];
 
 /// Whether the programs can sample here: the sampler reads the registers
 /// of these architectures only.
@@ -161,6 +174,7 @@ pub(crate) struct Counted {
 pub(crate) struct Samples {
     /// Samples that found the ring buffer full.
     pub(crate) dropped: u64,
+    pub(crate) interpreters: Interpreters,
 }
 
 /// What the programs found. Each part is `None` if it was not asked for.
@@ -208,6 +222,9 @@ pub(crate) struct Programs {
     tells_guests: bool,
     let_go_late: bool,
     reader: Option<Reader>,
+    finder: Option<Finder>,
+    /// The kernel empties a program array once uhr no longer has it open.
+    next: Option<ProgramArray<MapData>>,
     ended: Option<Result<u64, Error>>,
 }
 
@@ -280,6 +297,8 @@ impl Programs {
             tells_guests: layout.task_flags.is_some(),
             let_go_late: layout.exits.is_none(),
             reader: None,
+            finder: None,
+            next: None,
             ended: None,
         };
         if let Some(sampling) = &options.sampling {
@@ -297,6 +316,19 @@ impl Programs {
         sampler_program(&mut self.ebpf)?
             .load()
             .map_err(|e| Error::Program(SAMPLER, e).or_not_permitted())?;
+        let next = self
+            .ebpf
+            .take_map("PROGRAMS")
+            .ok_or(Error::Missing("PROGRAMS"))?;
+        let mut next = ProgramArray::try_from(next).map_err(|e| Error::Map("PROGRAMS", e))?;
+        let walker = perf_event(&mut self.ebpf, WALKER)?;
+        walker
+            .load()
+            .map_err(|e| Error::Program(WALKER, e).or_not_permitted())?;
+        let walker = walker.fd().map_err(|e| Error::Program(WALKER, e))?;
+        next.set(0, walker, 0)
+            .map_err(|e| Error::Map("PROGRAMS", e))?;
+        self.next = Some(next);
         self.period_ns = sampling.period_ns;
         // Before the CPUs' events, so no step of a CPU's goes unseen.
         let (program, category, name) = HOTPLUG;
@@ -306,6 +338,21 @@ impl Programs {
             .and_then(|()| hotplug.attach(category, name))
             .map_err(|e| Error::Program(program, e).or_not_permitted())?;
         self.tracepoints.push((program, link));
+        for (program, category, name) in MAPPINGS {
+            let tracepoint = tracepoint(&mut self.ebpf, program)?;
+            tracepoint
+                .load()
+                .map_err(|e| Error::Program(program, e).or_not_permitted())?;
+            // A kernel can be built without the tracepoints of syscalls.
+            match tracepoint.attach(category, name) {
+                Ok(link) => self.tracepoints.push((program, link)),
+                Err(error) => warn!(
+                    program,
+                    %error,
+                    "a runtime loaded after the exec gets its frames read only a while later"
+                ),
+            }
+        }
         for cpu in online_cpus().map_err(|(_, e)| Error::Cpus(e))? {
             // Before the event opens, so a CPU that goes offline and back in
             // between is seen to.
@@ -314,7 +361,18 @@ impl Programs {
             self.sampler.insert(cpu, (link, attached));
             self.sampled_cpus.insert(cpu);
         }
-        self.reader = Some(Reader::start(ring, &sampling.path)?);
+        let walks = self.ebpf.take_map("WALKS").ok_or(Error::Missing("WALKS"))?;
+        let threads = self
+            .ebpf
+            .take_map("THREADS")
+            .ok_or(Error::Missing("THREADS"))?;
+        let maps = Maps {
+            walks: aya::maps::HashMap::try_from(walks).map_err(|e| Error::Map("WALKS", e))?,
+            threads: aya::maps::HashMap::try_from(threads).map_err(|e| Error::Map("THREADS", e))?,
+        };
+        let finder = Finder::start(maps);
+        self.reader = Some(Reader::start(ring, &sampling.path, finder.sender())?);
+        self.finder = Some(finder);
         Ok(())
     }
 
@@ -439,6 +497,7 @@ impl Programs {
             tells_guests,
             let_go_late,
             reader,
+            finder,
             ..
         } = self;
         let mut programs = Vec::new();
@@ -450,6 +509,9 @@ impl Programs {
                     .map_err(|e| Error::Program(SAMPLER, e))?;
             }
             let info = program.info().map_err(|e| Error::Program(SAMPLER, e))?;
+            programs.push(format!("{:016x}", info.tag()));
+            let walker = perf_event(&mut ebpf, WALKER)?;
+            let info = walker.info().map_err(|e| Error::Program(WALKER, e))?;
             programs.push(format!("{:016x}", info.tag()));
         }
         for (program, link) in tracepoints {
@@ -470,14 +532,15 @@ impl Programs {
             let info = tracepoint.info().map_err(|e| Error::Program(program, e))?;
             programs.push(format!("{:016x}", info.tag()));
         }
-        let samples = match reader {
-            Some(reader) => {
+        let samples = match (reader, finder) {
+            (Some(reader), Some(finder)) => {
                 reader.finish()?;
                 Some(Samples {
                     dropped: sum(&mut ebpf, "DROPPED")?,
+                    interpreters: finder.finish(),
                 })
             }
-            None => None,
+            _ => None,
         };
         let syscalls = if counting {
             Some(counted(&mut ebpf, now)?)
@@ -561,7 +624,7 @@ struct Reader {
 }
 
 impl Reader {
-    fn start(ring: RingBuf<MapData>, path: &Path) -> Result<Self, Error> {
+    fn start(ring: RingBuf<MapData>, path: &Path, walked: Sender<Walked>) -> Result<Self, Error> {
         let error = |source| Error::Samples {
             path: path.to_owned(),
             source,
@@ -570,7 +633,7 @@ impl Reader {
         let stop = Arc::new(AtomicBool::new(false));
         let thread = {
             let stop = stop.clone();
-            thread::spawn(move || copy(ring, BufWriter::new(file), &stop))
+            thread::spawn(move || copy(ring, BufWriter::new(file), &stop, &walked))
         };
         Ok(Self {
             stop,
@@ -610,19 +673,53 @@ fn create_private(path: &Path) -> io::Result<File> {
     options.write(true).create_new(true).mode(0o600).open(path)
 }
 
-fn copy(mut ring: RingBuf<MapData>, mut out: BufWriter<File>, stop: &AtomicBool) -> io::Result<()> {
+fn copy(
+    mut ring: RingBuf<MapData>,
+    mut out: BufWriter<File>,
+    stop: &AtomicBool,
+    walked: &Sender<Walked>,
+) -> io::Result<()> {
     loop {
         // Before the last read, so that it gets every sample from before.
         let stopping = stop.load(Ordering::Acquire);
         while let Some(sample) = ring.next() {
             out.write_all(&(sample.len() as u32).to_le_bytes())?;
             out.write_all(&sample)?;
+            if let Some(found) = walked_frames(&sample) {
+                // Gone only once uhr stops sampling.
+                let _ = walked.send(found);
+            }
         }
         if stopping {
             return out.flush();
         }
         thread::sleep(READ_EVERY);
     }
+}
+
+/// What a sample says of its interpreter frames, which follow all else.
+fn walked_frames(sample: &[u8]) -> Option<Walked> {
+    // SAFETY: plain numbers, any bits of which are valid.
+    let header: SampleHeader = unsafe {
+        std::ptr::read_unaligned(sample.get(..size_of::<SampleHeader>())?.as_ptr().cast())
+    };
+    let user_words = header.user_frames as usize * (1 + header.frame_ends as usize);
+    let frames = (header.kernel_frames as usize + user_words) * 8;
+    let copy = match header.copy {
+        0 => 0,
+        _ => size_of::<UserRegisters>() + header.stack_bytes as usize,
+    };
+    let start = size_of::<SampleHeader>() + frames + copy;
+    let len = header.walked_frames as usize * header.walked_bytes as usize;
+    Some(Walked {
+        pid: header.tgid,
+        exec: header.exec,
+        mapped: header.mapped,
+        time_ns: header.time_ns,
+        status: header.walk,
+        frame_bytes: header.walked_bytes,
+        frames: sample.get(start..start + len)?.to_vec(),
+    })
 }
 
 /// Loads every program without running them, as recording would.
@@ -641,12 +738,17 @@ pub fn check() -> Result<(), Error> {
     if !CAN_SAMPLE {
         return Ok(());
     }
-    tracepoint(&mut ebpf, HOTPLUG.0)?
-        .load()
-        .map_err(|e| Error::Program(HOTPLUG.0, e).or_not_permitted())?;
-    sampler_program(&mut ebpf)?
-        .load()
-        .map_err(|e| Error::Program(SAMPLER, e).or_not_permitted())
+    for (program, ..) in [HOTPLUG].into_iter().chain(MAPPINGS) {
+        tracepoint(&mut ebpf, program)?
+            .load()
+            .map_err(|e| Error::Program(program, e).or_not_permitted())?;
+    }
+    for program in [SAMPLER, WALKER] {
+        perf_event(&mut ebpf, program)?
+            .load()
+            .map_err(|e| Error::Program(program, e).or_not_permitted())?;
+    }
+    Ok(())
 }
 
 fn tracepoint<'a>(ebpf: &'a mut Ebpf, program: &'static str) -> Result<&'a mut TracePoint, Error> {
@@ -667,10 +769,14 @@ fn raw_tracepoint<'a>(
 }
 
 fn sampler_program(ebpf: &mut Ebpf) -> Result<&mut PerfEvent, Error> {
-    ebpf.program_mut(SAMPLER)
-        .ok_or(Error::Missing(SAMPLER))?
+    perf_event(ebpf, SAMPLER)
+}
+
+fn perf_event<'a>(ebpf: &'a mut Ebpf, program: &'static str) -> Result<&'a mut PerfEvent, Error> {
+    ebpf.program_mut(program)
+        .ok_or(Error::Missing(program))?
         .try_into()
-        .map_err(|e| Error::Program(SAMPLER, e))
+        .map_err(|e| Error::Program(program, e))
 }
 
 /// Where the kernel keeps what the programs read of its tasks, from its BTF.
@@ -681,18 +787,22 @@ struct Layout {
     /// `task_struct.signal`, and `signal_struct.live`, how many threads a
     /// process has live.
     exits: Option<(u32, u32)>,
+    /// `task_struct.self_exec_id`, how many times the process exec'd.
+    exec_id: Option<u32>,
 }
 
 impl Layout {
     fn read() -> Self {
-        let [task_flags, signal, live] = btf::kernel_member_offsets([
+        let [task_flags, signal, live, exec_id] = btf::kernel_member_offsets([
             ("task_struct", "flags"),
             ("task_struct", "signal"),
             ("signal_struct", "live"),
+            ("task_struct", "self_exec_id"),
         ]);
         Self {
             task_flags,
             exits: signal.zip(live),
+            exec_id,
         }
     }
 }
@@ -724,6 +834,7 @@ fn load(sampling: Option<&Sampling>, layout: Layout) -> Result<Ebpf, Error> {
     let max_stack = sampling.map_or(uhr_ebpf::MAX_FRAMES as u32, |s| s.max_stack);
     let stack_bytes = stack_bytes.unwrap_or(0);
     let task_flags = layout.task_flags.unwrap_or(u32::MAX);
+    let exec_id = layout.exec_id.unwrap_or(u32::MAX);
     let (signal, live) = layout.exits.unwrap_or((u32::MAX, u32::MAX));
     #[cfg(uhr_ebpf)]
     {
@@ -734,6 +845,7 @@ fn load(sampling: Option<&Sampling>, layout: Layout) -> Result<Ebpf, Error> {
             .override_global("MAX_STACK", &max_stack, CAN_SAMPLE)
             .override_global("STACK_BYTES", &stack_bytes, CAN_SAMPLE)
             .override_global("TASK_FLAGS", &task_flags, CAN_SAMPLE)
+            .override_global("TASK_EXEC_ID", &exec_id, CAN_SAMPLE)
             .override_global("TASK_SIGNAL", &signal, true)
             .override_global("SIGNAL_LIVE", &live, true)
             .load(PROGRAMS)

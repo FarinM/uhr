@@ -2,7 +2,10 @@
 //! empty program.
 #![cfg_attr(target_arch = "bpf", no_std)]
 #![cfg_attr(target_arch = "bpf", no_main)]
+#![cfg_attr(target_arch = "bpf", feature(asm_experimental_arch))]
 
+#[cfg(target_arch = "bpf")]
+mod mappings;
 // It reads the registers of these.
 #[cfg(all(
     target_arch = "bpf",
@@ -13,6 +16,8 @@ mod samples;
 mod syscalls;
 #[cfg(target_arch = "bpf")]
 mod targets;
+#[cfg(target_arch = "bpf")]
+mod walk;
 
 #[cfg(target_arch = "bpf")]
 #[panic_handler]

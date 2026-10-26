@@ -3,7 +3,7 @@ mod unwind;
 
 pub(crate) use convert::is_dummy;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::ffi::OsString;
 use std::fs;
@@ -24,6 +24,7 @@ use tracing::{debug, info, warn};
 
 use crate::doctor;
 use crate::ebpf::{self, Programs};
+use crate::interpreters::Interpreters;
 use crate::kallsyms::Kallsyms;
 use crate::launch::{self, Held, Interrupts, Process, monotonic_ns};
 use crate::perf_map;
@@ -262,6 +263,11 @@ pub fn record(options: &RecordOptions, interrupts: &Interrupts, out: &Path) -> R
     // still the ones recorded.
     let kallsyms = Kallsyms::read();
     let found = ended.ebpf.map(|s| s.map(ebpf::Stopped::unload));
+    let none = Interpreters::default();
+    let interpreters = found
+        .as_ref()
+        .and_then(|found| found.as_ref().ok()?.samples.as_ref())
+        .map_or(&none, |samples| &samples.interpreters);
     let ebpf_samples = match tick.as_ref().filter(|_| !ended.perf_sampled) {
         Some(_) if let Some(Err(error)) = found => {
             remove_staging(&staging);
@@ -271,6 +277,7 @@ pub fn record(options: &RecordOptions, interrupts: &Interrupts, out: &Path) -> R
             path: &samples,
             period_ns: tick.period_ns,
             stack_bytes: tick.stack_bytes,
+            interpreters,
         }),
         None => None,
     };
@@ -431,6 +438,16 @@ fn add_ebpf(
             .map(String::from),
         );
         lost_events += samples.dropped;
+        let mut unsupported: BTreeMap<&str, usize> = BTreeMap::new();
+        for reason in samples.interpreters.unsupported.values() {
+            *unsupported.entry(reason).or_default() += 1;
+        }
+        known_biases.extend(unsupported.into_iter().map(|(reason, processes)| {
+            format!(
+                "{processes} processes ran an interpreter whose frames uhr did not read, so \
+                 their stacks show only its own code: {reason}."
+            )
+        }));
     }
     if let Some((stacks, _)) = sampled.as_ref().filter(|(s, _)| s.untracked > 0) {
         known_biases.push(format!(
