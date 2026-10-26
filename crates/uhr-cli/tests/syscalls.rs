@@ -10,7 +10,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use serde_json::Value;
 
-use common::{compile, scratch, uhr};
+use common::{UHR, as_root, compile, scratch, uhr, uhr_as_root};
 
 /// While a test records as root, uhr's programs run at every process's
 /// syscalls, outside the syscall's own function, so the tests here take
@@ -185,34 +185,6 @@ fn the_time_is_in_the_kernel_on_behalf_of_read_zero() {
     );
 }
 
-/// Runs uhr as root through sudo, and gives the recording back to this
-/// user. `None` where sudo asks for a password.
-fn uhr_as_root(args: &[&str], recording: &Path) -> Option<()> {
-    let mut command = vec![common::UHR];
-    command.extend(args);
-    as_root(&command, recording)
-}
-
-/// Runs `command` as root, as `uhr_as_root` runs uhr.
-fn as_root(command: &[&str], recording: &Path) -> Option<()> {
-    let sudo = |args: &[&str]| {
-        std::process::Command::new("sudo")
-            .arg("-n")
-            .args(args)
-            .output()
-            .is_ok_and(|output| output.status.success())
-    };
-    if !sudo(&["true"]) {
-        return None;
-    }
-    assert!(sudo(command), "sudo {command:?} failed");
-    let owner = format!("{}:{}", unsafe { libc::getuid() }, unsafe {
-        libc::getgid()
-    });
-    assert!(sudo(&["chown", "-R", &owner, recording.to_str().unwrap()]));
-    Some(())
-}
-
 #[test]
 fn counts_every_call_of_each_syscall() {
     let _turn = one_at_a_time();
@@ -327,7 +299,7 @@ fn counts_no_syscalls_in_a_pid_namespace_of_its_own() {
     // With a /proc of its own, for perf.
     let unshare = ["unshare", "--pid", "--fork", "--mount-proc"];
     let record = ["record", "-o", rec, "--", program.to_str().unwrap(), "2000"];
-    let command = [&unshare[..], &[common::UHR], &record].concat();
+    let command = [&unshare[..], &[UHR], &record].concat();
     if as_root(&command, &recording).is_none() {
         eprintln!("skipped: needs root through sudo without a password");
         return;

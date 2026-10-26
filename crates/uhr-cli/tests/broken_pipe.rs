@@ -70,12 +70,7 @@ fn record_finishes_when_stderr_is_closed() {
     let manifest: Value =
         serde_json::from_slice(&fs::read(recording.join("manifest.json")).unwrap()).unwrap();
     assert_eq!(manifest["target"]["exit"]["signal"], 13);
-    assert!(
-        manifest["streams"][0]["coverage"]["stacks"]["samples"]
-            .as_u64()
-            .unwrap()
-            > 0
-    );
+    assert!(common::samples(&manifest) > 0, "{manifest}");
     assert!(recording.join("symbols.parquet").exists());
 }
 

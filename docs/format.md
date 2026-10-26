@@ -56,7 +56,7 @@ Each stream has:
 | Field | Meaning |
 |---|---|
 | `id` | Unique within the recording |
-| `collector` | `name` plus the collector's version and settings. For perf: `version`, `sampling`, `context_switches` (whether perf recorded every context switch). uhr's eBPF programs are `ebpf`, with `programs`, their tags in hex, as in the kernel's names for their code: `bpf_prog_<tag>_<name>` |
+| `collector` | `name` plus the collector's version and settings. For perf: `version`, `sampling`, `context_switches` (whether perf recorded every context switch). uhr's eBPF programs are `ebpf`, with `programs`, their tags in hex, as in the kernel's names for their code: `bpf_prog_<tag>_<name>`, and `sampling` |
 | `collector.sampling` | How the collector sampled CPU time: `event`, `frequency_hz` (what it sampled at), `requested_frequency_hz`. Null for one that did not |
 | `signals` | What was captured: `user_cpu_samples`, `kernel_cpu_samples`, `user_stacks`, `kernel_stacks`, `off_cpu_time` (when threads went off CPU and came back, and whether they were preempted), `off_cpu_stacks` (where they went off CPU), `syscall_calls` (how often threads called each syscall and how long the calls took) |
 | `missing_signals` | Signals requested but not captured, each with a `reason`. Without `kernel_cpu_samples`, CPU time spent in the kernel is not in the samples at all, not merely unnamed. Threads go off CPU in the kernel, so without kernel sampling `off_cpu_stacks` is missing too |
@@ -66,7 +66,7 @@ Each stream has:
 | `coverage.stacks.stack_copy_bytes` | User stack copied with each stack, as the collector used it. Null without `dwarf` |
 | `coverage.stacks.samples` | Samples written |
 | `coverage.stacks.off_cpu_intervals` | Off-CPU intervals written. Null without `context_switches` |
-| `coverage.stacks.throttle_events` | Times the kernel throttled sampling |
+| `coverage.stacks.throttle_events` | Times the kernel throttled sampling. Null where the collector does not see it, as for `ebpf`, whose events have no buffer for the kernel to say so in |
 | `coverage.stacks.max_stack_depth` | Stacks deeper than this were cut |
 | `coverage.stacks.stacks_at_stack_limit` | Stacks that reached that depth. This and the next two count every stack: one per sample and one per switch out |
 | `coverage.stacks.stacks_cut_at_stack_copy` | Stacks that went on past the end of their stack copy, so their outer callers are missing. Null without `dwarf` |

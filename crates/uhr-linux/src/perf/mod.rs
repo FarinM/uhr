@@ -23,7 +23,7 @@ use rustix::process::{Pid, Signal, geteuid, kill_process, set_parent_process_dea
 use tracing::{debug, info, warn};
 
 use crate::doctor;
-use crate::ebpf::{self, Syscalls};
+use crate::ebpf::{self, Programs};
 use crate::kallsyms::Kallsyms;
 use crate::launch::{self, Held, Interrupts, Process, monotonic_ns};
 use crate::perf_map;
@@ -89,6 +89,10 @@ pub enum Error {
     },
     #[error("converting {}, which is kept for inspection", .path.display())]
     Convert { path: PathBuf, source: Box<Error> },
+    /// uhr's eBPF programs sampled in place of perf, but what they took
+    /// could not be read.
+    #[error("reading the samples of uhr's eBPF programs")]
+    EbpfSamples(#[source] ebpf::Error),
     /// perf.data does not hold what the collector asked perf for.
     #[error("{0}")]
     UnexpectedData(String),
@@ -121,6 +125,17 @@ pub struct RecordOptions {
     /// Count and time the target's syscalls with uhr's eBPF programs, if
     /// this host lets uhr load them.
     pub syscalls: bool,
+    /// What samples CPU time. `None` for uhr's eBPF programs where this host
+    /// lets uhr load them, and perf elsewhere.
+    pub sampler: Option<Sampler>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sampler {
+    Perf,
+    /// uhr's eBPF programs, at each tick of every CPU's clock. perf still
+    /// records the processes' mappings and threads, and context switches.
+    Ebpf,
 }
 
 /// What to record.
@@ -162,6 +177,18 @@ pub fn record(options: &RecordOptions, interrupts: &Interrupts, out: &Path) -> R
         detail,
         fix: Some(doctor::INSTALL_PERF.into()),
     })?;
+    if options.sampler == Some(Sampler::Ebpf) && !ebpf::CAN_SAMPLE {
+        return Err(Error::Blocked {
+            detail: format!("uhr's eBPF programs can't sample on {}", env::consts::ARCH),
+            fix: Some("Record with --sampler perf.".into()),
+        });
+    }
+    if let (Some(Sampler::Ebpf), Unwind::Dwarf { .. }) = (options.sampler, options.unwind) {
+        return Err(Error::Blocked {
+            detail: "uhr's eBPF programs walk frame pointers, and copy no stacks to unwind".into(),
+            fix: Some("Record with --sampler perf to unwind with DWARF.".into()),
+        });
+    }
     if let Unwind::Dwarf { .. } = options.unwind {
         let check = doctor::check_dwarf_unwinding();
         if check.status != Status::Ok {
@@ -212,14 +239,23 @@ pub fn record(options: &RecordOptions, interrupts: &Interrupts, out: &Path) -> R
         result => result.map_err(io_error("creating", &staging))?,
     }
 
-    let max_stack_depth = read_max_stack_depth()?;
+    let max_stack_depth = read_number(MAX_STACK)?;
+    let tick = tick(options)?;
     let perf_data = staging.join("perf.data");
+    let samples = staging.join(SAMPLES);
     // Without the watch, a map counts only if it belongs to root or the
     // user the target started as.
     let watch = perf_map::watch(Path::new(perf_map::DIR))
         .inspect_err(|error| warn!(%error, "watching for perf maps"))
         .ok();
-    let ended = run(&perf_data, options, interrupts, &ready);
+    let ended = run(
+        &perf_data,
+        &samples,
+        tick.as_ref(),
+        options,
+        interrupts,
+        &ready,
+    );
     let map_owners = watch.map(perf_map::Watch::stop).unwrap_or_default();
     let ended = match ended {
         Ok(ended) => ended,
@@ -231,7 +267,18 @@ pub fn record(options: &RecordOptions, interrupts: &Interrupts, out: &Path) -> R
     // While the boot, the loaded modules and uhr's own eBPF programs are
     // still the ones recorded.
     let kallsyms = Kallsyms::read();
-    let syscalls = ended.syscalls.map(|s| s.map(ebpf::Stopped::unload));
+    let found = ended.ebpf.map(|s| s.map(ebpf::Stopped::unload));
+    let ebpf_samples = match tick.as_ref().filter(|_| !ended.perf_sampled) {
+        Some(_) if let Some(Err(error)) = found => {
+            remove_staging(&staging);
+            return Err(Error::EbpfSamples(error));
+        }
+        Some(tick) => Some(convert::EbpfSamples {
+            path: &samples,
+            period_ns: tick.period_ns,
+        }),
+        None => None,
+    };
 
     let recording = convert::convert(convert::Input {
         perf_data: &perf_data,
@@ -245,14 +292,15 @@ pub fn record(options: &RecordOptions, interrupts: &Interrupts, out: &Path) -> R
         requested_frequency_hz: options.frequency_hz,
         max_stack_depth,
         kallsyms: kallsyms.as_ref(),
+        ebpf_samples,
     });
-    let mut recording = match recording {
-        Ok(recording) => recording,
+    let (mut recording, ebpf_stacks) = match recording {
+        Ok(converted) => converted,
         Err(error) if !finished(ended.perf) => {
             remove_staging(&staging);
             return Err(Error::NoUsableData {
                 status: ended.perf,
-                command: diagnosis(options),
+                command: diagnosis(options, ended.perf_sampled),
                 source: Box::new(error),
             });
         }
@@ -291,9 +339,16 @@ pub fn record(options: &RecordOptions, interrupts: &Interrupts, out: &Path) -> R
         );
     }
 
-    add_syscalls(
+    let sampling = tick.map(|tick| recording::Sampling {
+        event: "cpu-clock".into(),
+        frequency_hz: tick.frequency_hz,
+        requested_frequency_hz: options.frequency_hz,
+    });
+    add_ebpf(
         &mut recording,
-        syscalls,
+        found,
+        ebpf_stacks.zip(sampling),
+        options.syscalls,
         matches!(ready, Ready::Attach { .. }),
     );
 
@@ -326,81 +381,164 @@ pub fn record(options: &RecordOptions, interrupts: &Interrupts, out: &Path) -> R
         remove_runtime_files(pids, since, owners);
     }
     fs::remove_file(&perf_data).map_err(io_error("removing", &perf_data))?;
+    if !ended.perf_sampled {
+        fs::remove_file(&samples).map_err(io_error("removing", &samples))?;
+    }
     fs::rename(&staging, out).map_err(io_error("renaming into place", out))?;
     log_summary(&recording, out);
     Ok(recording)
 }
 
-/// Adds what the eBPF programs counted as a stream of its own, or says why
-/// there is none.
-fn add_syscalls(
+/// Adds what uhr's eBPF programs found as a stream of their own, or says
+/// why the syscalls were not counted. `sampled` is the coverage of the
+/// stacks they sampled, and how they sampled.
+fn add_ebpf(
     recording: &mut Recording,
-    counted: Option<Result<ebpf::Counted, ebpf::Error>>,
+    found: Option<Result<ebpf::Found, ebpf::Error>>,
+    sampled: Option<(convert::EbpfStacks, recording::Sampling)>,
+    syscalls: bool,
     attached: bool,
 ) {
-    match counted {
-        Some(Ok(counted)) => {
-            let mut known_biases = vec![
-                "Each call's time includes part of what the eBPF programs take, which for a \
-                 quick syscall is more than the call itself."
-                    .to_owned(),
-                "Syscalls of 32-bit code are named from the 64-bit table, so their names are \
-                 wrong."
-                    .to_owned(),
-                "The overhead is the target's CPU time in the eBPF programs, from its samples. It \
-                 leaves out the kernel's way into them, and their cost to other processes, whose \
-                 syscalls run them too."
-                    .to_owned(),
-            ];
-            if attached {
-                known_biases.push(
-                    "Calls a thread was already in when uhr attached are left out.".to_owned(),
-                );
-            }
-            if counted.let_go_late {
-                known_biases.push(
-                    "A process that took the id of one of the target's just after it was reaped \
-                     can have gone uncounted: without the kernel's BTF, uhr's eBPF programs let \
-                     go of a process only once the kernel frees it."
-                        .to_owned(),
-                );
-            }
-            if counted.unfollowed > 0 {
-                known_biases.push(format!(
-                    "The calls of {} processes the target started are left out: uhr's eBPF \
-                     programs had no room left to follow them.",
-                    counted.unfollowed
-                ));
-            }
-            let overhead_ns = recording.in_programs(&counted.programs).map(|own| {
-                recording
-                    .samples
-                    .iter()
-                    .filter(|s| own[s.stack as usize])
-                    .map(|s| s.cpu_ns)
-                    .sum()
+    let found = match found {
+        Some(Ok(found)) => found,
+        Some(Err(error)) if syscalls => {
+            recording.manifest.missing_signals.push(MissingSignal {
+                signal: recording::Signal::SyscallCalls,
+                reason: error.reason(),
             });
-            recording.manifest.streams.push(recording::Stream {
-                id: "ebpf".into(),
-                collector: Collector::Ebpf {
-                    programs: counted.programs,
-                },
-                signals: vec![recording::Signal::SyscallCalls],
-                missing_signals: Vec::new(),
-                coverage: StreamCoverage {
-                    lost_events: counted.lost,
-                    stacks: None,
-                    overhead_ns,
-                    known_biases,
-                },
-            });
-            recording.syscall_calls = counted.calls;
+            return;
         }
-        Some(Err(error)) => recording.manifest.missing_signals.push(MissingSignal {
-            signal: recording::Signal::SyscallCalls,
-            reason: error.reason(),
-        }),
-        None => {}
+        _ => return,
+    };
+    let mut signals = Vec::new();
+    let mut known_biases = Vec::new();
+    let mut lost_events = 0;
+    if let Some(samples) = &found.samples {
+        signals.extend([
+            recording::Signal::UserCPUSamples,
+            recording::Signal::KernelCPUSamples,
+            recording::Signal::UserStacks,
+            recording::Signal::KernelStacks,
+        ]);
+        known_biases.extend(
+            [
+                convert::TIMER_BIAS,
+                convert::FRAME_POINTER_BIAS,
+                "Time in BPF programs at kprobes and tracepoints, which other tools load, has no \
+                 samples: the kernel runs no program at a perf event while one of those runs.",
+            ]
+            .map(String::from),
+        );
+        lost_events += samples.dropped;
+    }
+    if let Some((stacks, _)) = sampled.as_ref().filter(|(s, _)| s.untracked > 0) {
+        known_biases.push(format!(
+            "{} samples of threads perf has no record of are left out, as of processes the \
+             target started while perf attached: perf has no record of their mappings either.",
+            stacks.untracked
+        ));
+        lost_events += stacks.untracked;
+    }
+    if let Some(counted) = &found.syscalls {
+        signals.push(recording::Signal::SyscallCalls);
+        known_biases.extend(
+            [
+                "Each call's time includes part of what the eBPF programs take, which for a \
+                 quick syscall is more than the call itself.",
+                "Syscalls of 32-bit code are named from the 64-bit table, so their names are \
+                 wrong.",
+            ]
+            .map(String::from),
+        );
+        if attached {
+            known_biases
+                .push("Calls a thread was already in when uhr attached are left out.".to_owned());
+        }
+        lost_events += counted.lost;
+    }
+    if found.samples.is_some() && !found.tells_guests {
+        known_biases.push(
+            "Time a thread runs a virtual machine's guest counts as kernel time in the code that \
+             entered it: without the kernel's BTF, uhr's eBPF programs can't tell it apart."
+                .to_owned(),
+        );
+    }
+    if found.late_cpus > 0 {
+        known_biases.push(format!(
+            "{} CPUs came online during the capture, and each went unsampled for up to {} ms.",
+            found.late_cpus,
+            POLL.as_millis()
+        ));
+    }
+    if found.restarted_cpus > 0 {
+        known_biases.push(format!(
+            "{} CPUs went offline and back during the capture, as across a suspend, and went \
+             unsampled for up to {} ms in all, until uhr started their sampling again.",
+            found.restarted_cpus,
+            found.unsampled_ns / 1_000_000
+        ));
+    }
+    if found.unsampled_cpus > 0 {
+        known_biases.push(format!(
+            "{} CPUs came online during the capture, and uhr's eBPF programs could not sample \
+             them.",
+            found.unsampled_cpus
+        ));
+    }
+    if found.let_go_late {
+        known_biases.push(
+            "A process that took the id of one of the target's just after it was reaped can have \
+             gone unfollowed: without the kernel's BTF, uhr's eBPF programs let go of a process \
+             only once the kernel frees it."
+                .to_owned(),
+        );
+    }
+    if found.unfollowed > 0 {
+        known_biases.push(format!(
+            "{} processes the target started are left out: uhr's eBPF programs had no room \
+             left to follow them.",
+            found.unfollowed
+        ));
+    }
+    known_biases.push(
+        "The overhead is the target's CPU time in the eBPF programs, from its samples. It leaves \
+         out the kernel's way into them, their cost to other processes, whose syscalls run them \
+         too, and the time they take to sample, which no sample can see."
+            .to_owned(),
+    );
+    let streams = &recording.manifest.streams;
+    let kernel_sampled = streams
+        .iter()
+        .any(|stream| stream.signals.contains(&recording::Signal::KernelStacks));
+    let overhead_ns = recording
+        .in_programs(&found.programs)
+        .filter(|_| kernel_sampled || found.samples.is_some())
+        .map(|own| {
+            recording
+                .samples
+                .iter()
+                .filter(|s| own[s.stack as usize])
+                .map(|s| s.cpu_ns)
+                .sum()
+        });
+    let (stacks, sampling) = sampled.map(|(stacks, s)| (stacks.coverage, s)).unzip();
+    recording.manifest.streams.push(recording::Stream {
+        id: "ebpf".into(),
+        collector: Collector::Ebpf {
+            programs: found.programs,
+            sampling,
+        },
+        signals,
+        missing_signals: Vec::new(),
+        coverage: StreamCoverage {
+            lost_events,
+            stacks,
+            overhead_ns,
+            known_biases,
+        },
+    });
+    if let Some(counted) = found.syscalls {
+        recording.syscall_calls = counted.calls;
     }
 }
 
@@ -465,10 +603,14 @@ fn log_summary(recording: &Recording, out: &Path) {
         if let Some(sampling) = stream.collector.sampling()
             && sampling.frequency_hz != sampling.requested_frequency_hz
         {
+            let sampler = match stream.collector {
+                Collector::Perf { .. } => "perf",
+                Collector::Ebpf { .. } => "uhr",
+            };
             warn!(
                 requested_hz = sampling.requested_frequency_hz,
                 actual_hz = sampling.frequency_hz,
-                "perf lowered the sampling frequency to the kernel's limit"
+                "{sampler} lowered the sampling frequency to the kernel's limit"
             );
         }
         for missing in &stream.missing_signals {
@@ -477,8 +619,9 @@ fn log_summary(recording: &Recording, out: &Path) {
         let coverage = &stream.coverage;
         if coverage.lost_events > 0 {
             warn!(
+                stream = %stream.id,
                 lost_events = coverage.lost_events,
-                "the kernel dropped events"
+                "events were lost"
             );
         }
         if let Some(stacks) = coverage
@@ -496,24 +639,28 @@ fn log_summary(recording: &Recording, out: &Path) {
 }
 
 /// perf's flags, without what it records: `-p` and a pid, or a command.
-pub(crate) fn perf_args(perf_data: &Path, options: &RecordOptions) -> Vec<OsString> {
-    let mut args: Vec<OsString> = [
-        "record",
-        "--quiet",
-        "--event=cpu-clock",
-        &format!("--freq={}", options.frequency_hz),
+/// Unless `sampled`, perf samples no CPU time.
+pub(crate) fn perf_args(perf_data: &Path, options: &RecordOptions, sampled: bool) -> Vec<OsString> {
+    let mut args: Vec<OsString> = vec!["record".into(), "--quiet".into()];
+    if sampled {
+        args.push("--event=cpu-clock".into());
+        args.push(format!("--freq={}", options.frequency_hz).into());
+    }
+    for flag in [
         "--sample-cpu",
         "--clockid=CLOCK_MONOTONIC",
         "--buildid-mmap",
-    ]
-    .iter()
-    .map(OsString::from)
-    .collect();
+    ] {
+        args.push(flag.into());
+    }
     if options.off_cpu {
         // A sample at each switch gives the stack, and the switch records
         // give when the thread came back and whether it was preempted.
         args.push("--event=context-switches/period=1/".into());
         args.push("--switch-events".into());
+    } else if !sampled {
+        // For the records of the processes' mappings and threads alone.
+        args.push("--event=dummy".into());
     }
     match options.unwind {
         Unwind::FramePointers => args.push("--call-graph=fp".into()),
@@ -530,8 +677,8 @@ pub(crate) fn perf_args(perf_data: &Path, options: &RecordOptions) -> Vec<OsStri
 
 /// A perf command a person can run to see the error perf printed to
 /// itself: the same flags without --quiet, launching a command itself.
-fn diagnosis(options: &RecordOptions) -> String {
-    let mut args = perf_args(Path::new("perf.data"), options);
+fn diagnosis(options: &RecordOptions, sampled: bool) -> String {
+    let mut args = perf_args(Path::new("perf.data"), options, sampled);
     args.retain(|a| a != "--quiet");
     match &options.target {
         Target::Launch(command) => {
@@ -570,7 +717,9 @@ struct Ended {
     /// When perf started sampling a process uhr attached to.
     attached_ns: Option<u64>,
     /// `None` when not asked for.
-    syscalls: Option<Result<ebpf::Stopped, ebpf::Error>>,
+    ebpf: Option<Result<ebpf::Stopped, ebpf::Error>>,
+    /// Whether perf sampled, rather than uhr's eBPF programs.
+    perf_sampled: bool,
 }
 
 /// A target checked and ready to record.
@@ -590,6 +739,8 @@ enum Ready<'a> {
 
 fn run(
     perf_data: &Path,
+    samples: &Path,
+    tick: Option<&Tick>,
     options: &RecordOptions,
     interrupts: &Interrupts,
     ready: &Ready,
@@ -602,13 +753,18 @@ fn run(
                 runtimes::environment(|v| env::var_os(v), options.runtime_support);
             let held = Held::spawn(command, &environment)?;
             let pid = held.pid();
-            let syscalls = options.syscalls.then(|| Syscalls::start(pid, true));
-            let mut sampling = sample(perf_data, options, pid)?;
+            let mut ebpf = start_ebpf(pid, true, options, tick, samples)?;
+            let perf_sampled = !samples_with(&ebpf);
+            let mut sampling = sample(perf_data, options, pid, perf_sampled)?;
+            begin(&mut ebpf);
             sampling.stop_if_interrupted(interrupts)?;
             let mut target = held.release()?;
             let program = Path::new(&command[0]);
-            let (target, perf) =
-                supervise(program, &mut target.child, &mut sampling.perf, interrupts)?;
+            let mut capture = Capture {
+                perf: &mut sampling.perf,
+                ebpf: running(&mut ebpf),
+            };
+            let (target, perf) = supervise(program, &mut target.child, &mut capture, interrupts)?;
             sampling.finish_relay();
             Ok(Ended {
                 runtime_support: Some(runtimes),
@@ -617,7 +773,8 @@ fn run(
                 perf,
                 stopped_ns: interrupts.first_ns(),
                 attached_ns: None,
-                syscalls: syscalls.map(|s| s.and_then(Syscalls::stop)),
+                ebpf: ebpf.map(|e| e.and_then(Programs::stop)),
+                perf_sampled,
             })
         }
         Ready::Attach {
@@ -626,8 +783,10 @@ fn run(
             process,
             ..
         } => {
-            let mut sampling = sample(perf_data, options, *pid)?;
-            let syscalls = options.syscalls.then(|| Syscalls::start(*pid, false));
+            let mut ebpf = start_ebpf(*pid, false, options, tick, samples)?;
+            let perf_sampled = !samples_with(&ebpf);
+            let mut sampling = sample(perf_data, options, *pid, perf_sampled)?;
+            begin(&mut ebpf);
             let attached_ns = monotonic_ns();
             sampling.stop_if_interrupted(interrupts)?;
             match duration {
@@ -638,7 +797,11 @@ fn run(
                 ),
                 None => info!(pid, "attached, recording until interrupted"),
             }
-            let (perf, stopped_ns) = watch(&mut sampling.perf, interrupts, *duration)?;
+            let mut capture = Capture {
+                perf: &mut sampling.perf,
+                ebpf: running(&mut ebpf),
+            };
+            let (perf, stopped_ns) = watch(&mut capture, interrupts, *duration)?;
             sampling.finish_relay();
             let exited = process.exited().map_err(|e| no_process(*pid, e))?;
             if stopped_ns.is_none() && !exited {
@@ -658,10 +821,125 @@ fn run(
                 perf,
                 stopped_ns,
                 attached_ns: Some(attached_ns),
-                syscalls: syscalls.map(|s| s.and_then(Syscalls::stop)),
+                ebpf: ebpf.map(|e| e.and_then(Programs::stop)),
+                perf_sampled,
             })
         }
     }
+}
+
+/// Starts uhr's eBPF programs on `pid` for what `options` asks of them, and
+/// to sample at `tick`. `None` if nothing is asked of them. If they can't
+/// start, perf samples instead, unless `options` asks for them.
+fn start_ebpf(
+    pid: u32,
+    held: bool,
+    options: &RecordOptions,
+    tick: Option<&Tick>,
+    samples: &Path,
+) -> Result<Option<Result<Programs, ebpf::Error>>> {
+    let sampling = tick.map(|tick| ebpf::Sampling {
+        period_ns: tick.period_ns,
+        path: samples.to_owned(),
+        max_stack: tick.max_stack,
+    });
+    if !options.syscalls && sampling.is_none() {
+        return Ok(None);
+    }
+    let ebpf_options = ebpf::Options {
+        syscalls: options.syscalls,
+        sampling,
+    };
+    let programs = Programs::start(pid, held, &ebpf_options);
+    if let Err(error) = &programs {
+        if options.sampler == Some(Sampler::Ebpf) {
+            return Err(Error::Blocked {
+                detail: error.reason(),
+                fix: Some("Run `uhr doctor`, or record with --sampler perf.".into()),
+            });
+        }
+        match error {
+            // This host or this build can't run them.
+            ebpf::Error::NotBuilt | ebpf::Error::NotPermitted | ebpf::Error::PidNamespace => {
+                debug!(reason = %error.reason(), "perf samples, as uhr's eBPF programs can't")
+            }
+            _ if tick.is_some() => {
+                warn!(reason = %error.reason(), "perf samples, as uhr's eBPF programs failed")
+            }
+            _ => {}
+        }
+    }
+    Ok(Some(programs))
+}
+
+fn samples_with(ebpf: &Option<Result<Programs, ebpf::Error>>) -> bool {
+    matches!(ebpf, Some(Ok(programs)) if programs.samples())
+}
+
+fn running(ebpf: &mut Option<Result<Programs, ebpf::Error>>) -> Option<&mut Programs> {
+    ebpf.as_mut()?.as_mut().ok()
+}
+
+/// Starts the capture of uhr's eBPF programs. If that fails, they found
+/// nothing, and say why.
+fn begin(ebpf: &mut Option<Result<Programs, ebpf::Error>>) {
+    if let Some(Err(error)) = running(ebpf).map(Programs::begin) {
+        *ebpf = Some(Err(error));
+    }
+}
+
+/// What records the target, and is stopped together.
+struct Capture<'a> {
+    perf: &'a mut Perf,
+    ebpf: Option<&'a mut Programs>,
+}
+
+impl Capture<'_> {
+    fn stop(&mut self) {
+        self.end();
+        self.perf.stop();
+    }
+
+    /// Keeps the capture whole as the system changes under it.
+    fn poll(&mut self) {
+        if let Some(ebpf) = self.ebpf.as_mut() {
+            ebpf.follow_cpus();
+        }
+    }
+
+    /// Ends what still records without perf, as perf has stopped.
+    fn end(&mut self) {
+        if let Some(ebpf) = self.ebpf.as_mut() {
+            ebpf.end();
+        }
+    }
+}
+
+/// When uhr's eBPF programs sample: every `period_ns` of each CPU's clock,
+/// stacks of up to `max_stack` frames.
+struct Tick {
+    period_ns: u64,
+    frequency_hz: u64,
+    max_stack: u32,
+}
+
+/// Where uhr's eBPF programs are to sample, at the frequency asked for,
+/// lowered to the kernel's limit as perf lowers it. `None` where perf is to
+/// sample.
+fn tick(options: &RecordOptions) -> Result<Option<Tick>> {
+    match (options.sampler, options.unwind) {
+        (Some(Sampler::Perf), _) | (None, Unwind::Dwarf { .. }) => return Ok(None),
+        (None, _) if !ebpf::CAN_SAMPLE => return Ok(None),
+        _ => {}
+    }
+    let frequency_hz = options.frequency_hz.clamp(1, read_number(MAX_SAMPLE_RATE)?);
+    let period_ns = 1_000_000_000 / frequency_hz;
+    let max_stack: u32 = read_number(MAX_STACK)?;
+    Ok(Some(Tick {
+        period_ns,
+        frequency_hz: 1_000_000_000 / period_ns,
+        max_stack: max_stack.min(uhr_ebpf::MAX_FRAMES as u32),
+    }))
 }
 
 /// perf sampling a process, and the copy of its stderr if uhr relays it.
@@ -689,9 +967,10 @@ impl Sampling {
     }
 }
 
-/// Attaches perf to `pid` and returns once it samples.
-fn sample(perf_data: &Path, options: &RecordOptions, pid: u32) -> Result<Sampling> {
-    let mut args = perf_args(perf_data, options);
+/// Attaches perf to `pid` and returns once it records: samples, if
+/// `sampled`.
+fn sample(perf_data: &Path, options: &RecordOptions, pid: u32, sampled: bool) -> Result<Sampling> {
+    let mut args = perf_args(perf_data, options, sampled);
     args.extend(["--pid".into(), pid.to_string().into(), "--delay=-1".into()]);
     debug!(command = %format!("perf {}", join_args(&args)), "running perf");
     let stderr = if stderr_can_break() {
@@ -711,7 +990,7 @@ fn sample(perf_data: &Path, options: &RecordOptions, pid: u32) -> Result<Samplin
         sampling.finish_relay();
         return Err(Error::PerfStart {
             status,
-            command: diagnosis(options),
+            command: diagnosis(options, sampled),
         });
     }
     Ok(sampling)
@@ -802,15 +1081,16 @@ pub(crate) fn finished(status: ExitStatus) -> bool {
 /// How often supervision looks at the target, perf and the interrupts.
 const POLL: Duration = Duration::from_millis(10);
 
-/// Waits for the target to exit, and stops perf then. Processes the target
-/// leaves running are not followed after that. An interrupt stops perf at
-/// once, but uhr still waits for the target: a terminal's Ctrl-C reaches it
+/// Waits for the target to exit, and stops the capture then. Processes the
+/// target leaves running are not followed after that. An interrupt stops it
+/// at once, but uhr still waits for the target: a terminal's Ctrl-C reaches it
 /// too, and one sent to uhr alone is passed on. A second interrupt kills
-/// it. If perf stops on its own first, the target is asked to stop.
+/// it. If perf stops on its own first, the capture ends then, and the
+/// target is asked to stop.
 fn supervise(
     program: &Path,
     target: &mut Child,
-    perf: &mut Perf,
+    capture: &mut Capture,
     interrupts: &Interrupts,
 ) -> Result<(ExitStatus, ExitStatus)> {
     let pid = Pid::from_child(target);
@@ -823,14 +1103,18 @@ fn supervise(
                 .map_err(io_error("waiting for", program))?;
         }
         if perf_status.is_none() {
-            perf_status = perf
+            perf_status = capture
+                .perf
                 .child
                 .try_wait()
                 .map_err(io_error("waiting for", Path::new("perf")))?;
         }
+        if perf_status.is_some() {
+            capture.end();
+        }
         let interrupted = interrupts.count();
         if (interrupted > 0 || target_status.is_some()) && perf_status.is_none() && !perf_stopped {
-            perf.stop();
+            capture.stop();
             perf_stopped = true;
             if target_status.is_none() {
                 info!(
@@ -853,34 +1137,38 @@ fn supervise(
         if let (Some(target), Some(perf)) = (target_status, perf_status) {
             return Ok((target, perf));
         }
+        capture.poll();
         thread::sleep(POLL);
     }
 }
 
-/// Waits for an interrupt or the end of `duration`, then stops perf, or
-/// for perf to stop by itself once the process and all it started exit. A
+/// Waits for an interrupt or the end of `duration`, then stops the capture,
+/// or for perf to stop by itself once the process and all it started exit. A
 /// process uhr attached to is never signalled. Returns perf's status, and
 /// when uhr stopped it.
 fn watch(
-    perf: &mut Perf,
+    capture: &mut Capture,
     interrupts: &Interrupts,
     duration: Option<Duration>,
 ) -> Result<(ExitStatus, Option<u64>)> {
     let started = Instant::now();
     let mut stopped_ns = None;
     loop {
-        let status = perf
+        let status = capture
+            .perf
             .child
             .try_wait()
             .map_err(io_error("waiting for", Path::new("perf")))?;
         if let Some(status) = status {
+            capture.end();
             return Ok((status, stopped_ns));
         }
         let ended = duration.is_some_and(|d| started.elapsed() >= d);
         if stopped_ns.is_none() && (interrupts.count() > 0 || ended) {
             stopped_ns = Some(interrupts.first_ns().unwrap_or_else(monotonic_ns));
-            perf.stop();
+            capture.stop();
         }
+        capture.poll();
         thread::sleep(POLL);
     }
 }
@@ -996,8 +1284,13 @@ fn staging_dir(out: &Path) -> Result<PathBuf> {
     Ok(out.with_file_name(staging))
 }
 
-fn read_max_stack_depth() -> Result<u32> {
-    let path = "/proc/sys/kernel/perf_event_max_stack";
+const MAX_STACK: &str = "/proc/sys/kernel/perf_event_max_stack";
+const MAX_SAMPLE_RATE: &str = "/proc/sys/kernel/perf_event_max_sample_rate";
+
+/// Where uhr's eBPF programs leave their samples while recording.
+const SAMPLES: &str = "ebpf-samples";
+
+fn read_number<T: std::str::FromStr>(path: &'static str) -> Result<T> {
     let text = fs::read_to_string(path).map_err(io_error("reading", Path::new(path)))?;
     text.trim().parse().map_err(|_| Error::NotANumber {
         path,

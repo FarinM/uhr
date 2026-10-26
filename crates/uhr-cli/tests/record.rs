@@ -40,7 +40,7 @@ fn records_the_frequency_perf_actually_used() {
     // Far above any kernel's sampling limit, so perf has to lower it.
     let output = record(
         &recording,
-        &["-F", "10000000"],
+        &["-F", "10000000", "--sampler", "perf"],
         &[program.to_str().unwrap(), "5"],
     );
     assert!(output.status.success());
@@ -87,12 +87,7 @@ fn an_interrupt_records_how_the_target_ended() {
         "{}",
         manifest["target"]
     );
-    assert!(
-        manifest["streams"][0]["coverage"]["stacks"]["samples"]
-            .as_u64()
-            .unwrap()
-            > 0
-    );
+    assert!(common::samples(&manifest) > 0, "{manifest}");
 }
 
 struct RecordingProcess(Child);
@@ -452,12 +447,7 @@ fn attaching_records_for_the_duration_and_leaves_the_process_alone() {
         as f64
         / 1e9;
     assert!((0.9..1.5).contains(&seconds), "captured {seconds} s");
-    assert!(
-        manifest["streams"][0]["coverage"]["stacks"]["samples"]
-            .as_u64()
-            .unwrap()
-            > 0
-    );
+    assert!(common::samples(&manifest) > 0, "{manifest}");
 }
 
 /// uhr attached to `pid`, once it records.

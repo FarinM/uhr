@@ -239,7 +239,7 @@ fn perf_stream() -> Stream {
                 stack_copy_bytes: None,
                 samples: 4,
                 off_cpu_intervals: None,
-                throttle_events: 3,
+                throttle_events: Some(3),
                 max_stack_depth: 127,
                 stacks_at_stack_limit: 0,
                 stacks_cut_at_stack_copy: None,
@@ -256,7 +256,24 @@ fn reports_throttling() {
     let mut recording = recording();
     recording.manifest.streams.push(perf_stream());
     let result = run(&recording, Some(&symbols()), &query(10)).unwrap();
-    assert_eq!(result.coverage.recording.throttle_events, 3);
+    assert_eq!(result.coverage.recording.throttle_events, Some(3));
+
+    // A stream that can't see them makes the total unknown.
+    let mut unseen = perf_stream();
+    unseen.id = "ebpf".into();
+    unseen.coverage.stacks.as_mut().unwrap().throttle_events = None;
+    recording.manifest.streams.push(unseen);
+    let result = run(&recording, Some(&symbols()), &query(10)).unwrap();
+    let coverage = &result.coverage.recording;
+    assert_eq!(coverage.throttle_events, None);
+    assert!(
+        coverage
+            .unknown
+            .iter()
+            .any(|u| u == "throttling of stream ebpf's sampling"),
+        "{:?}",
+        coverage.unknown
+    );
 }
 
 #[test]
@@ -431,6 +448,7 @@ fn with_own_programs() -> (Recording, Symbols) {
         id: "ebpf".into(),
         collector: Collector::Ebpf {
             programs: vec!["8782325c7cb17f7f".into()],
+            sampling: None,
         },
         signals: vec![Signal::SyscallCalls],
         missing_signals: Vec::new(),
@@ -1169,6 +1187,7 @@ fn with_counted_calls() -> (Recording, Symbols) {
         id: "ebpf".into(),
         collector: Collector::Ebpf {
             programs: Vec::new(),
+            sampling: None,
         },
         signals: vec![Signal::SyscallCalls],
         missing_signals: Vec::new(),

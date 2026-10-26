@@ -425,7 +425,7 @@ fn follows_off_cpu_time_through_the_paths() {
                 stack_copy_bytes: None,
                 samples: 15,
                 off_cpu_intervals: Some(3),
-                throttle_events: 0,
+                throttle_events: Some(0),
                 max_stack_depth: 127,
                 stacks_at_stack_limit: 0,
                 stacks_cut_at_stack_copy: None,

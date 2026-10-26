@@ -66,7 +66,7 @@ fn stream(kernel: bool) -> Stream {
                 stack_copy_bytes: None,
                 samples: 7,
                 off_cpu_intervals: None,
-                throttle_events: 0,
+                throttle_events: Some(0),
                 max_stack_depth: 127,
                 stacks_at_stack_limit: 0,
                 stacks_cut_at_stack_copy: None,

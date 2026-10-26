@@ -92,14 +92,16 @@ pub enum Collector {
         /// Their tags, in hex. The kernel names a program's code
         /// `bpf_prog_<tag>_<name>`, so its frames can be told apart.
         programs: Vec<String>,
+        sampling: Option<Sampling>,
     },
 }
 
 impl Collector {
     pub fn sampling(&self) -> Option<&Sampling> {
         match self {
-            Collector::Perf { sampling, .. } => sampling.as_ref(),
-            Collector::Ebpf { .. } => None,
+            Collector::Perf { sampling, .. } | Collector::Ebpf { sampling, .. } => {
+                sampling.as_ref()
+            }
         }
     }
 }
@@ -191,7 +193,8 @@ pub struct StackCoverage {
     pub samples: u64,
     /// `None` without context switches.
     pub off_cpu_intervals: Option<u64>,
-    pub throttle_events: u64,
+    /// `None` where the collector does not see them.
+    pub throttle_events: Option<u64>,
     /// Stacks longer than this were cut by the kernel.
     pub max_stack_depth: u32,
     pub stacks_at_stack_limit: u64,

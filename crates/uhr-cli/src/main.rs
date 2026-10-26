@@ -29,7 +29,7 @@ use uhr_core::symbols;
 #[cfg(target_os = "linux")]
 use signals::{Handlers, INTERRUPTS};
 #[cfg(target_os = "linux")]
-use uhr_linux::perf::{self, RecordOptions, Target, Unwind};
+use uhr_linux::perf::{self, RecordOptions, Sampler, Target, Unwind};
 
 #[derive(Parser)]
 #[command(
@@ -146,6 +146,11 @@ struct RecordArgs {
     /// CAP_PERFMON
     #[arg(long)]
     no_syscalls: bool,
+    /// What samples CPU time. By default uhr's eBPF programs do, when uhr
+    /// may load them and stacks are walked with frame pointers, and perf
+    /// does otherwise
+    #[arg(long, value_enum)]
+    sampler: Option<SamplerArg>,
     /// Record this running process, and the threads and processes it
     /// starts, rather than a command. It is not signalled
     #[arg(long, conflicts_with = "command")]
@@ -157,6 +162,13 @@ struct RecordArgs {
     /// Command to profile, after `--`
     #[arg(required_unless_present = "pid", last = true)]
     command: Vec<String>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum SamplerArg {
+    Perf,
+    /// uhr's eBPF programs, at each tick of every CPU's clock
+    Ebpf,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -434,6 +446,10 @@ fn run_record(args: RecordArgs) -> Result<ExitCode> {
         off_cpu: !args.no_off_cpu,
         runtime_support: !args.no_runtime_support,
         syscalls: !args.no_syscalls,
+        sampler: args.sampler.map(|sampler| match sampler {
+            SamplerArg::Perf => Sampler::Perf,
+            SamplerArg::Ebpf => Sampler::Ebpf,
+        }),
     };
     let handlers = Handlers::install().context("installing the signal handlers")?;
     let recorded = perf::record(&options, &INTERRUPTS, &args.output);
@@ -977,7 +993,9 @@ fn write_symbol_coverage(out: &mut impl Write, coverage: &SymbolCoverage) -> io:
 
 fn write_coverage(out: &mut impl Write, coverage: &Coverage) -> io::Result<()> {
     writeln!(out, "  lost events: {}", coverage.lost_events)?;
-    writeln!(out, "  throttle events: {}", coverage.throttle_events)?;
+    if let Some(throttled) = coverage.throttle_events {
+        writeln!(out, "  throttle events: {throttled}")?;
+    }
     writeln!(
         out,
         "  stacks at the depth limit: {}",

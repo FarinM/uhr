@@ -17,3 +17,10 @@ aya-ebpf.workspace = true
 [[bin]]
 name = "uhr-ebpf"
 path = "src/main.rs"
+
+# Set by the build, as aya's are, to the architecture whose kernel runs the
+# programs.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = [
+    'cfg(bpf_target_arch, values("aarch64", "arm", "loongarch64", "mips", "mips64", "powerpc64", "riscv64", "s390x", "x86_64"))',
+] }

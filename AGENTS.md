@@ -45,7 +45,8 @@ and the code covers only part of the design.
   programs. The checks above leave their code out; lint it with
   `CARGO_ENCODED_RUSTFLAGS='--cfg=bpf_target_arch="x86_64"' cargo +nightly
   clippy -p uhr-ebpf --bin uhr-ebpf --target bpfel-unknown-none -Z
-  build-std=core`.
+  build-std=core`, and again with `aarch64`, whose registers they read
+  too.
 - `uhr-core` holds the model, the recording format, symbol resolution and
   queries, and builds on every platform: nothing in it depends on Linux, so a
   recording can be read anywhere. `uhr-linux` records on Linux: perf,

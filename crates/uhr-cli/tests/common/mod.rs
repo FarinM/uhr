@@ -20,6 +20,41 @@ pub fn uhr(args: &[&str]) -> Output {
     output
 }
 
+/// Runs uhr as root through sudo, and gives the recording back to this
+/// user. `None` where sudo asks for a password.
+pub fn uhr_as_root(args: &[&str], recording: &Path) -> Option<()> {
+    let mut command = vec![UHR];
+    command.extend(args);
+    as_root(&command, recording)
+}
+
+/// Runs `command` as root, as `uhr_as_root` runs uhr.
+pub fn as_root(command: &[&str], recording: &Path) -> Option<()> {
+    let sudo = |args: &[&str]| {
+        Command::new("sudo")
+            .arg("-n")
+            .args(args)
+            .output()
+            .is_ok_and(|output| output.status.success())
+    };
+    if !sudo(&["true"]) {
+        return None;
+    }
+    assert!(sudo(command), "sudo {command:?} failed");
+    let owner = format!("{}:{}", unsafe { libc::getuid() }, unsafe {
+        libc::getgid()
+    });
+    assert!(sudo(&["chown", "-R", &owner, recording.to_str().unwrap()]));
+    Some(())
+}
+
+/// The CPU samples of a recording's manifest, whichever stream took them.
+pub fn samples(manifest: &serde_json::Value) -> u64 {
+    let streams = manifest["streams"].as_array().unwrap();
+    let samples = streams.iter().map(|s| &s["coverage"]["stacks"]["samples"]);
+    samples.filter_map(|n| n.as_u64()).sum()
+}
+
 pub fn scratch(name: &str) -> PathBuf {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
     let _ = fs::remove_dir_all(&dir);

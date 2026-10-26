@@ -9,7 +9,7 @@ use uhr_core::doctor::{Check, Report, Status};
 use crate::ebpf;
 use crate::kallsyms;
 use crate::launch::Held;
-use crate::perf::{Perf, RecordOptions, Target, Unwind, finished, is_dummy, perf_args};
+use crate::perf::{Perf, RecordOptions, Sampler, Target, Unwind, finished, is_dummy, perf_args};
 
 /// What recording needs on this host.
 pub fn check() -> Report {
@@ -24,8 +24,8 @@ pub fn check_ebpf() -> Check {
     match ebpf::check() {
         Ok(()) => Check {
             status: Status::Ok,
-            detail: "uhr can load its eBPF programs: recordings count and time the target's \
-                     syscalls"
+            detail: "uhr can load its eBPF programs: they sample the target's stacks, and \
+                     count and time its syscalls"
                 .into(),
             fix: None,
         },
@@ -46,7 +46,10 @@ pub fn check_ebpf() -> Check {
                 }
                 _ => None,
             },
-            detail: format!("{}, so recordings have no syscall counts", error.reason()),
+            detail: format!(
+                "{}, so perf samples, and recordings have no syscall counts",
+                error.reason()
+            ),
         },
     }
 }
@@ -246,9 +249,10 @@ fn probe_recording(perf: &Path) -> Result<bool, String> {
         off_cpu: true,
         runtime_support: false,
         syscalls: false,
+        sampler: Some(Sampler::Perf),
     };
     let held = Held::spawn(&["true".into()], &[]).map_err(|e| format!("starting `true`: {e}"))?;
-    let mut args = perf_args(&data, &options);
+    let mut args = perf_args(&data, &options, true);
     // Permission errors from perf are suppressed by --quiet.
     args.retain(|arg| arg != "--quiet");
     args.extend([

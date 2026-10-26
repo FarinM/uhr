@@ -412,28 +412,24 @@ impl Recording {
     }
 
     /// Which stacks run uhr's own eBPF programs. `None` without them, or
-    /// without the names of kernel frames to find them by.
+    /// without kernel stacks, or their names, to find them by.
     pub(crate) fn in_own_programs(&self) -> Option<Vec<bool>> {
-        let tags = self
-            .manifest
-            .streams
-            .iter()
-            .find_map(|s| match &s.collector {
-                Collector::Ebpf { programs } => Some(programs),
-                Collector::Perf { .. } => None,
-            })?;
-        self.in_programs(tags)
-    }
-
-    /// Which stacks run one of the eBPF programs with these tags. `None`
-    /// without the names of kernel frames to find them by.
-    pub fn in_programs(&self, tags: &[String]) -> Option<Vec<bool>> {
-        let sampled = self
-            .manifest
-            .streams
+        let streams = &self.manifest.streams;
+        let tags = streams.iter().find_map(|s| match &s.collector {
+            Collector::Ebpf { programs, .. } => Some(programs),
+            Collector::Perf { .. } => None,
+        })?;
+        let sampled = streams
             .iter()
             .any(|s| s.signals.contains(&Signal::KernelStacks));
-        if !sampled || self.manifest.kernel_symbols != KernelSymbols::Saved {
+        self.in_programs(tags).filter(|_| sampled)
+    }
+
+    /// Which stacks run one of the eBPF programs with these tags, if they
+    /// are in the kernel stacks. `None` without the names of kernel frames
+    /// to find them by.
+    pub fn in_programs(&self, tags: &[String]) -> Option<Vec<bool>> {
+        if self.manifest.kernel_symbols != KernelSymbols::Saved {
             return None;
         }
         let own: Vec<bool> = self

@@ -1,14 +1,24 @@
-//! uhr's own eBPF programs, which count and time the target's syscalls.
+//! uhr's own eBPF programs, which sample the target's stacks and count and
+//! time its syscalls.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error as _;
-use std::io;
-use std::path::Path;
+use std::fs::File;
+use std::io::{self, BufWriter, Write};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
-use aya::maps::{HashMap, MapData, PerCpuArray};
+use aya::maps::{Array, HashMap, MapData, PerCpuArray, RingBuf};
+use aya::programs::perf_event::{
+    PerfEventConfig, PerfEventLinkId, PerfEventScope, SamplePolicy, SoftwareEvent,
+};
 use aya::programs::raw_trace_point::RawTracePointLinkId;
 use aya::programs::trace_point::TracePointLinkId;
-use aya::programs::{RawTracePoint, TracePoint};
+use aya::programs::{PerfEvent, RawTracePoint, TracePoint};
+use aya::util::online_cpus;
 use aya::{Ebpf, EbpfLoader};
 use syscalls::Sysno;
 use uhr_core::recording::SyscallCalls;
@@ -42,6 +52,14 @@ pub enum Error {
     PidNamespace,
     #[error("reading uhr's PID namespace")]
     Namespace(#[source] io::Error),
+    #[error("listing the online CPUs: {0}")]
+    Cpus(#[source] io::Error),
+    #[error("writing the samples to {}", .path.display())]
+    Samples {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
 }
 
 impl Error {
@@ -93,47 +111,116 @@ const LET_GO_LATE: (&str, &str, &str) = ("sched_process_free", "sched", "sched_p
 /// The programs that count syscalls, at the raw tracepoints of their names.
 const SYSCALLS: [&str; 2] = ["sys_enter", "sys_exit"];
 
-/// What the programs counted.
+const SAMPLER: &str = "sample";
+
+/// The program that sees CPUs go offline and online, and the tracepoint it
+/// runs at.
+const HOTPLUG: (&str, &str, &str) = ("cpuhp_enter", "cpuhp", "cpuhp_enter");
+
+/// Whether the programs can sample here: the sampler reads the registers
+/// of these architectures only.
+pub(crate) const CAN_SAMPLE: bool = cfg!(any(target_arch = "x86_64", target_arch = "aarch64"));
+
+/// Room for samples while uhr is between reads, a few milliseconds apart.
+const SAMPLE_BUFFER: u32 = 16 << 20;
+
+/// How often the samples are copied out of the ring buffer.
+const READ_EVERY: Duration = Duration::from_millis(20);
+
+pub(crate) struct Options {
+    pub(crate) syscalls: bool,
+    pub(crate) sampling: Option<Sampling>,
+}
+
+/// Sampling at every tick of each CPU's clock, `period_ns` apart, into
+/// `path`, stacks of up to `max_stack` frames.
+pub(crate) struct Sampling {
+    pub(crate) period_ns: u64,
+    pub(crate) path: PathBuf,
+    pub(crate) max_stack: u32,
+}
+
+/// What the syscall programs counted.
 pub(crate) struct Counted {
     pub(crate) calls: Vec<SyscallCalls>,
     /// Calls that found the programs' table of calls full.
     pub(crate) lost: u64,
+}
+
+pub(crate) struct Samples {
+    /// Samples that found the ring buffer full.
+    pub(crate) dropped: u64,
+}
+
+/// What the programs found. Each part is `None` if it was not asked for.
+pub(crate) struct Found {
+    pub(crate) syscalls: Option<Counted>,
+    pub(crate) samples: Option<Samples>,
     /// Processes the target started that found the programs' table of
     /// processes full, which they then did not follow.
     pub(crate) unfollowed: u64,
     /// Whether the programs let go of a process only once it was freed.
     pub(crate) let_go_late: bool,
-    /// The programs' tags, in hex.
+    /// CPUs that came online during the capture, and those that could not
+    /// be sampled by its end.
+    pub(crate) late_cpus: u32,
+    pub(crate) unsampled_cpus: u32,
+    /// CPUs that went offline and back during the capture, as across a
+    /// suspend, whose sampling uhr restarted, and at most how long they
+    /// went unsampled until then, in all.
+    pub(crate) restarted_cpus: u32,
+    pub(crate) unsampled_ns: u64,
+    /// Whether samples tell a thread running a virtual machine's guest
+    /// apart.
+    pub(crate) tells_guests: bool,
+    /// The tags of the programs that ran, in hex.
     pub(crate) programs: Vec<String>,
 }
 
-pub(crate) struct Syscalls {
+/// The programs count and sample only between `begin` and `end`, so that
+/// they can start before the capture and fail before it too.
+pub(crate) struct Programs {
     ebpf: Ebpf,
     tracepoints: Vec<(&'static str, TracePointLinkId)>,
-    syscalls: Vec<(&'static str, RawTracePointLinkId)>,
+    syscalls: Option<Vec<(&'static str, RawTracePointLinkId)>>,
+    /// By CPU, with when each was attached.
+    sampler: BTreeMap<u32, (PerfEventLinkId, u64)>,
+    period_ns: u64,
+    late_cpus: u32,
+    unsampled_cpus: BTreeSet<u32>,
+    restarted_cpus: BTreeSet<u32>,
+    unsampled_ns: u64,
+    /// Every CPU sampled yet, and since when each that went offline since
+    /// was not.
+    sampled_cpus: BTreeSet<u32>,
+    down_since: BTreeMap<u32, u64>,
+    tells_guests: bool,
     let_go_late: bool,
+    reader: Option<Reader>,
+    ended: Option<Result<u64, Error>>,
 }
 
-/// The counts, and the programs: detached, but loaded until unloaded, so
-/// that the kernel's symbols still name them.
+/// What the programs found, and the programs: detached, but loaded until
+/// unloaded, so that the kernel's symbols still name them.
 pub(crate) struct Stopped {
-    counted: Counted,
+    found: Found,
     programs: Ebpf,
 }
 
 impl Stopped {
-    pub(crate) fn unload(self) -> Counted {
+    pub(crate) fn unload(self) -> Found {
         drop(self.programs);
-        self.counted
+        self.found
     }
 }
 
-impl Syscalls {
-    /// Counts the syscalls of `pid` and of the processes it starts: at once,
-    /// or for a target `held` before its exec, from the exec.
-    pub(crate) fn start(pid: u32, held: bool) -> Result<Self, Error> {
-        let exits = exits();
-        let mut ebpf = load(exits)?;
+impl Programs {
+    /// Loads the programs `options` asks for, for `pid` and the processes it
+    /// starts, which they count and sample from `begin` on, or for a target
+    /// `held` before its exec, from the exec.
+    pub(crate) fn start(pid: u32, held: bool, options: &Options) -> Result<Self, Error> {
+        let layout = Layout::read();
+        let mut ebpf = load(options.sampling.as_ref(), layout)?;
         let targets = ebpf.map_mut("TARGETS").ok_or(Error::Missing("TARGETS"))?;
         let mut targets: HashMap<_, u32, u8> =
             HashMap::try_from(targets).map_err(|e| Error::Map("TARGETS", e))?;
@@ -142,7 +229,11 @@ impl Syscalls {
             .insert(pid, state, 0)
             .map_err(|e| Error::Map("TARGETS", e).or_not_permitted())?;
         let mut tracepoints = Vec::new();
-        let let_go = if exits.is_some() { LET_GO } else { LET_GO_LATE };
+        let let_go = if layout.exits.is_some() {
+            LET_GO
+        } else {
+            LET_GO_LATE
+        };
         for (program, category, name) in FOLLOWERS.into_iter().chain([let_go]) {
             let tracepoint = tracepoint(&mut ebpf, program)?;
             let link = tracepoint
@@ -151,33 +242,205 @@ impl Syscalls {
                 .map_err(|e| Error::Program(program, e).or_not_permitted())?;
             tracepoints.push((program, link));
         }
-        let mut syscalls = Vec::new();
-        for program in SYSCALLS {
-            let tracepoint = raw_tracepoint(&mut ebpf, program)?;
-            let link = tracepoint
-                .load()
-                .and_then(|()| tracepoint.attach(program))
-                .map_err(|e| Error::Program(program, e).or_not_permitted())?;
-            syscalls.push((program, link));
+        let mut syscalls = None;
+        if options.syscalls {
+            let links = syscalls.insert(Vec::new());
+            for program in SYSCALLS {
+                let tracepoint = raw_tracepoint(&mut ebpf, program)?;
+                let link = tracepoint
+                    .load()
+                    .and_then(|()| tracepoint.attach(program))
+                    .map_err(|e| Error::Program(program, e).or_not_permitted())?;
+                links.push((program, link));
+            }
         }
-        Ok(Self {
+        let mut programs = Self {
             ebpf,
             tracepoints,
             syscalls,
-            let_go_late: exits.is_none(),
-        })
+            sampler: BTreeMap::new(),
+            period_ns: 0,
+            late_cpus: 0,
+            unsampled_cpus: BTreeSet::new(),
+            restarted_cpus: BTreeSet::new(),
+            unsampled_ns: 0,
+            sampled_cpus: BTreeSet::new(),
+            down_since: BTreeMap::new(),
+            tells_guests: layout.task_flags.is_some(),
+            let_go_late: layout.exits.is_none(),
+            reader: None,
+            ended: None,
+        };
+        if let Some(sampling) = &options.sampling {
+            programs.sample(sampling)?;
+        }
+        Ok(programs)
     }
 
-    /// Stops counting, and reads what was counted.
-    pub(crate) fn stop(self) -> Result<Stopped, Error> {
+    fn sample(&mut self, sampling: &Sampling) -> Result<(), Error> {
+        let ring = self
+            .ebpf
+            .take_map("SAMPLES")
+            .ok_or(Error::Missing("SAMPLES"))?;
+        let ring = RingBuf::try_from(ring).map_err(|e| Error::Map("SAMPLES", e))?;
+        sampler_program(&mut self.ebpf)?
+            .load()
+            .map_err(|e| Error::Program(SAMPLER, e).or_not_permitted())?;
+        self.period_ns = sampling.period_ns;
+        // Before the CPUs' events, so no step of a CPU's goes unseen.
+        let (program, category, name) = HOTPLUG;
+        let hotplug = tracepoint(&mut self.ebpf, program)?;
+        let link = hotplug
+            .load()
+            .and_then(|()| hotplug.attach(category, name))
+            .map_err(|e| Error::Program(program, e).or_not_permitted())?;
+        self.tracepoints.push((program, link));
+        for cpu in online_cpus().map_err(|(_, e)| Error::Cpus(e))? {
+            // Before the event opens, so a CPU that goes offline and back in
+            // between is seen to.
+            let attached = monotonic_ns();
+            let link = self.attach(cpu)?;
+            self.sampler.insert(cpu, (link, attached));
+            self.sampled_cpus.insert(cpu);
+        }
+        self.reader = Some(Reader::start(ring, &sampling.path)?);
+        Ok(())
+    }
+
+    fn attach(&mut self, cpu: u32) -> Result<PerfEventLinkId, Error> {
+        sampler_program(&mut self.ebpf)?
+            .attach(
+                PerfEventConfig::Software(SoftwareEvent::CpuClock),
+                PerfEventScope::AllProcessesOneCpu { cpu },
+                SamplePolicy::Period(self.period_ns),
+                false,
+            )
+            .map_err(|e| Error::Program(SAMPLER, e).or_not_permitted())
+    }
+
+    /// Keeps every online CPU sampled while the capture runs. The kernel
+    /// samples none at an event opened while its CPU was offline, and drops
+    /// that of a CPU going offline, which can go and come back between two
+    /// of uhr's looks, as across a suspend.
+    pub(crate) fn follow_cpus(&mut self) {
+        if self.reader.is_none() || self.ended.is_some() {
+            return;
+        }
+        let Ok(online) = online_cpus() else {
+            return;
+        };
+        let (down, up) = (self.steps("WENT_DOWN"), self.steps("CAME_UP"));
         let now = monotonic_ns();
+        let attached: Vec<(u32, u64)> = self
+            .sampler
+            .iter()
+            .map(|(&cpu, &(_, attached))| (cpu, attached))
+            .collect();
+        for (cpu, attached) in attached {
+            let went = down.get(&cpu).copied().filter(|&ns| ns > attached);
+            if went.is_some() || !online.contains(&cpu) {
+                self.detach(cpu);
+                self.down_since.entry(cpu).or_insert(went.unwrap_or(now));
+            }
+        }
+        for cpu in online {
+            // Not before it is back up from its last step down.
+            if self.sampler.contains_key(&cpu) || down.get(&cpu) > up.get(&cpu) {
+                continue;
+            }
+            // A CPU can show online before perf can sample on it, so one
+            // that fails is tried again.
+            let Ok(link) = self.attach(cpu) else {
+                self.unsampled_cpus.insert(cpu);
+                continue;
+            };
+            self.sampler.insert(cpu, (link, now));
+            self.unsampled_cpus.remove(&cpu);
+            if let Some(went) = self.down_since.remove(&cpu) {
+                self.restarted_cpus.insert(cpu);
+                self.unsampled_ns += now.saturating_sub(went);
+            } else if self.sampled_cpus.insert(cpu) {
+                self.late_cpus += 1;
+            }
+        }
+    }
+
+    fn detach(&mut self, cpu: u32) {
+        if let (Some((link, _)), Ok(sampler)) =
+            (self.sampler.remove(&cpu), sampler_program(&mut self.ebpf))
+        {
+            let _ = sampler.detach(link);
+        }
+    }
+
+    /// When each CPU last took a step one way, by `name`'s map.
+    fn steps(&self, name: &str) -> BTreeMap<u32, u64> {
+        let map = self.ebpf.map(name);
+        let steps = map.and_then(|map| HashMap::<_, u32, u64>::try_from(map).ok());
+        steps.map_or_else(BTreeMap::new, |steps| steps.iter().flatten().collect())
+    }
+
+    pub(crate) fn samples(&self) -> bool {
+        self.reader.is_some()
+    }
+
+    /// Starts the capture.
+    pub(crate) fn begin(&mut self) -> Result<(), Error> {
+        self.run(1)
+    }
+
+    /// Ends the capture, at once.
+    pub(crate) fn end(&mut self) {
+        if self.ended.is_none() {
+            let now = monotonic_ns();
+            self.ended = Some(self.run(0).map(|()| now));
+        }
+    }
+
+    fn run(&mut self, running: u32) -> Result<(), Error> {
+        let map = self
+            .ebpf
+            .map_mut("RUNNING")
+            .ok_or(Error::Missing("RUNNING"))?;
+        let mut map: Array<_, u32> = Array::try_from(map).map_err(|e| Error::Map("RUNNING", e))?;
+        map.set(0, running, 0).map_err(|e| Error::Map("RUNNING", e))
+    }
+
+    /// Stops the programs, and reads what they found.
+    pub(crate) fn stop(mut self) -> Result<Stopped, Error> {
+        let now = match self.ended.take() {
+            Some(ended) => ended?,
+            None => {
+                let now = monotonic_ns();
+                self.run(0)?;
+                now
+            }
+        };
         let Self {
             mut ebpf,
             tracepoints,
             syscalls,
+            sampler,
+            late_cpus,
+            unsampled_cpus,
+            restarted_cpus,
+            unsampled_ns,
+            tells_guests,
             let_go_late,
+            reader,
+            ..
         } = self;
         let mut programs = Vec::new();
+        if reader.is_some() {
+            let program = sampler_program(&mut ebpf)?;
+            for (link, _) in sampler.into_values() {
+                program
+                    .detach(link)
+                    .map_err(|e| Error::Program(SAMPLER, e))?;
+            }
+            let info = program.info().map_err(|e| Error::Program(SAMPLER, e))?;
+            programs.push(format!("{:016x}", info.tag()));
+        }
         for (program, link) in tracepoints {
             let tracepoint = tracepoint(&mut ebpf, program)?;
             tracepoint
@@ -186,7 +449,8 @@ impl Syscalls {
             let info = tracepoint.info().map_err(|e| Error::Program(program, e))?;
             programs.push(format!("{:016x}", info.tag()));
         }
-        for (program, link) in syscalls {
+        let counting = syscalls.is_some();
+        for (program, link) in syscalls.into_iter().flatten() {
             let tracepoint = raw_tracepoint(&mut ebpf, program)?;
             // So the maps stay as they are while read.
             tracepoint
@@ -195,51 +459,76 @@ impl Syscalls {
             let info = tracepoint.info().map_err(|e| Error::Program(program, e))?;
             programs.push(format!("{:016x}", info.tag()));
         }
-        let mut take = |name| ebpf.take_map(name).ok_or(Error::Missing(name));
-        let (calls, starts) = (take("CALLS")?, take("STARTS")?);
-
-        let calls: HashMap<MapData, CallKey, Calls> =
-            HashMap::try_from(calls).map_err(|e| Error::Map("CALLS", e))?;
-        let mut rows = BTreeMap::new();
-        for entry in calls.iter() {
-            let (key, calls) = entry.map_err(|e| Error::Map("CALLS", e))?;
-            rows.insert(
-                (key.tgid, key.tid, key.nr),
-                row(
-                    key.tgid,
-                    key.tid,
-                    key.nr,
-                    calls.calls,
-                    calls.ns,
-                    &calls.buckets,
-                ),
-            );
-        }
-        let starts: HashMap<MapData, u32, Start> =
-            HashMap::try_from(starts).map_err(|e| Error::Map("STARTS", e))?;
-        for entry in starts.iter() {
-            let (tid, start) = entry.map_err(|e| Error::Map("STARTS", e))?;
-            // A thread that exited in a syscall, or in exit, leaves it there.
-            let ends = [Sysno::exit, Sysno::exit_group].map(|s| s as u32);
-            let alive = Path::new(&format!("/proc/{}/task/{tid}", start.tgid)).exists();
-            if !alive || ends.contains(&start.nr) {
-                continue;
+        let samples = match reader {
+            Some(reader) => {
+                reader.finish()?;
+                Some(Samples {
+                    dropped: sum(&mut ebpf, "DROPPED")?,
+                })
             }
-            rows.entry((start.tgid, tid, start.nr))
-                .or_insert_with(|| row(start.tgid, tid, start.nr, 0, 0, &[0; uhr_ebpf::BUCKETS]))
-                .unfinished_ns = Some(now.saturating_sub(start.ns));
-        }
+            None => None,
+        };
+        let syscalls = if counting {
+            Some(counted(&mut ebpf, now)?)
+        } else {
+            None
+        };
         Ok(Stopped {
-            counted: Counted {
-                calls: rows.into_values().collect(),
-                lost: sum(&mut ebpf, "LOST")?,
+            found: Found {
+                syscalls,
+                samples,
                 unfollowed: sum(&mut ebpf, "UNFOLLOWED")?,
+                late_cpus,
+                unsampled_cpus: unsampled_cpus.len() as u32,
+                restarted_cpus: restarted_cpus.len() as u32,
+                unsampled_ns,
+                tells_guests,
                 let_go_late,
                 programs,
             },
             programs: ebpf,
         })
     }
+}
+
+fn counted(ebpf: &mut Ebpf, now: u64) -> Result<Counted, Error> {
+    let mut take = |name| ebpf.take_map(name).ok_or(Error::Missing(name));
+    let (calls, starts) = (take("CALLS")?, take("STARTS")?);
+    let calls: HashMap<MapData, CallKey, Calls> =
+        HashMap::try_from(calls).map_err(|e| Error::Map("CALLS", e))?;
+    let mut rows = BTreeMap::new();
+    for entry in calls.iter() {
+        let (key, calls) = entry.map_err(|e| Error::Map("CALLS", e))?;
+        rows.insert(
+            (key.tgid, key.tid, key.nr),
+            row(
+                key.tgid,
+                key.tid,
+                key.nr,
+                calls.calls,
+                calls.ns,
+                &calls.buckets,
+            ),
+        );
+    }
+    let starts: HashMap<MapData, u32, Start> =
+        HashMap::try_from(starts).map_err(|e| Error::Map("STARTS", e))?;
+    for entry in starts.iter() {
+        let (tid, start) = entry.map_err(|e| Error::Map("STARTS", e))?;
+        // A thread that exited in a syscall, or in exit, leaves it there.
+        let ends = [Sysno::exit, Sysno::exit_group].map(|s| s as u32);
+        let alive = Path::new(&format!("/proc/{}/task/{tid}", start.tgid)).exists();
+        if !alive || ends.contains(&start.nr) {
+            continue;
+        }
+        rows.entry((start.tgid, tid, start.nr))
+            .or_insert_with(|| row(start.tgid, tid, start.nr, 0, 0, &[0; uhr_ebpf::BUCKETS]))
+            .unfinished_ns = Some(now.saturating_sub(start.ns));
+    }
+    Ok(Counted {
+        calls: rows.into_values().collect(),
+        lost: sum(ebpf, "LOST")?,
+    })
 }
 
 /// The total of a per-CPU counter.
@@ -251,9 +540,75 @@ fn sum(ebpf: &mut Ebpf, name: &'static str) -> Result<u64, Error> {
     Ok(values.iter().sum())
 }
 
-/// Loads the programs without running them, as recording would.
+/// Copies samples from the ring buffer to a file while recording, each
+/// after its length as a 32-bit number.
+struct Reader {
+    stop: Arc<AtomicBool>,
+    /// `None` once joined.
+    thread: Option<JoinHandle<io::Result<()>>>,
+    path: PathBuf,
+}
+
+impl Reader {
+    fn start(ring: RingBuf<MapData>, path: &Path) -> Result<Self, Error> {
+        let error = |source| Error::Samples {
+            path: path.to_owned(),
+            source,
+        };
+        let file = File::create_new(path).map_err(error)?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread = {
+            let stop = stop.clone();
+            thread::spawn(move || copy(ring, BufWriter::new(file), &stop))
+        };
+        Ok(Self {
+            stop,
+            thread: Some(thread),
+            path: path.to_owned(),
+        })
+    }
+
+    /// Copies what is left.
+    fn finish(mut self) -> Result<(), Error> {
+        self.stop.store(true, Ordering::Release);
+        let Some(thread) = self.thread.take() else {
+            return Ok(());
+        };
+        let copied = thread
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        copied.map_err(|source| Error::Samples {
+            path: self.path.clone(),
+            source,
+        })
+    }
+}
+
+/// Left running, the thread would copy until uhr exits.
+impl Drop for Reader {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+    }
+}
+
+fn copy(mut ring: RingBuf<MapData>, mut out: BufWriter<File>, stop: &AtomicBool) -> io::Result<()> {
+    loop {
+        // Before the last read, so that it gets every sample from before.
+        let stopping = stop.load(Ordering::Acquire);
+        while let Some(sample) = ring.next() {
+            out.write_all(&(sample.len() as u32).to_le_bytes())?;
+            out.write_all(&sample)?;
+        }
+        if stopping {
+            return out.flush();
+        }
+        thread::sleep(READ_EVERY);
+    }
+}
+
+/// Loads every program without running them, as recording would.
 pub fn check() -> Result<(), Error> {
-    let mut ebpf = load(None)?;
+    let mut ebpf = load(None, Layout::default())?;
     for (program, ..) in FOLLOWERS.into_iter().chain([LET_GO, LET_GO_LATE]) {
         tracepoint(&mut ebpf, program)?
             .load()
@@ -264,7 +619,15 @@ pub fn check() -> Result<(), Error> {
             .load()
             .map_err(|e| Error::Program(program, e).or_not_permitted())?;
     }
-    Ok(())
+    if !CAN_SAMPLE {
+        return Ok(());
+    }
+    tracepoint(&mut ebpf, HOTPLUG.0)?
+        .load()
+        .map_err(|e| Error::Program(HOTPLUG.0, e).or_not_permitted())?;
+    sampler_program(&mut ebpf)?
+        .load()
+        .map_err(|e| Error::Program(SAMPLER, e).or_not_permitted())
 }
 
 fn tracepoint<'a>(ebpf: &'a mut Ebpf, program: &'static str) -> Result<&'a mut TracePoint, Error> {
@@ -284,19 +647,54 @@ fn raw_tracepoint<'a>(
         .map_err(|e| Error::Program(program, e))
 }
 
-/// Where the kernel's structures say how many threads a process has live:
-/// the offsets of `task_struct.signal` and of `signal_struct.live`.
-fn exits() -> Option<(u32, u32)> {
-    let signal = btf::kernel_member_offset("task_struct", "signal")?;
-    Some((signal, btf::kernel_member_offset("signal_struct", "live")?))
+fn sampler_program(ebpf: &mut Ebpf) -> Result<&mut PerfEvent, Error> {
+    ebpf.program_mut(SAMPLER)
+        .ok_or(Error::Missing(SAMPLER))?
+        .try_into()
+        .map_err(|e| Error::Program(SAMPLER, e))
 }
 
-fn load(exits: Option<(u32, u32)>) -> Result<Ebpf, Error> {
-    let (signal, live) = exits.unwrap_or((u32::MAX, u32::MAX));
+/// Without sampling, the ring buffer gets the smallest size the kernel
+/// allows, a page.
+/// Where the kernel keeps what the programs read of its tasks, from its BTF.
+#[derive(Clone, Copy, Default)]
+struct Layout {
+    /// `task_struct.flags`, which say whether a thread runs a guest.
+    task_flags: Option<u32>,
+    /// `task_struct.signal`, and `signal_struct.live`, how many threads a
+    /// process has live.
+    exits: Option<(u32, u32)>,
+}
+
+impl Layout {
+    fn read() -> Self {
+        let [task_flags, signal, live] = btf::kernel_member_offsets([
+            ("task_struct", "flags"),
+            ("task_struct", "signal"),
+            ("signal_struct", "live"),
+        ]);
+        Self {
+            task_flags,
+            exits: signal.zip(live),
+        }
+    }
+}
+
+fn load(sampling: Option<&Sampling>, layout: Layout) -> Result<Ebpf, Error> {
+    let size = match sampling {
+        Some(_) => SAMPLE_BUFFER,
+        None => rustix::param::page_size() as u32,
+    };
+    let max_stack = sampling.map_or(uhr_ebpf::MAX_FRAMES as u32, |s| s.max_stack);
+    let task_flags = layout.task_flags.unwrap_or(u32::MAX);
+    let (signal, live) = layout.exits.unwrap_or((u32::MAX, u32::MAX));
     #[cfg(uhr_ebpf)]
     {
         check_namespace()?;
         EbpfLoader::new()
+            .map_max_entries("SAMPLES", size)
+            .override_global("MAX_STACK", &max_stack, CAN_SAMPLE)
+            .override_global("TASK_FLAGS", &task_flags, CAN_SAMPLE)
             .override_global("TASK_SIGNAL", &signal, true)
             .override_global("SIGNAL_LIVE", &live, true)
             .load(PROGRAMS)
@@ -304,7 +702,7 @@ fn load(exits: Option<(u32, u32)>) -> Result<Ebpf, Error> {
     }
     #[cfg(not(uhr_ebpf))]
     {
-        let _ = (signal, live, EbpfLoader::new);
+        let _ = (size, max_stack, task_flags, signal, live, EbpfLoader::new);
         Err(Error::NotBuilt)
     }
 }

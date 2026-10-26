@@ -13,7 +13,8 @@ pub struct Coverage {
     /// filter. The stack counts cover every stack: one per CPU sample, and
     /// one per thread going off CPU.
     pub lost_events: u64,
-    pub throttle_events: u64,
+    /// `None` if a stream does not see them.
+    pub throttle_events: Option<u64>,
     pub stacks_at_stack_limit: u64,
     /// Stacks that went on past the end of their stack copy, so their outer
     /// callers are missing. `None` without DWARF unwinding.
@@ -34,7 +35,7 @@ impl Coverage {
     pub(crate) fn of(recording: &Recording) -> Self {
         let mut coverage = Coverage {
             lost_events: 0,
-            throttle_events: 0,
+            throttle_events: Some(0),
             stacks_at_stack_limit: 0,
             stacks_cut_at_stack_copy: None,
             stacks_not_unwound: None,
@@ -48,7 +49,19 @@ impl Coverage {
             coverage.lost_events += c.lost_events;
             let stacks = c.stacks.as_ref();
             if let Some(stacks) = stacks {
-                coverage.throttle_events += stacks.throttle_events;
+                match stacks.throttle_events {
+                    Some(throttled) => {
+                        if let Some(total) = coverage.throttle_events.as_mut() {
+                            *total += throttled;
+                        }
+                    }
+                    None => {
+                        coverage.throttle_events = None;
+                        coverage
+                            .unknown
+                            .push(format!("throttling of stream {}'s sampling", stream.id));
+                    }
+                }
                 coverage.stacks_at_stack_limit += stacks.stacks_at_stack_limit;
                 if let Some(cut) = stacks.stacks_cut_at_stack_copy {
                     *coverage.stacks_cut_at_stack_copy.get_or_insert(0) += cut;

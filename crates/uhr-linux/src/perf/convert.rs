@@ -1,7 +1,9 @@
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs::File;
-use std::io::BufReader;
+use std::io::{self, BufReader, Read};
+use std::mem::size_of;
+use std::os::unix::fs::FileExt;
 use std::path::Path;
 
 use linux_perf_data::linux_perf_event_reader::constants::{
@@ -24,6 +26,7 @@ use uhr_core::recording::{
     MissingSignal, Mode, OffCPUInterval, Origin, Platform, Recording, Sample, Sampling, Signal,
     StackCoverage, Stream, StreamCoverage, Target, Thread, ThreadName, ThreadState, Unwinding,
 };
+use uhr_ebpf::{MAX_FRAMES, SampleHeader, mode};
 
 pub(super) struct Input<'a> {
     pub perf_data: &'a Path,
@@ -43,18 +46,37 @@ pub(super) struct Input<'a> {
     pub requested_frequency_hz: u64,
     pub max_stack_depth: u32,
     pub kallsyms: Result<&'a Kallsyms, &'a kallsyms::Error>,
+    /// The samples of uhr's eBPF programs, if they sampled instead of perf.
+    pub ebpf_samples: Option<EbpfSamples<'a>>,
 }
 
-const TIMER_BIAS: &str = "cpu-clock samples come from a timer interrupt, so code that runs \
-     with interrupts disabled is under-sampled and samples can land a few instructions late.";
-const FRAME_POINTER_BIAS: &str = "Frame-pointer unwinding cuts stacks short in code built \
-     without frame pointers, and misses the caller of a leaf function that has no frame setup.";
+#[derive(Clone, Copy)]
+pub(super) struct EbpfSamples<'a> {
+    pub path: &'a Path,
+    pub period_ns: u64,
+}
+
+pub(super) const TIMER_BIAS: &str = "cpu-clock samples come from a timer interrupt, so code \
+     that runs with interrupts disabled is under-sampled and samples can land a few instructions \
+     late.";
+pub(super) const FRAME_POINTER_BIAS: &str = "Frame-pointer unwinding cuts stacks short in code \
+     built without frame pointers, and misses the caller of a leaf function that has no frame \
+     setup.";
 const DWARF_BIAS: &str = "DWARF unwinding falls back to frame pointers in code without unwind \
      tables, such as JIT code, and stops at the end of each sample's stack copy.";
 const OFF_CPU_BIAS: &str = "Off-CPU time comes from context switches, without wakeups, so the \
      time a woken thread waits for a CPU counts as blocked rather than runnable.";
 
-pub(super) fn convert(input: Input) -> Result<Recording> {
+/// What became of the samples of uhr's eBPF programs.
+pub(super) struct EbpfStacks {
+    pub coverage: StackCoverage,
+    /// Samples of processes perf has no record of, which are left out.
+    pub untracked: u64,
+}
+
+/// The recording, and what became of the samples of uhr's eBPF programs if
+/// they sampled.
+pub(super) fn convert(input: Input) -> Result<(Recording, Option<EbpfStacks>)> {
     let file = File::open(input.perf_data).map_err(io_error("opening", input.perf_data))?;
     let PerfFileReader {
         mut perf_file,
@@ -81,30 +103,44 @@ pub(super) fn convert(input: Input) -> Result<Recording> {
             PerfEventType::Software(SoftwareCounterType::ContextSwitches)
         )
     });
-    let expected = if switches.is_some() { 2 } else { 1 };
-    let Some(cpu_clock) = cpu_clock.filter(|_| attributes.len() == expected) else {
+    // With uhr's eBPF programs sampling, perf only tracks the processes.
+    let sampled = input.ebpf_samples.is_none();
+    let expected = usize::from(sampled) + usize::from(switches.is_some());
+    if cpu_clock.is_some() != sampled || attributes.len() != expected {
         let types: Vec<_> = attributes
             .iter()
             .map(|(_, a)| a.attributes().type_)
             .collect();
-        return Err(unexpected(format!(
-            "expected a cpu-clock event and maybe a context-switches event, found {types:?}"
-        )));
-    };
+        let wanted = if sampled {
+            "a cpu-clock event and maybe a context-switches event"
+        } else {
+            "at most a context-switches event"
+        };
+        return Err(unexpected(format!("expected {wanted}, found {types:?}")));
+    }
     let all = perf_file.event_attributes();
-    let attr = all[cpu_clock].attributes();
-    check_clock(attr)?;
-    let SamplingPolicy::Frequency(frequency_hz) = attr.sampling_policy else {
-        return Err(unexpected(format!(
-            "expected sampling by frequency, found {:?}",
-            attr.sampling_policy
-        )));
-    };
-    let kernel_excluded = attr.flags.contains(AttrFlags::EXCLUDE_KERNEL);
-    let stack_copy_bytes = attr
-        .sample_format
-        .contains(SampleFormat::REGS_USER | SampleFormat::STACK_USER)
-        .then_some(attr.sample_stack_user);
+    let mut frequency_hz = None;
+    let mut kernel_excluded = false;
+    if let Some(cpu_clock) = cpu_clock {
+        let attr = all[cpu_clock].attributes();
+        check_clock(attr)?;
+        let SamplingPolicy::Frequency(frequency) = attr.sampling_policy else {
+            return Err(unexpected(format!(
+                "expected sampling by frequency, found {:?}",
+                attr.sampling_policy
+            )));
+        };
+        frequency_hz = Some(frequency);
+        kernel_excluded = attr.flags.contains(AttrFlags::EXCLUDE_KERNEL);
+    }
+    // perf takes every stack the same way.
+    let stack_copy_bytes = cpu_clock.or(switches).and_then(|index| {
+        let attr = all[index].attributes();
+        let copied = SampleFormat::REGS_USER | SampleFormat::STACK_USER;
+        attr.sample_format
+            .contains(copied)
+            .then_some(attr.sample_stack_user)
+    });
     // Threads go off CPU in the kernel, so without it there are no stacks.
     let mut switch_stacks_excluded = false;
     if let Some(index) = switches {
@@ -136,6 +172,7 @@ pub(super) fn convert(input: Input) -> Result<Recording> {
     if stack_copy_bytes.is_some() {
         state.unwinding = Some(UserUnwinding::new());
     }
+    let mut ebpf = input.ebpf_samples.map(EbpfReader::open).transpose()?;
     let mut held = input.launched_pid;
     let mut foreign = 0;
     while let Some(record) = record_iter
@@ -166,11 +203,14 @@ pub(super) fn convert(input: Input) -> Result<Recording> {
         // perf stamps the records it synthesizes at startup with 0.
         let time = record.timestamp().filter(|&t| t != 0);
         if let Some(time) = time {
-            state.start_ns = Some(state.start_ns.map_or(time, |t| t.min(time)));
-            state.end_ns = Some(state.end_ns.map_or(time, |t| t.max(time)));
+            // So a sample sees the mappings and threads of its time.
+            if let Some(ebpf) = ebpf.as_mut() {
+                ebpf.add(&mut state, Some(time))?;
+            }
+            state.seen_at(time);
         }
         match parsed {
-            EventRecord::Sample(sample) if attr_index == cpu_clock => {
+            EventRecord::Sample(sample) if Some(attr_index) == cpu_clock => {
                 state.sample(&record, &sample)?
             }
             EventRecord::Sample(sample) if Some(attr_index) == switches => {
@@ -239,6 +279,9 @@ pub(super) fn convert(input: Input) -> Result<Recording> {
             _ => {}
         }
     }
+    if let Some(ebpf) = ebpf.as_mut() {
+        ebpf.add(&mut state, None)?;
+    }
     if foreign > 0 {
         warn!(
             records = foreign,
@@ -258,20 +301,23 @@ pub(super) fn convert(input: Input) -> Result<Recording> {
     state.attached_ns = input.attached_ns;
     state.finish_off_cpu();
 
-    let mut signals = vec![Signal::UserCPUSamples, Signal::UserStacks];
+    let mut signals = Vec::new();
     let mut missing_signals = Vec::new();
-    let kernel_signals = [Signal::KernelCPUSamples, Signal::KernelStacks];
-    if kernel_excluded {
-        missing_signals.extend(kernel_signals.map(|signal| {
-            MissingSignal {
-                signal,
-                reason: "perf excluded the kernel, usually because perf_event_paranoid is 2 or \
-                     higher. Run `uhr doctor`."
-                    .into(),
-            }
-        }));
-    } else {
-        signals.extend(kernel_signals);
+    if sampled {
+        signals.extend([Signal::UserCPUSamples, Signal::UserStacks]);
+        let kernel_signals = [Signal::KernelCPUSamples, Signal::KernelStacks];
+        if kernel_excluded {
+            missing_signals.extend(kernel_signals.map(|signal| {
+                MissingSignal {
+                    signal,
+                    reason: "perf excluded the kernel, usually because perf_event_paranoid is 2 \
+                         or higher. Run `uhr doctor`."
+                        .into(),
+                }
+            }));
+        } else {
+            signals.extend(kernel_signals);
+        }
     }
     if switches.is_some() {
         signals.push(Signal::OffCPUTime);
@@ -287,13 +333,18 @@ pub(super) fn convert(input: Input) -> Result<Recording> {
         }
     }
 
-    let mut known_biases = vec![
-        TIMER_BIAS,
-        match stack_copy_bytes {
+    // perf takes no stacks when it only tracks the processes.
+    let stacks_taken = sampled || switches.is_some();
+    let mut known_biases = Vec::new();
+    if sampled {
+        known_biases.push(TIMER_BIAS);
+    }
+    if stacks_taken {
+        known_biases.push(match stack_copy_bytes {
             Some(_) => DWARF_BIAS,
             None => FRAME_POINTER_BIAS,
-        },
-    ];
+        });
+    }
     if switches.is_some() {
         known_biases.push(OFF_CPU_BIAS);
     }
@@ -301,7 +352,7 @@ pub(super) fn convert(input: Input) -> Result<Recording> {
         id: "perf".into(),
         collector: Collector::Perf {
             version: input.perf_version,
-            sampling: Some(Sampling {
+            sampling: frequency_hz.map(|frequency_hz| Sampling {
                 event: "cpu-clock".into(),
                 frequency_hz,
                 requested_frequency_hz: input.requested_frequency_hz,
@@ -312,15 +363,15 @@ pub(super) fn convert(input: Input) -> Result<Recording> {
         missing_signals,
         coverage: StreamCoverage {
             lost_events: state.lost_events,
-            stacks: Some(StackCoverage {
+            stacks: stacks_taken.then(|| StackCoverage {
                 unwinding: match stack_copy_bytes {
                     Some(_) => Unwinding::Dwarf,
                     None => Unwinding::FramePointers,
                 },
                 stack_copy_bytes,
-                samples: state.samples.len() as u64,
+                samples: state.samples.len() as u64 - state.ebpf_samples,
                 off_cpu_intervals: switches.map(|_| state.off_cpu.len() as u64),
-                throttle_events: state.throttle_events,
+                throttle_events: Some(state.throttle_events),
                 max_stack_depth: input.max_stack_depth,
                 stacks_at_stack_limit: state.stacks_at_stack_limit,
                 stacks_cut_at_stack_copy: stack_copy_bytes.map(|_| state.stacks_cut_at_stack_copy),
@@ -330,6 +381,10 @@ pub(super) fn convert(input: Input) -> Result<Recording> {
             known_biases: known_biases.iter().map(|b| b.to_string()).collect(),
         },
     };
+    let ebpf_stacks = input.ebpf_samples.map(|_| EbpfStacks {
+        coverage: ebpf_coverage(&state, input.max_stack_depth),
+        untracked: state.ebpf_untracked,
+    });
 
     let (kernel_symbols, saved) = match input.kallsyms {
         Ok(kallsyms) => (
@@ -343,7 +398,7 @@ pub(super) fn convert(input: Input) -> Result<Recording> {
             },
         ),
     };
-    Ok(Recording {
+    let recording = Recording {
         manifest: Manifest {
             format_version: FORMAT_VERSION,
             platform: Platform {
@@ -373,7 +428,114 @@ pub(super) fn convert(input: Input) -> Result<Recording> {
         kernel_symbols,
         jit_symbols: Vec::new(),
         syscall_calls: Vec::new(),
-    })
+    };
+    Ok((recording, ebpf_stacks))
+}
+
+fn ebpf_coverage(state: &State, max_stack_depth: u32) -> StackCoverage {
+    StackCoverage {
+        unwinding: Unwinding::FramePointers,
+        stack_copy_bytes: None,
+        samples: state.ebpf_samples,
+        off_cpu_intervals: None,
+        // The kernel reports throttling in an event's buffer, and the
+        // events the programs sample at have none.
+        throttle_events: None,
+        max_stack_depth: ebpf_depth(max_stack_depth),
+        stacks_at_stack_limit: state.ebpf_at_limit,
+        stacks_cut_at_stack_copy: None,
+        stacks_not_unwound: None,
+    }
+}
+
+/// The deepest stack uhr's eBPF programs take, kernel and user frames
+/// together: the kernel's limit, or their room for frames if lower.
+fn ebpf_depth(max_stack_depth: u32) -> u32 {
+    max_stack_depth.min(MAX_FRAMES as u32)
+}
+
+/// The samples of uhr's eBPF programs, in the order they were taken. The
+/// ring buffer they come through has them in the order the CPUs wrote
+/// them, which is not quite that.
+struct EbpfReader<'a> {
+    path: &'a Path,
+    file: File,
+    /// The time, place in the file and length of each sample, by time.
+    index: Vec<(u64, u64, u32)>,
+    next: usize,
+    period_ns: u64,
+    buffer: Vec<u8>,
+}
+
+impl<'a> EbpfReader<'a> {
+    fn open(samples: EbpfSamples<'a>) -> Result<Self> {
+        let path = samples.path;
+        let file = File::open(path).map_err(io_error("opening", path))?;
+        let mut reader = BufReader::new(&file);
+        let mut index = Vec::new();
+        let mut at = 0;
+        loop {
+            let mut len = [0; 4];
+            match reader.read_exact(&mut len) {
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                result => result.map_err(io_error("reading", path))?,
+            }
+            let len = u32::from_le_bytes(len);
+            if (len as usize) < size_of::<SampleHeader>() {
+                return Err(unexpected(format!("an eBPF sample of {len} bytes")));
+            }
+            // The time comes first.
+            let mut time = [0; 8];
+            reader
+                .read_exact(&mut time)
+                .map_err(io_error("reading", path))?;
+            reader
+                .seek_relative(i64::from(len) - 8)
+                .map_err(io_error("reading", path))?;
+            index.push((u64::from_ne_bytes(time), at + 4, len));
+            at += 4 + u64::from(len);
+        }
+        index.sort_unstable();
+        Ok(Self {
+            path,
+            file,
+            index,
+            next: 0,
+            period_ns: samples.period_ns,
+            buffer: Vec::new(),
+        })
+    }
+
+    /// Adds the samples taken before `until` to `state`, or all that are
+    /// left.
+    fn add(&mut self, state: &mut State, until: Option<u64>) -> Result<()> {
+        while let Some(&(time, at, len)) = self.index.get(self.next) {
+            if until.is_some_and(|until| time >= until) {
+                break;
+            }
+            self.buffer.resize(len as usize, 0);
+            self.file
+                .read_exact_at(&mut self.buffer, at)
+                .map_err(io_error("reading", self.path))?;
+            // SAFETY: the sample is longer than the header, which is plain
+            // numbers, any bits of which are valid.
+            let header: SampleHeader =
+                unsafe { std::ptr::read_unaligned(self.buffer.as_ptr().cast()) };
+            let frames = &self.buffer[size_of::<SampleHeader>()..];
+            let count = header.kernel_frames as usize + header.user_frames as usize;
+            if frames.len() != count * 8 {
+                return Err(unexpected(format!(
+                    "an eBPF sample of {len} bytes with {count} frames"
+                )));
+            }
+            let frames = frames
+                .chunks_exact(8)
+                .map(|word| u64::from_ne_bytes(word.try_into().unwrap()));
+            state.ebpf_sample(&header, frames, self.period_ns);
+            self.next += 1;
+        }
+        Ok(())
+    }
 }
 
 pub(crate) fn is_dummy(attr: &PerfEventAttr) -> bool {
@@ -470,6 +632,9 @@ struct State {
     lost_events: u64,
     throttle_events: u64,
     stacks_at_stack_limit: u64,
+    ebpf_samples: u64,
+    ebpf_at_limit: u64,
+    ebpf_untracked: u64,
     /// Only for recordings with a stack copy in each sample.
     unwinding: Option<UserUnwinding>,
     stacks_cut_at_stack_copy: u64,
@@ -510,10 +675,19 @@ impl State {
             lost_events: 0,
             throttle_events: 0,
             stacks_at_stack_limit: 0,
+            ebpf_samples: 0,
+            ebpf_at_limit: 0,
+            ebpf_untracked: 0,
             unwinding: None,
             stacks_cut_at_stack_copy: 0,
             stacks_not_unwound: 0,
         }
+    }
+
+    /// The capture runs from its first event to its last.
+    fn seen_at(&mut self, time: u64) {
+        self.start_ns = Some(self.start_ns.map_or(time, |t| t.min(time)));
+        self.end_ns = Some(self.end_ns.map_or(time, |t| t.max(time)));
     }
 
     fn thread(&mut self, pid: u32, tid: u32) -> &mut Thread {
@@ -530,6 +704,16 @@ impl State {
     fn comm(&mut self, pid: u32, tid: u32, name: String, exec: bool, time: Option<u64>) {
         if exec {
             self.processes.insert(pid, Vec::new());
+            // Another thread's exec takes the ids of the main thread, whose
+            // exit came first, and goes on as a new one.
+            let ended = self
+                .threads
+                .get(&(pid, tid))
+                .is_some_and(|t| t.end_ns.is_some());
+            if ended && let Some(earlier) = self.threads.remove(&(pid, tid)) {
+                self.ended.push(earlier);
+                self.thread(pid, tid).start_ns = time;
+            }
         }
         self.thread(pid, tid);
         self.names.insert((pid, tid), name.clone());
@@ -647,6 +831,66 @@ impl State {
             cpu_ns: period,
         });
         Ok(())
+    }
+
+    /// A sample of uhr's eBPF programs, with its kernel frames and then its
+    /// user frames, each leaf first.
+    fn ebpf_sample(
+        &mut self,
+        header: &SampleHeader,
+        frames: impl Iterator<Item = u64>,
+        period_ns: u64,
+    ) {
+        let (pid, tid, time_ns) = (header.tgid, header.tid, header.time_ns);
+        // perf follows a thread from its start, or from when it attached,
+        // until it exits. One the target started while perf attached has no
+        // record, nor do its mappings, and a later thread with the ids of one
+        // that exited is another.
+        let alive = self
+            .threads
+            .get(&(pid, tid))
+            .is_some_and(|thread| thread.end_ns.is_none_or(|end| time_ns <= end));
+        if !alive {
+            self.ebpf_untracked += 1;
+            return;
+        }
+        self.seen_at(time_ns);
+        self.thread(pid, tid);
+        self.seen_on_cpu(pid, tid, time_ns);
+        let kernel = header.kernel_frames as usize;
+        let mut stack = Vec::new();
+        for (i, address) in frames.enumerate() {
+            let context = if i < kernel {
+                ChainContext::Kernel
+            } else {
+                ChainContext::User
+            };
+            let first = i == 0 || i == kernel;
+            stack.push(self.frame(pid, context, address, !first));
+        }
+        let (mode, context) = match header.mode {
+            mode::KERNEL => (Mode::Kernel, ChainContext::Kernel),
+            mode::USER => (Mode::User, ChainContext::User),
+            _ => (Mode::Unknown, ChainContext::Other),
+        };
+        // In a guest, or both walks failed.
+        if stack.is_empty() {
+            stack.push(self.frame(pid, context, header.ip, false));
+        }
+        if stack.len() >= ebpf_depth(self.max_stack_depth) as usize {
+            self.ebpf_at_limit += 1;
+        }
+        let stack = intern(&mut self.stacks, &mut self.stack_ids, stack);
+        self.ebpf_samples += 1;
+        self.samples.push(Sample {
+            time_ns,
+            pid,
+            tid,
+            cpu: Some(header.cpu),
+            mode,
+            stack,
+            cpu_ns: period_ns,
+        });
     }
 
     /// perf samples a thread right before it goes off CPU, and the switch
@@ -1075,6 +1319,59 @@ mod tests {
             build_id: None,
             time: None,
         }
+    }
+
+    #[test]
+    fn leaves_out_ebpf_samples_of_threads_perf_has_no_record_of_then() {
+        let mut state = State::new(127);
+        // A kernel thread, which has no mappings, and a thread that exits.
+        state.comm(1, 1, "rcu_preempt".into(), false, None);
+        state.comm(3, 3, "short".into(), false, None);
+        state.exit(3, 3, Some(4));
+        let header = |tgid| SampleHeader {
+            time_ns: 5,
+            ip: 0xffff_0000_1000,
+            tgid,
+            tid: tgid,
+            cpu: 0,
+            mode: mode::KERNEL,
+            kernel_frames: 1,
+            user_frames: 0,
+        };
+        for pid in [1, 2, 3] {
+            state.ebpf_sample(&header(pid), [0xffff_0000_1000].into_iter(), 1000);
+        }
+        assert_eq!((state.samples.len(), state.ebpf_untracked), (1, 2));
+        assert_eq!(state.samples[0].pid, 1);
+        assert!(!state.threads.contains_key(&(2, 2)));
+    }
+
+    #[test]
+    fn takes_an_exec_by_another_thread_for_a_new_main_thread() {
+        let mut state = State::new(127);
+        state.comm(1, 1, "app".into(), false, None);
+        state.fork(1, 2, Some((1, 1)), Some(1));
+        state.exit(1, 1, Some(5));
+        state.comm(1, 1, "worker".into(), true, Some(6));
+        let header = SampleHeader {
+            time_ns: 7,
+            ip: 0x1010,
+            tgid: 1,
+            tid: 1,
+            cpu: 0,
+            mode: mode::USER,
+            kernel_frames: 0,
+            user_frames: 1,
+        };
+        state.ebpf_sample(&header, [0x1010].into_iter(), 1000);
+        assert_eq!((state.samples.len(), state.ebpf_untracked), (1, 0));
+        let threads = state.take_threads();
+        let main: Vec<_> = threads
+            .iter()
+            .filter(|t| t.tid == 1)
+            .map(|t| (t.start_ns, t.end_ns))
+            .collect();
+        assert_eq!(main, [(None, Some(5)), (Some(6), None)]);
     }
 
     #[test]

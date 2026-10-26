@@ -6,10 +6,15 @@ const MAGIC: u16 = 0xeb9f;
 const STRUCT: u32 = 4;
 const UNION: u32 = 5;
 
-/// The offset in bytes of `member` in the running kernel's `structure`.
-pub(crate) fn kernel_member_offset(structure: &str, member: &str) -> Option<u32> {
-    let btf = fs::read("/sys/kernel/btf/vmlinux").ok()?;
-    Btf::parse(&btf)?.member_offset(structure, member)
+/// The offset in bytes of each member, by its structure and its name, in
+/// the running kernel. `None` for one not found, or all if the kernel has
+/// no BTF.
+pub(crate) fn kernel_member_offsets<const N: usize>(
+    members: [(&str, &str); N],
+) -> [Option<u32>; N] {
+    let btf = fs::read("/sys/kernel/btf/vmlinux").unwrap_or_default();
+    let btf = Btf::parse(&btf);
+    members.map(|(structure, member)| btf.as_ref()?.member_offset(structure, member))
 }
 
 struct Btf<'a> {
@@ -184,11 +189,17 @@ mod tests {
             eprintln!("skipped: the kernel has no BTF");
             return;
         }
-        let offset = kernel_member_offset("task_struct", "flags").unwrap();
+        let [flags, signal, live] = kernel_member_offsets([
+            ("task_struct", "flags"),
+            ("task_struct", "signal"),
+            ("signal_struct", "live"),
+        ]);
         // After the thread info and the state, and well inside the
         // structure.
-        assert!((8..256).contains(&offset), "{offset}");
-        assert!(kernel_member_offset("task_struct", "signal").is_some());
-        assert!(kernel_member_offset("signal_struct", "live").is_some());
+        assert!(
+            flags.is_some_and(|offset| (8..256).contains(&offset)),
+            "{flags:?}"
+        );
+        assert!(signal.is_some() && live.is_some());
     }
 }

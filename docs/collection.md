@@ -184,18 +184,35 @@ they can walk an interpreter's frames in its memory without runtime flags,
 also in processes uhr attaches to. They can also capture what perf gets only
 from tracepoints, such as wakeups and syscall latency.
 
-- So far they count and time the target's syscalls. At each syscall's entry
-  and exit they add, per thread and syscall, the call, its time and a log2
-  histogram of times in the kernel, so nothing is written per call. Each call
-  still runs them, which a program making millions of quick calls notices,
-  and while they run every process's syscalls take the kernel's slower path
-  for traced ones. They follow the processes the target starts until the
-  last thread of each exits, and count a launched target from its exec on.
+- On x86-64 and arm64, they sample CPU time in place of perf, at each tick
+  of every CPU's clock, and take the kernel and user stacks of the target's
+  threads, walking user stacks with frame pointers. perf then records only the processes'
+  mappings and threads, and the context switches. perf samples instead with
+  `--unwind dwarf` or `--sampler perf`. The kernel runs no program at a perf
+  event while one at a kprobe or a tracepoint runs on the same CPU, so the
+  time in those, which other tools load, has no samples. uhr's own run at
+  raw tracepoints, which don't stop it. A thread running a virtual
+  machine's guest has its time in unknown mode and without frames, as with
+  perf, told apart by the task flag the kernel's own accounting uses, which
+  uhr finds in the kernel's BTF. The kernel drops the sampling event of a
+  CPU going offline, as across a suspend, so they see CPUs go and come
+  back, and uhr starts sampling each again once it is back.
+- They count and time the target's syscalls. At each syscall's entry and
+  exit they add, per thread and syscall, the call, its time and a log2
+  histogram of times in the kernel, so nothing is written per call. Each
+  call still runs them, which a program making millions of quick calls
+  notices, and while they run every process's syscalls take the kernel's
+  slower path for traced ones.
+- They follow the processes the target starts until the last thread of
+  each exits, and sample and count a launched target from its exec on.
+  They start before perf, so that uhr falls back to perf where they can't
+  load, but sample and count only from when perf records until uhr stops
+  the capture.
 - `uhr record` runs them when it may load eBPF, as root or with CAP_BPF and
-  CAP_PERFMON, unless `--no-syscalls`. They know processes by their ids in
-  the kernel's first PID namespace, so uhr also has to run there, not in a
-  container's own. Otherwise the recording says why it has no syscall
-  counts.
+  CAP_PERFMON. They know processes by their ids in the kernel's first PID
+  namespace, so uhr also has to run there, not in a container's own.
+  Otherwise perf samples, and the recording says why it has no syscall
+  counts. `--no-syscalls` leaves the counting out.
 - Their overhead is the target's CPU time in them, from its samples, and a
   query gives the share of its own time in them. That leaves out the
   kernel's way into them and their cost to other processes. The kernel's

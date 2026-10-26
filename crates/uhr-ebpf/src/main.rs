@@ -3,8 +3,16 @@
 #![cfg_attr(target_arch = "bpf", no_std)]
 #![cfg_attr(target_arch = "bpf", no_main)]
 
+// It reads the registers of these.
+#[cfg(all(
+    target_arch = "bpf",
+    any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64")
+))]
+mod samples;
 #[cfg(target_arch = "bpf")]
 mod syscalls;
+#[cfg(target_arch = "bpf")]
+mod targets;
 
 #[cfg(target_arch = "bpf")]
 #[panic_handler]
