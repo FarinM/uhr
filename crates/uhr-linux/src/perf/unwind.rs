@@ -69,6 +69,9 @@ pub(super) struct UserCopy<'a> {
     /// The registers are those of 32-bit code.
     pub(super) compat: bool,
     pub(super) stack: &'a [u8],
+    /// The kernel copied as much as asked, rather than stopping where it
+    /// could read no further, so the stack can go on past the copy.
+    pub(super) full: bool,
 }
 
 pub(super) struct UserStack {
@@ -106,6 +109,7 @@ impl Unwinding {
             bp,
             compat,
             stack,
+            full,
         } = *copy;
         // The x86-64 unwinder would read a 32-bit stack as 8-byte words.
         if compat {
@@ -156,7 +160,7 @@ impl Unwinding {
                 Ok(None) => break,
                 Err(UnwindError::CouldNotReadStack(address)) => {
                     // A word can start in the copy and end past it.
-                    cut = address >= sp && address.saturating_add(8) > end;
+                    cut = full && address >= sp && address.saturating_add(8) > end;
                     break;
                 }
                 // Corrupt or unusual stacks end where unwinding cannot go on.
@@ -558,20 +562,23 @@ mod tests {
     }
 
     #[test]
-    fn counts_a_stack_cut_where_a_word_runs_past_the_copy() {
+    fn counts_a_stack_cut_where_a_word_runs_past_a_full_copy() {
         // Without unwind tables, the caller's frame pointer is at bp and
         // the return address right after it, past the 9 bytes copied.
         let stack = [0; 9];
-        let copy = UserCopy {
-            ip: 0x1000,
-            sp: 0x7000,
-            bp: 0x7000,
-            compat: false,
-            stack: &stack,
-        };
-        let user = Unwinding::new().unwind(&copy, 1, &[], &[], 10);
-        assert_eq!(user.frames, [(0x1000, false)]);
-        assert!(user.cut);
+        for full in [true, false] {
+            let copy = UserCopy {
+                ip: 0x1000,
+                sp: 0x7000,
+                bp: 0x7000,
+                compat: false,
+                stack: &stack,
+                full,
+            };
+            let user = Unwinding::new().unwind(&copy, 1, &[], &[], 10);
+            assert_eq!(user.frames, [(0x1000, false)]);
+            assert_eq!(user.cut, full);
+        }
     }
 
     #[test]
@@ -582,6 +589,7 @@ mod tests {
             bp: 0x7000,
             compat: true,
             stack: &[],
+            full: true,
         };
         let mut unwinding = Unwinding::new();
         for (max_frames, kept) in [(0, 0), (5, 1)] {

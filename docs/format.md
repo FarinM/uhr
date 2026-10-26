@@ -69,7 +69,7 @@ Each stream has:
 | `coverage.stacks.throttle_events` | Times the kernel throttled sampling. Null where the collector does not see it, as for `ebpf`, whose events have no buffer for the kernel to say so in |
 | `coverage.stacks.max_stack_depth` | Stacks deeper than this were cut |
 | `coverage.stacks.stacks_at_stack_limit` | Stacks that reached that depth. This and the next two count every stack: one per sample and one per switch out |
-| `coverage.stacks.stacks_cut_at_stack_copy` | Stacks that went on past the end of their stack copy, so their outer callers are missing. Null without `dwarf` |
+| `coverage.stacks.stacks_cut_at_stack_copy` | Stacks that went on past the end of their stack copy, so their outer callers are missing. A copy the kernel ended early, where it could read no further, does not count. Null without `dwarf` |
 | `coverage.stacks.stacks_not_unwound` | Stacks of 32-bit code, which `dwarf` unwinding cannot walk. They keep only the instruction they were taken at. Null without `dwarf` |
 | `coverage.overhead_ns` | Profiler overhead. Null until it is measured. For `ebpf`, the target's CPU time in uhr's programs, from its samples. Null without kernel stacks, or their names, to find them by |
 | `coverage.known_biases` | Biases of this collector, in words |

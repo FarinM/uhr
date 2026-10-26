@@ -1058,9 +1058,9 @@ impl State {
                     let valid = (*valid as usize).min(bytes.len());
                     (bytes, valid)
                 });
-                let copy = bytes
-                    .as_ref()
-                    .and_then(|(bytes, valid)| user_copy(sample, abi, &bytes[..*valid]));
+                let copy = bytes.as_ref().and_then(|(bytes, valid)| {
+                    user_copy(sample, abi, &bytes[..*valid], *valid == bytes.len())
+                });
                 copy.map(|copy| {
                     let ids = self.processes.get(&pid).map_or(&[][..], Vec::as_slice);
                     let room = (self.max_stack_depth as usize).saturating_sub(stack.len());
@@ -1177,7 +1177,12 @@ impl State {
 
 /// The user registers and stack copy perf took with a sample, in `abi`.
 /// `None` without them, as for a kernel thread.
-fn user_copy<'a>(sample: &SampleRecord, abi: u64, stack: &'a [u8]) -> Option<UserCopy<'a>> {
+fn user_copy<'a>(
+    sample: &SampleRecord,
+    abi: u64,
+    stack: &'a [u8],
+    full: bool,
+) -> Option<UserCopy<'a>> {
     let regs = sample.user_regs.as_ref()?;
     Some(UserCopy {
         ip: regs.get(PERF_REG_X86_IP)?,
@@ -1185,6 +1190,7 @@ fn user_copy<'a>(sample: &SampleRecord, abi: u64, stack: &'a [u8]) -> Option<Use
         bp: regs.get(PERF_REG_X86_BP)?,
         compat: abi == PERF_SAMPLE_REGS_ABI_32,
         stack,
+        full,
     })
 }
 
