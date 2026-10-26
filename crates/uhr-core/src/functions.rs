@@ -143,6 +143,8 @@ pub(crate) struct Functions {
     /// The functions of each frame, innermost inlined call first. The last
     /// is the function the frame's machine code belongs to.
     chains: Vec<Vec<Step>>,
+    /// Whether each frame is an interpreter's.
+    interpreted: Vec<bool>,
     functions: Vec<Function>,
     roles: Vec<Role>,
     lines: Vec<SourceLine>,
@@ -344,6 +346,11 @@ impl Functions {
             .collect();
         Self {
             chains,
+            interpreted: recording
+                .frames
+                .iter()
+                .map(|frame| frame.interpreted.is_some())
+                .collect(),
             functions,
             roles,
             lines,
@@ -354,8 +361,33 @@ impl Functions {
     /// The functions of a stack and their lines, leaf first, with inlined
     /// calls expanded.
     pub(crate) fn steps<'a>(&'a self, stack: &'a [u32]) -> impl Iterator<Item = Step> + 'a {
+        // A runtime that names its code in perf maps can run each call
+        // through code of its own, so that a call shows twice: as the
+        // interpreter's frame, and outward of it, past only the runtime's
+        // code, as the frame the perf map names. It is one call.
+        let mut interpreted: Option<u32> = None;
         stack
             .iter()
+            .filter(move |&&frame| {
+                let Some(function) = self.chains[frame as usize].last().map(|s| s.function) else {
+                    return true;
+                };
+                if self.interpreted[frame as usize] {
+                    interpreted = Some(function);
+                    return true;
+                }
+                match self.roles[function as usize] {
+                    Role::Runtime(_) => true,
+                    Role::Program(_) if interpreted == Some(function) => {
+                        interpreted = None;
+                        false
+                    }
+                    _ => {
+                        interpreted = None;
+                        true
+                    }
+                }
+            })
             .flat_map(|&frame| self.chains[frame as usize].iter().copied())
     }
 

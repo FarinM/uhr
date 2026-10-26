@@ -473,3 +473,112 @@ fn follows_off_cpu_time_through_the_paths() {
         ["b 32", "  main 32", "a 9", "  main 9"]
     );
 }
+
+/// work calls warm in Python, which runs each call through a trampoline
+/// that its perf map names, under the eval loop, with the interpreter's
+/// frames read too: 4. Then warm calls itself: 1.
+#[test]
+fn counts_a_call_a_perf_map_and_the_interpreter_both_show_once() {
+    let (mut recording, mut symbols) = (recording(), symbols());
+    let mut mapping = |start: u64, path: &str| {
+        recording.mappings.push(Mapping {
+            pid: Some(1),
+            start,
+            end: start + 0x1000,
+            file_offset: 0,
+            path: path.into(),
+            build_id: None,
+            time_ns: None,
+        });
+        recording.mappings.len() as u32 - 1
+    };
+    let (python, anon) = (
+        mapping(0x10000, "/usr/bin/python3.12"),
+        mapping(0x20000, "//anon"),
+    );
+    for (start, name) in [(0x20000, "warm"), (0x20100, "work")] {
+        recording.jit_symbols.push(JitSymbol {
+            pid: 1,
+            start,
+            end: start + 0x100,
+            name: format!("py::{name}:/app/x.py"),
+        });
+        recording.interpreted_code.push(InterpretedCode {
+            pid: 1,
+            runtime: "python".into(),
+            address: 0x9000 + start,
+            name: Some(name.into()),
+            file: Some("/app/x.py".into()),
+            first_line: Some(1),
+        });
+    }
+    let mut frame = |frame: Frame, name: &str, start: Option<u32>| {
+        recording.frames.push(frame);
+        symbols.names.push(Some(FrameName::Symbol(name.into())));
+        symbols.function_addresses.push(start);
+        symbols.inline.push(Vec::new());
+        recording.frames.len() as u32 - 1
+    };
+    let interpreted = |code, address| Frame {
+        origin: Origin::Interpreted,
+        address,
+        mapping: None,
+        file_offset: None,
+        return_address: false,
+        interpreted: Some(Interpreted { code, line: None }),
+    };
+    let native = |origin, mapping, address| Frame {
+        origin,
+        address,
+        mapping: Some(mapping),
+        file_offset: Some(address & 0xfff),
+        return_address: true,
+        interpreted: None,
+    };
+    let warm = frame(interpreted(0, 0x29010), "warm", None);
+    let warm_again = frame(interpreted(0, 0x29020), "warm", None);
+    let work = frame(interpreted(1, 0x29110), "work", None);
+    let eval = frame(
+        native(Origin::Binary, python, 0x10110),
+        "_PyEval_EvalFrameDefault",
+        Some(0x100),
+    );
+    let warm_map = frame(
+        native(Origin::Jit, anon, 0x20010),
+        "py::warm:/app/x.py",
+        None,
+    );
+    let work_map = frame(
+        native(Origin::Jit, anon, 0x20110),
+        "py::work:/app/x.py",
+        None,
+    );
+    let stacks = [
+        (vec![warm, eval, warm_map, eval, work, eval, work_map, 0], 4),
+        (vec![warm, eval, warm_again, eval, 0], 1),
+    ];
+    for (stack, cpu_ns) in stacks {
+        recording.stacks.push(stack);
+        recording.samples.push(Sample {
+            time_ns: 1,
+            pid: 1,
+            tid: 1,
+            cpu: None,
+            mode: Mode::User,
+            stack: recording.stacks.len() as u32 - 1,
+            cpu_ns,
+        });
+    }
+    let paths = run(&recording, Some(&symbols), &query("warm", 10, 10)).unwrap();
+    // The recursion is warm's own; the perf map's frame of the one call is
+    // not another.
+    assert_eq!(
+        tree(&paths.callees),
+        ["_PyEval_EvalFrameDefault 1", "  warm 1"]
+    );
+    let callers = tree(&paths.callers);
+    assert!(
+        callers.iter().any(|l| l.trim_start() == "work 4"),
+        "{callers:#?}"
+    );
+}
