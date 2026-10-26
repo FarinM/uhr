@@ -41,6 +41,9 @@ pub fn check_ebpf() -> Check {
                 ebpf::Error::NotPermitted => Some(
                     "Record under sudo, or give the uhr executable CAP_BPF and CAP_PERFMON.".into(),
                 ),
+                ebpf::Error::PidNamespace => {
+                    Some("Record from outside the container's PID namespace.".into())
+                }
                 _ => None,
             },
             detail: format!("{}, so recordings have no syscall counts", error.reason()),

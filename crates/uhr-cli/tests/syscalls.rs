@@ -188,6 +188,13 @@ fn the_time_is_in_the_kernel_on_behalf_of_read_zero() {
 /// Runs uhr as root through sudo, and gives the recording back to this
 /// user. `None` where sudo asks for a password.
 fn uhr_as_root(args: &[&str], recording: &Path) -> Option<()> {
+    let mut command = vec![common::UHR];
+    command.extend(args);
+    as_root(&command, recording)
+}
+
+/// Runs `command` as root, as `uhr_as_root` runs uhr.
+fn as_root(command: &[&str], recording: &Path) -> Option<()> {
     let sudo = |args: &[&str]| {
         std::process::Command::new("sudo")
             .arg("-n")
@@ -198,9 +205,7 @@ fn uhr_as_root(args: &[&str], recording: &Path) -> Option<()> {
     if !sudo(&["true"]) {
         return None;
     }
-    let mut command = vec![common::UHR];
-    command.extend(args);
-    assert!(sudo(&command), "sudo uhr {args:?} failed");
+    assert!(sudo(command), "sudo {command:?} failed");
     let owner = format!("{}:{}", unsafe { libc::getuid() }, unsafe {
         libc::getgid()
     });
@@ -309,4 +314,30 @@ fn tells_its_own_programs_apart() {
     let rows = syscalls["rows"].as_array().unwrap();
     let own = rows.iter().find(|r| r["own_programs"] == true).unwrap();
     assert_eq!(own["share"].as_f64().unwrap(), share, "{syscalls}");
+}
+
+#[test]
+fn counts_no_syscalls_in_a_pid_namespace_of_its_own() {
+    let _turn = one_at_a_time();
+    let dir = scratch("syscalls_pid_namespace");
+    let program = dir.join("syscalls");
+    compile("syscalls", &program, "-O2");
+    let recording = dir.join("rec");
+    let rec = recording.to_str().unwrap();
+    // With a /proc of its own, for perf.
+    let unshare = ["unshare", "--pid", "--fork", "--mount-proc"];
+    let record = ["record", "-o", rec, "--", program.to_str().unwrap(), "2000"];
+    let command = [&unshare[..], &[common::UHR], &record].concat();
+    if as_root(&command, &recording).is_none() {
+        eprintln!("skipped: needs root through sudo without a password");
+        return;
+    }
+    let manifest: Value =
+        serde_json::from_slice(&fs::read(recording.join("manifest.json")).unwrap()).unwrap();
+    let missing = manifest["missing_signals"].as_array().unwrap();
+    assert!(
+        missing.iter().any(|m| m["signal"] == "syscall_calls"
+            && m["reason"].as_str().unwrap().contains("PID namespace")),
+        "{manifest}"
+    );
 }

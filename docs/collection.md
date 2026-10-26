@@ -192,8 +192,10 @@ from tracepoints, such as wakeups and syscall latency.
   for traced ones. They follow the processes the target starts, and count a
   launched target from its exec on.
 - `uhr record` runs them when it may load eBPF, as root or with CAP_BPF and
-  CAP_PERFMON, unless `--no-syscalls`. Otherwise the recording says why it
-  has no syscall counts.
+  CAP_PERFMON, unless `--no-syscalls`. They know processes by their ids in
+  the kernel's first PID namespace, so uhr also has to run there, not in a
+  container's own. Otherwise the recording says why it has no syscall
+  counts.
 - Their overhead is the target's CPU time in them, from its samples, and a
   query gives the share of its own time in them. That leaves out the
   kernel's way into them and their cost to other processes. The kernel's

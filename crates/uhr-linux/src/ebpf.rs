@@ -34,6 +34,13 @@ pub enum Error {
     Map(&'static str, #[source] aya::maps::MapError),
     #[error("uhr's eBPF programs have no {0}")]
     Missing(&'static str),
+    #[error(
+        "uhr runs in a PID namespace of its own, as in a container, and its eBPF programs know \
+         processes by their ids outside it"
+    )]
+    PidNamespace,
+    #[error("reading uhr's PID namespace")]
+    Namespace(#[source] io::Error),
 }
 
 impl Error {
@@ -258,9 +265,27 @@ fn raw_tracepoint<'a>(
 
 fn load() -> Result<Ebpf, Error> {
     #[cfg(uhr_ebpf)]
-    return Ebpf::load(PROGRAMS).map_err(|e| Error::Load(e).or_not_permitted());
+    {
+        check_namespace()?;
+        Ebpf::load(PROGRAMS).map_err(|e| Error::Load(e).or_not_permitted())
+    }
     #[cfg(not(uhr_ebpf))]
     Err(Error::NotBuilt)
+}
+
+/// The inode of the kernel's first PID namespace, which is fixed.
+const FIRST_PID_NAMESPACE: u64 = 0xEFFF_FFFC;
+
+/// The programs see processes by their ids in the kernel's first PID
+/// namespace, and uhr knows them by their ids in its own.
+#[cfg_attr(not(uhr_ebpf), allow(dead_code))]
+fn check_namespace() -> Result<(), Error> {
+    let namespace =
+        rustix::fs::stat("/proc/self/ns/pid").map_err(|e| Error::Namespace(e.into()))?;
+    if namespace.st_ino != FIRST_PID_NAMESPACE {
+        return Err(Error::PidNamespace);
+    }
+    Ok(())
 }
 
 fn row(pid: u32, tid: u32, number: u32, calls: u64, ns: u64, buckets: &[u64]) -> SyscallCalls {
