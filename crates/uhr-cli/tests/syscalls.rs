@@ -35,10 +35,12 @@ fn the_time_is_in_the_kernel_on_behalf_of_read_zero() {
     compile("syscalls", &program, "-O2");
     let recording = dir.join("rec");
     let recording = recording.to_str().unwrap();
+    // As root, uhr's syscall programs would take part of the time.
     let output = uhr(&[
         "record",
         "-o",
         recording,
+        "--no-syscalls",
         "--",
         program.to_str().unwrap(),
         "200000",
