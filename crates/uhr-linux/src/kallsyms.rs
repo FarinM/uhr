@@ -268,6 +268,7 @@ ffffffffc000a000 t bpf_prog_ee0e253c78993a24_sd_fw_ingress\t[bpf]
             mapping,
             file_offset: None,
             return_address,
+            interpreted: None,
         }
     }
 

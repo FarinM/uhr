@@ -2,9 +2,9 @@ use std::collections::HashMap;
 
 use serde::Serialize;
 
-use crate::recording::{KERNEL, Origin, Recording, bpf_program};
-use crate::runtimes::{JitCode, binary_runtime, jit_code};
-use crate::symbols::{FrameName, InlineFrame, Symbols};
+use crate::recording::{InterpretedCode, KERNEL, Origin, Recording, bpf_program};
+use crate::runtimes::{JitCode, RUNTIMES, binary_runtime, jit_code};
+use crate::symbols::{FrameName, Symbols};
 
 /// One function, or the unnamed code of one module.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -93,16 +93,18 @@ enum Code<'a> {
         file: Option<&'a str>,
         line: Option<u32>,
     },
-    /// Code a runtime compiled, which moves from run to run, by what the
-    /// runtime called it.
+    /// Code a runtime compiled or interpreted, which moves from run to run,
+    /// by what the runtime called it.
     Jit(Jit<'a>),
+    /// Interpreted code of this runtime that could not be read.
+    Unnamed(&'a str),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Jit<'a> {
     /// One of the program's functions, as its id names it.
     Function {
-        runtime: &'static str,
+        runtime: &'a str,
         file: &'a str,
         name: Option<&'a str>,
         /// Only for an anonymous function.
@@ -113,7 +115,10 @@ enum Jit<'a> {
     Named(&'a str),
 }
 
-type Key<'a> = (Origin, Option<Module<'a>>, Code<'a>);
+/// A runtime's code has no origin in its key: a function is the same
+/// whether a perf map named its compiled code or uhr read it from the
+/// interpreter's frames.
+type Key<'a> = (Option<Origin>, Option<Module<'a>>, Code<'a>);
 
 /// Why no single function matched what was asked for.
 #[derive(Debug, thiserror::Error)]
@@ -170,8 +175,8 @@ impl Functions {
         let mut roles = Vec::new();
         let mut line_ids: HashMap<(&'a str, u32), u32> = HashMap::new();
         let mut lines = Vec::new();
-        let mut line = |call: &'a InlineFrame| {
-            let place = call.file.as_deref().zip(call.line)?;
+        let mut line = |place: Option<(&'a str, u32)>| {
+            let place = place?;
             Some(*line_ids.entry(place).or_insert_with(|| {
                 lines.push(SourceLine {
                     file: place.0.to_owned(),
@@ -194,14 +199,34 @@ impl Functions {
                 let mut function = |code: Code<'a>, make: &dyn Fn() -> Function| {
                     // The same runtime code in other processes, or other
                     // copies of it, is one function.
-                    let module = module.filter(|_| !matches!(code, Code::Jit(_)));
-                    *ids.entry((frame.origin, module, code)).or_insert_with(|| {
+                    let runtime = matches!(code, Code::Jit(_) | Code::Unnamed(_));
+                    let module = module.filter(|_| !runtime);
+                    let origin = (!runtime).then_some(frame.origin);
+                    *ids.entry((origin, module, code)).or_insert_with(|| {
                         let function = make();
                         roles.push(role(&function, code));
                         functions.push(function);
                         functions.len() as u32 - 1
                     })
                 };
+                if let Some(interpreted) = frame.interpreted.filter(|_| symbols.is_some()) {
+                    let code = &recording.interpreted_code[interpreted.code as usize];
+                    let key = match (&code.name, &code.file) {
+                        (Some(name), Some(file)) => Code::Jit(Jit::Function {
+                            runtime: &code.runtime,
+                            file,
+                            name: Some(name),
+                            start: None,
+                        }),
+                        _ => Code::Unnamed(&code.runtime),
+                    };
+                    let id = function(key, &|| interpreted_function(code));
+                    let place = code.file.as_deref().zip(interpreted.line);
+                    return vec![Step {
+                        function: id,
+                        line: line(place),
+                    }];
+                }
                 if let Some(symbol) = symbols.and(recording.jit_symbol(frame)) {
                     let code = jit_code(&symbol.name);
                     let key = match code {
@@ -283,7 +308,7 @@ impl Functions {
                         });
                         Step {
                             function: id,
-                            line: line(call),
+                            line: line(call.file.as_deref().zip(call.line)),
                         }
                     })
                     .collect();
@@ -312,7 +337,7 @@ impl Functions {
                 });
                 chain.push(Step {
                     function: id,
-                    line: inline.last().and_then(&mut line),
+                    line: line(inline.last().and_then(|o| o.file.as_deref().zip(o.line))),
                 });
                 chain
             })
@@ -405,8 +430,11 @@ impl Functions {
 }
 
 fn role(function: &Function, code: Code) -> Role {
+    let known = |name: &str| RUNTIMES.iter().find(|r| r.name() == name).map(|r| r.name());
     match code {
-        Code::Jit(Jit::Function { runtime, .. }) => Role::Program(runtime),
+        Code::Jit(Jit::Function { runtime, .. }) | Code::Unnamed(runtime) => {
+            known(runtime).map_or(Role::Other, Role::Program)
+        }
         Code::Jit(Jit::Named(name)) => match jit_code(name) {
             Some(JitCode {
                 runtime,
@@ -433,17 +461,11 @@ fn jit_function(name: &str, code: Option<JitCode>) -> Function {
         Some(JitCode {
             runtime,
             function: Some(function),
-        }) => {
-            let named = match (function.name, function.start) {
-                (Some(name), _) => escape(name),
-                (None, start) => format!("@{}", escape(start.unwrap_or_default())),
-            };
-            (
-                format!("jit+{runtime}:{named}:{}", function.file),
-                function.name.unwrap_or("(anonymous)").to_owned(),
-                Some(function.file.to_owned()),
-            )
-        }
+        }) => (
+            program_id(runtime, function.name, function.start, function.file),
+            function.name.unwrap_or("(anonymous)").to_owned(),
+            Some(function.file.to_owned()),
+        ),
         Some(JitCode { runtime, .. }) => (format!("jit+{runtime}+{name}"), name.to_owned(), None),
         None => (format!("jit:{name}"), name.to_owned(), None),
     };
@@ -461,6 +483,31 @@ fn jit_function(name: &str, code: Option<JitCode>) -> Function {
 }
 
 /// Escapes what ends a name in a JIT id, so that no two functions share one.
+fn interpreted_function(code: &InterpretedCode) -> Function {
+    let named = code.name.as_deref().zip(code.file.as_deref());
+    Function {
+        id: named.map(|(name, file)| program_id(&code.runtime, Some(name), None, file)),
+        name: code.name.clone(),
+        placeholder: None,
+        inlined: false,
+        module: Some(format!("[{}]", code.runtime)),
+        build_id: None,
+        function_address: None,
+        file: code.file.clone(),
+        origin: Origin::Interpreted,
+    }
+}
+
+/// The id of one of the program's functions, which a runtime compiled or
+/// interpreted.
+fn program_id(runtime: &str, name: Option<&str>, start: Option<&str>, file: &str) -> String {
+    let named = match (name, start) {
+        (Some(name), _) => escape(name),
+        (None, start) => format!("@{}", escape(start.unwrap_or_default())),
+    };
+    format!("jit+{runtime}:{named}:{file}")
+}
+
 fn escape(name: &str) -> String {
     let mut escaped = String::with_capacity(name.len());
     for c in name.chars() {

@@ -37,6 +37,7 @@ fn recording() -> Recording {
             mapping: Some(0),
             file_offset: Some(address as u64),
             return_address: false,
+            interpreted: None,
         })
         .collect();
     frames.push(Frame {
@@ -45,6 +46,7 @@ fn recording() -> Recording {
         mapping: None,
         file_offset: None,
         return_address: false,
+        interpreted: None,
     });
     let stacks: Vec<(Vec<u32>, u64)> = vec![
         (vec![3, 1, 0], 6),
@@ -111,6 +113,7 @@ fn recording() -> Recording {
         off_cpu: Vec::new(),
         kernel_symbols: Vec::new(),
         jit_symbols: Vec::new(),
+        interpreted_code: Vec::new(),
         syscall_calls: Vec::new(),
     }
 }

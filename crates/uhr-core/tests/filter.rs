@@ -60,6 +60,7 @@ fn recording() -> Recording {
             mapping: None,
             file_offset: None,
             return_address: false,
+            interpreted: None,
         }],
         stacks: vec![vec![0]],
         samples: vec![
@@ -72,6 +73,7 @@ fn recording() -> Recording {
         off_cpu: Vec::new(),
         kernel_symbols: Vec::new(),
         jit_symbols: Vec::new(),
+        interpreted_code: Vec::new(),
         syscall_calls: Vec::new(),
     }
 }

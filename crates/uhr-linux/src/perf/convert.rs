@@ -431,6 +431,7 @@ pub(super) fn convert(input: Input) -> Result<(Recording, Option<EbpfStacks>)> {
         off_cpu: state.off_cpu,
         kernel_symbols,
         jit_symbols: Vec::new(),
+        interpreted_code: Vec::new(),
         syscall_calls: Vec::new(),
     };
     Ok((recording, ebpf_stacks))
@@ -1158,6 +1159,7 @@ impl State {
                 mapping: self.find_mapping(&self.kernel_mappings, lookup),
                 file_offset: None,
                 return_address,
+                interpreted: None,
             },
             ChainContext::User => {
                 let mapping = self
@@ -1171,6 +1173,7 @@ impl State {
                         mapping,
                         file_offset: Some(address - m.start + m.file_offset),
                         return_address,
+                        interpreted: None,
                     },
                     _ => Frame {
                         origin: Origin::Unresolved,
@@ -1178,6 +1181,7 @@ impl State {
                         mapping: mapping.map(|id| self.own_mapping(id, pid)),
                         file_offset: None,
                         return_address,
+                        interpreted: None,
                     },
                 }
             }
@@ -1187,6 +1191,7 @@ impl State {
                 mapping: None,
                 file_offset: None,
                 return_address,
+                interpreted: None,
             },
         };
         intern(&mut self.frames, &mut self.frame_ids, frame)

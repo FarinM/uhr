@@ -73,7 +73,13 @@ pub(crate) fn of_stacks<'a>(
             if own_programs.as_ref().is_some_and(|own| own[id]) {
                 return Some(InSyscall::OwnPrograms);
             }
-            let whole = depth_limit.is_some_and(|limit| stack.len() < limit);
+            // Interpreter frames come from the interpreter's memory, not the
+            // walk the limit cuts.
+            let native = stack
+                .iter()
+                .filter(|&&frame| recording.frames[frame as usize].origin != Origin::Interpreted)
+                .count();
+            let whole = depth_limit.is_some_and(|limit| native < limit);
             let (mut syscall, mut path, mut outermost) = (None, false, None);
             // Leaf first, so the last kernel function is where the kernel
             // was entered.

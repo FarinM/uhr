@@ -21,6 +21,7 @@ const STACKS: &str = "stacks.parquet";
 const SAMPLES: &str = "samples.parquet";
 const KERNEL_SYMBOLS: &str = "kernel_symbols.parquet";
 const JIT_SYMBOLS: &str = "jit_symbols.parquet";
+const INTERPRETED_CODE: &str = "interpreted_code.parquet";
 const SYSCALL_CALLS: &str = "syscall_calls.parquet";
 const OFF_CPU: &str = "off_cpu.parquet";
 
@@ -126,6 +127,7 @@ pub struct Recording {
     pub kernel_symbols: Vec<KernelSymbol>,
     /// Sorted by pid and start, and not overlapping in a process.
     pub jit_symbols: Vec<JitSymbol>,
+    pub interpreted_code: Vec<InterpretedCode>,
     pub syscall_calls: Vec<SyscallCalls>,
 }
 
@@ -182,6 +184,16 @@ pub struct Frame {
     /// Return addresses point one instruction past the call, so symbol
     /// lookup must step back into the call.
     pub return_address: bool,
+    /// For an interpreted frame, the code it ran and where in it.
+    pub interpreted: Option<Interpreted>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Interpreted {
+    /// Its row in `interpreted_code`.
+    pub code: u32,
+    /// The line it was at, when the runtime says.
+    pub line: Option<u32>,
 }
 
 /// Where the code lives, decided from the mappings at record time. Whether
@@ -194,6 +206,8 @@ pub enum Origin {
     /// Code a runtime compiled as it ran, which the runtime named in its
     /// perf map.
     Jit,
+    /// Code an interpreter ran, whose frames uhr read from its memory.
+    Interpreted,
     /// No known code mapping contains the address.
     Unresolved,
 }
@@ -204,6 +218,7 @@ impl Origin {
             Origin::Binary => "binary",
             Origin::Kernel => "kernel",
             Origin::Jit => "jit",
+            Origin::Interpreted => "interpreted",
             Origin::Unresolved => "unresolved",
         }
     }
@@ -213,6 +228,7 @@ impl Origin {
             "binary" => Origin::Binary,
             "kernel" => Origin::Kernel,
             "jit" => Origin::Jit,
+            "interpreted" => Origin::Interpreted,
             "unresolved" => Origin::Unresolved,
             _ => return Err(format!("unknown frame origin {value:?}")),
         })
@@ -229,6 +245,20 @@ pub struct JitSymbol {
     /// Exclusive.
     pub end: u64,
     pub name: String,
+}
+
+/// Code an interpreter ran, as uhr read it from the process's memory while
+/// recording, the only time it could.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InterpretedCode {
+    pub pid: u32,
+    pub runtime: String,
+    /// Where the runtime kept it.
+    pub address: u64,
+    /// `None` if it could not be read, as when the process freed it first.
+    pub name: Option<String>,
+    pub file: Option<String>,
+    pub first_line: Option<u32>,
 }
 
 /// The calls a thread made to one syscall during the capture.
@@ -385,6 +415,7 @@ impl Recording {
             off_cpu: read_off_cpu(dir)?,
             kernel_symbols: read_kernel_symbols(dir)?,
             jit_symbols: read_jit_symbols(dir)?,
+            interpreted_code: read_interpreted_code(dir)?,
             syscall_calls: read_syscall_calls(dir)?,
         };
         recording
@@ -527,6 +558,20 @@ impl Recording {
                     "return_address",
                     frames.iter().map(|f| f.return_address).collect(),
                 ),
+                Column::optional_u32(
+                    "code_id",
+                    frames
+                        .iter()
+                        .map(|f| f.interpreted.map(|i| i.code))
+                        .collect(),
+                ),
+                Column::optional_u32(
+                    "line",
+                    frames
+                        .iter()
+                        .map(|f| f.interpreted.and_then(|i| i.line))
+                        .collect(),
+                ),
             ],
         )?;
 
@@ -590,6 +635,20 @@ impl Recording {
             ],
         )?;
 
+        let code = &self.interpreted_code;
+        table::write(
+            &dir.join(INTERPRETED_CODE),
+            vec![
+                Column::u32("code_id", ids(code.len())),
+                Column::u32("pid", code.iter().map(|c| c.pid).collect()),
+                Column::string("runtime", code.iter().map(|c| c.runtime.as_str()).collect()),
+                Column::u64("address", code.iter().map(|c| c.address).collect()),
+                Column::optional_string("name", code.iter().map(|c| c.name.as_deref()).collect()),
+                Column::optional_string("file", code.iter().map(|c| c.file.as_deref()).collect()),
+                Column::optional_u32("first_line", code.iter().map(|c| c.first_line).collect()),
+            ],
+        )?;
+
         let calls = &self.syscall_calls;
         let latency: Vec<Vec<u64>> = calls.iter().map(|c| c.latency.clone()).collect();
         table::write(
@@ -619,6 +678,21 @@ impl Recording {
         for (id, frame) in self.frames.iter().enumerate() {
             if let Some(mapping) = frame.mapping {
                 check_id("frame", id, "mapping", mapping, self.mappings.len())?;
+            }
+            if (frame.origin == Origin::Interpreted) != frame.interpreted.is_some() {
+                return Err(format!(
+                    "frame {id} must have interpreted code if and only if it is interpreted"
+                ));
+            }
+            if let Some(interpreted) = frame.interpreted {
+                let code = interpreted.code;
+                check_id(
+                    "frame",
+                    id,
+                    "interpreted code",
+                    code,
+                    self.interpreted_code.len(),
+                )?;
             }
         }
         for (id, stack) in self.stacks.iter().enumerate() {
@@ -767,6 +841,8 @@ fn read_frames(dir: &Path) -> Result<Vec<Frame>> {
     let mapping = table.optional_u32("mapping_id")?;
     let file_offset = table.optional_u64("file_offset")?;
     let return_address = table.bool("return_address")?;
+    let code = table.optional_u32("code_id")?;
+    let line = table.optional_u32("line")?;
     (0..table.len())
         .map(|i| {
             Ok(Frame {
@@ -775,6 +851,10 @@ fn read_frames(dir: &Path) -> Result<Vec<Frame>> {
                 mapping: mapping[i],
                 file_offset: file_offset[i],
                 return_address: return_address[i],
+                interpreted: code[i].map(|code| Interpreted {
+                    code,
+                    line: line[i],
+                }),
             })
         })
         .collect()
@@ -871,6 +951,27 @@ fn read_jit_symbols(dir: &Path) -> Result<Vec<JitSymbol>> {
             start: start[i],
             end: end[i],
             name: std::mem::take(&mut name[i]),
+        })
+        .collect())
+}
+
+fn read_interpreted_code(dir: &Path) -> Result<Vec<InterpretedCode>> {
+    let table = Table::read(&dir.join(INTERPRETED_CODE))?;
+    check_ids(&table, "code_id")?;
+    let pid = table.u32("pid")?;
+    let mut runtime = table.string("runtime")?;
+    let address = table.u64("address")?;
+    let mut name = table.optional_string("name")?;
+    let mut file = table.optional_string("file")?;
+    let first_line = table.optional_u32("first_line")?;
+    Ok((0..table.len())
+        .map(|i| InterpretedCode {
+            pid: pid[i],
+            runtime: std::mem::take(&mut runtime[i]),
+            address: address[i],
+            name: name[i].take(),
+            file: file[i].take(),
+            first_line: first_line[i],
         })
         .collect())
 }

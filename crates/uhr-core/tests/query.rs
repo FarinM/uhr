@@ -20,6 +20,7 @@ fn frame(address: u64, mapping: Option<u32>) -> Frame {
         mapping,
         file_offset: mapping.map(|_| address),
         return_address: false,
+        interpreted: None,
     }
 }
 
@@ -82,6 +83,7 @@ fn recording() -> Recording {
         off_cpu: Vec::new(),
         kernel_symbols: Vec::new(),
         jit_symbols: Vec::new(),
+        interpreted_code: Vec::new(),
         syscall_calls: Vec::new(),
     }
 }
@@ -1040,6 +1042,7 @@ fn kernel_sample(
             mapping: Some(kernel),
             file_offset: None,
             return_address: false,
+            interpreted: None,
         });
         symbols
             .function_addresses
@@ -1120,6 +1123,7 @@ fn with_syscalls() -> (Recording, Symbols) {
         mapping: None,
         file_offset: None,
         return_address: false,
+        interpreted: None,
     });
     symbols.function_addresses.push(None);
     symbols.names.push(None);
@@ -1164,6 +1168,50 @@ fn groups_by_the_syscall_on_the_stack() {
     recording.manifest.platform.os = "freebsd".into();
     let result = run(&recording, Some(&symbols), &query).unwrap();
     assert_eq!(syscall_rows(&result), unknown);
+}
+
+#[test]
+fn judges_the_depth_limit_by_native_frames() {
+    let (mut recording, mut symbols) = with_syscalls();
+    let fault = [Some("handle_mm_fault"), Some("asm_exc_page_fault")];
+    kernel_sample(&mut recording, &mut symbols, &fault, 6);
+    // Python deeper than the native limit, which handled the fault.
+    recording.interpreted_code.push(InterpretedCode {
+        pid: 1,
+        runtime: "python".into(),
+        address: 0x9000,
+        name: Some("deep".into()),
+        file: Some("/app/deep.py".into()),
+        first_line: Some(1),
+    });
+    for depth in 0..3 {
+        let id = recording.frames.len() as u32;
+        recording.frames.push(Frame {
+            origin: Origin::Interpreted,
+            address: 0x9010 + depth,
+            mapping: None,
+            file_offset: None,
+            return_address: false,
+            interpreted: Some(Interpreted {
+                code: 0,
+                line: None,
+            }),
+        });
+        symbols.function_addresses.push(None);
+        symbols.names.push(Some(FrameName::Symbol("deep".into())));
+        symbols.inline.push(Vec::new());
+        recording.stacks.last_mut().unwrap().push(id);
+    }
+    let query = Query {
+        group_by: GroupBy::Syscall,
+        ..query(10)
+    };
+    let result = run(&recording, Some(&symbols), &query).unwrap();
+    assert!(
+        syscall_rows(&result).contains(&(Some(false), None, 18)),
+        "{:?}",
+        syscall_rows(&result)
+    );
 }
 
 /// Threads go off CPU in the kernel, so a stack without kernel functions
@@ -1366,6 +1414,7 @@ fn with_jit() -> (Recording, Symbols) {
             mapping: Some(recording.mappings.len() as u32 - 1),
             file_offset: None,
             return_address: false,
+            interpreted: None,
         });
         recording.jit_symbols.push(JitSymbol {
             pid,
@@ -1432,6 +1481,96 @@ fn groups_code_runtimes_compiled_by_their_names() {
     );
 }
 
+/// Adds to `with_jit` the interpreter's frames of another process: `inner`
+/// at line 7, under `outer` at line 3, and code uhr could not read, each
+/// sampled for 1.
+fn with_interpreted() -> (Recording, Symbols) {
+    let (mut recording, mut symbols) = with_jit();
+    let code = [
+        (Some("inner"), Some("/app/spin.py")),
+        (Some("outer"), Some("/app/spin.py")),
+        (None, None),
+    ];
+    for (address, (name, file)) in (0x5000..).step_by(0x1000).zip(code) {
+        recording.interpreted_code.push(InterpretedCode {
+            pid: 3,
+            runtime: "python".into(),
+            address,
+            name: name.map(str::to_owned),
+            file: file.map(str::to_owned),
+            first_line: name.map(|_| 1),
+        });
+    }
+    let mut frame = |code: u32, line: Option<u32>| {
+        recording.frames.push(Frame {
+            origin: Origin::Interpreted,
+            address: 0x5000 + 0x1000 * u64::from(code) + 0x10,
+            mapping: None,
+            file_offset: None,
+            return_address: false,
+            interpreted: Some(Interpreted { code, line }),
+        });
+        let name = recording.interpreted_code[code as usize].name.clone();
+        symbols.names.push(name.map(FrameName::Symbol));
+        symbols.function_addresses.push(None);
+        symbols.inline.push(Vec::new());
+        recording.frames.len() as u32 - 1
+    };
+    let (inner, outer, unread) = (frame(0, Some(7)), frame(1, Some(3)), frame(2, None));
+    for stack in [vec![inner, outer, 3], vec![unread, outer, 3]] {
+        recording.stacks.push(stack);
+        recording
+            .samples
+            .push(sample(recording.stacks.len() as u32 - 1, 1));
+    }
+    (recording, symbols)
+}
+
+#[test]
+fn groups_interpreted_code_with_the_compiled_code_of_the_function() {
+    let (recording, symbols) = with_interpreted();
+    let result = run(&recording, Some(&symbols), &query(20)).unwrap();
+    let row = |id: Option<&str>, name: Option<&str>| {
+        let rows = function_rows(&result).iter();
+        let mut rows =
+            rows.filter(|r| r.function.id.as_deref() == id && r.function.name.as_deref() == name);
+        let row = rows
+            .next()
+            .unwrap_or_else(|| panic!("no row {id:?} {name:?}"));
+        assert!(rows.next().is_none(), "two rows {id:?} {name:?}");
+        row
+    };
+    let inner = row(Some("jit+python:inner:/app/spin.py"), Some("inner"));
+    assert_eq!((inner.self_ns, inner.total_ns), (3, 3));
+    assert_eq!(inner.function.module.as_deref(), Some("[python]"));
+    let outer = row(Some("jit+python:outer:/app/spin.py"), Some("outer"));
+    assert_eq!((outer.self_ns, outer.total_ns), (0, 2));
+    assert_eq!(outer.function.origin, Origin::Interpreted);
+    let unread: Vec<_> = function_rows(&result)
+        .iter()
+        .filter(|r| r.function.origin == Origin::Interpreted && r.function.name.is_none())
+        .map(|r| (r.function.id.as_deref(), r.self_ns))
+        .collect();
+    assert_eq!(unread, [(None, 1)]);
+
+    let mut by_line = query(20);
+    by_line.group_by = GroupBy::Line;
+    let result = run(&recording, Some(&symbols), &by_line).unwrap();
+    let at = |name: &str| {
+        let rows = function_rows(&result).iter();
+        let lines = rows.filter(|r| r.function.name.as_deref() == Some(name));
+        lines
+            .map(|r| r.line.as_ref().map(|l| (l.file.as_str(), l.line)))
+            .collect::<Vec<_>>()
+    };
+    assert!(
+        at("inner").contains(&Some(("/app/spin.py", 7))),
+        "{:?}",
+        at("inner")
+    );
+    assert_eq!(at("outer"), [Some(("/app/spin.py", 3))]);
+}
+
 /// Adds a frame in `mapping`, named `name` at the function `start`.
 fn named_frame(
     recording: &mut Recording,
@@ -1478,6 +1617,7 @@ fn with_interpreter() -> (Recording, Symbols) {
         mapping: Some(mapping),
         file_offset: Some(address),
         return_address: false,
+        interpreted: None,
     };
     let jit = |address| Frame {
         origin: Origin::Jit,
@@ -1485,6 +1625,7 @@ fn with_interpreter() -> (Recording, Symbols) {
         mapping: Some(anon),
         file_offset: None,
         return_address: false,
+        interpreted: None,
     };
     let mut add =
         |frame, name: &str, start| named_frame(&mut recording, &mut symbols, frame, name, start);

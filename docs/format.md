@@ -18,6 +18,7 @@ A recording is a directory:
 | `off_cpu.parquet` | Times threads spent off CPU, with why and where |
 | `kernel_symbols.parquet` | The kernel functions kernel frames fall in, read while recording |
 | `jit_symbols.parquet` | The code runtimes compiled that frames fall in, named in the runtimes' perf maps while recording |
+| `interpreted_code.parquet` | The code interpreted frames ran, read from the interpreters' memory while recording |
 | `syscall_calls.parquet` | How often each thread called each syscall, and how long the calls took |
 | `symbols.parquet` | Function name per frame, after symbol resolution |
 | `symbol_sources.parquet` | Files the names came from, and why some frames have none |
@@ -111,11 +112,13 @@ Each stream has:
 | Column | Type | Meaning |
 |---|---|---|
 | `frame_id` | uint32 | |
-| `origin` | string | `binary`, `kernel`, `jit` or `unresolved`. See [frames](model.md#frames). `jit` is code a runtime compiled in anonymous memory, which its perf map names |
+| `origin` | string | `binary`, `kernel`, `jit`, `interpreted` or `unresolved`. See [frames](model.md#frames). `jit` is code a runtime compiled in anonymous memory, which its perf map names. `interpreted` is a frame of an interpreter, such as CPython's, which uhr read from its memory |
 | `address` | uint64 | Address in the process, or in the kernel |
 | `mapping_id` | uint32, nullable | Region containing the address. Null if none is known |
 | `file_offset` | uint64, nullable | Offset in the mapped file. Null without a file mapping |
 | `return_address` | bool | True if the address is a return address, which points one instruction past the call |
+| `code_id` | uint32, nullable | For an `interpreted` frame, its row in `interpreted_code`, and null for any other. Its `address` is where in the code it was, as the interpreter keeps it |
+| `line` | uint32, nullable | For an `interpreted` frame, the source line it was at. Null if the interpreter does not say |
 
 `stacks`:
 
@@ -180,6 +183,22 @@ newer name holds, so samples of the older code there get the newer name.
 | `start`, `end` | uint64 | Address range, end exclusive |
 | `name` | string | As the runtime wrote it, as in `py::inner:/app/spin.py` or `JS:*parse /app/x.js:42:7` |
 
+`interpreted_code`, one row per piece of code interpreted frames ran in a
+process, such as a Python function's code object. uhr reads it from the
+process's memory while recording, the only time it can. A process can free
+code and put other code at its address later, which then keeps the name of
+the first.
+
+| Column | Type | Meaning |
+|---|---|---|
+| `code_id` | uint32 | |
+| `pid` | uint32 | The process that ran it |
+| `runtime` | string | As in `python` |
+| `address` | uint64 | Where the process kept it |
+| `name` | string, nullable | The function's name, as in `Pool.acquire`. Null if the code could not be read, as when the process freed it before uhr read it |
+| `file` | string, nullable | Its source file |
+| `first_line` | uint32, nullable | The line it starts at |
+
 `syscall_calls`, one row per thread and syscall, from uhr's eBPF programs.
 They count the target's processes and those they start, from the first
 syscall after the target's exec, and when attached from the attach on.
@@ -220,9 +239,10 @@ and name in its kernel symbol, `bpf_prog_<tag>_<name>`, and has the id
 again keeps the id. Other such code, like BPF trampolines, groups by its
 kernel symbol and has no id.
 
-Code a runtime compiled moves from run to run, so it groups by what the
-runtime called it. One of the program's functions, from a name uhr can read,
-groups by its runtime, file and name across processes, and has the id
+Code a runtime compiled or interpreted moves from run to run, so it groups
+by what the runtime called it. One of the program's functions, from a name
+uhr can read, groups by its runtime, file and name across processes, whether
+a perf map named it or uhr read it from the interpreter, and has the id
 `jit+<runtime>:<name>:<file>`, as in `jit+python:inner:/app/spin.py`. The
 name has `%`, `:` and `@` escaped as `%25`, `%3A` and `%40`, so no two
 functions share an id. An anonymous one has `@` and where it starts, escaped
@@ -231,7 +251,8 @@ module is its runtime in brackets, as in `[python]` or `[node]`, and its
 file is the source file. Other code, such as V8's builtins, groups by its
 name in the map, with the id `jit+<runtime>+<name>`, as in
 `jit+node+Builtin:ArrayPrototypePush`, or `jit:<name>` for a runtime uhr
-does not know. V8 inlines functions into
+does not know. Interpreted code uhr could not read groups into one function
+per runtime, with no name or id. V8 inlines functions into
 the code it optimizes, and its map cannot say so, so their time counts for
 the function they were inlined into.
 
@@ -264,7 +285,8 @@ a placeholder still counts as named; rejected debug candidates supply no names.
 
 `symbol_sources`, one row per file. A frame's source is the row whose `path`
 and `build_id` match the frame's mapping. Kernel frames share one row with
-path `[kernel]`, and JIT frames one with path `[jit]`.
+path `[kernel]`, JIT frames one with path `[jit]`, and interpreted frames
+one per runtime, as in `[python]`.
 
 | Column | Type | Meaning |
 |---|---|---|

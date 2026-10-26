@@ -112,6 +112,7 @@ fn example() -> Recording {
                 mapping: Some(0),
                 file_offset: Some(0x10),
                 return_address: false,
+                interpreted: None,
             },
             Frame {
                 origin: Origin::Unresolved,
@@ -119,9 +120,21 @@ fn example() -> Recording {
                 mapping: None,
                 file_offset: None,
                 return_address: true,
+                interpreted: None,
+            },
+            Frame {
+                origin: Origin::Interpreted,
+                address: 0x7f00_0000_2042,
+                mapping: None,
+                file_offset: None,
+                return_address: false,
+                interpreted: Some(Interpreted {
+                    code: 0,
+                    line: Some(12),
+                }),
             },
         ],
-        stacks: vec![vec![0, 1], vec![1]],
+        stacks: vec![vec![0, 1], vec![1], vec![2, 0]],
         samples: vec![
             Sample {
                 time_ns: 2_000,
@@ -186,6 +199,24 @@ fn example() -> Recording {
                 start: 0x7f00_0000_1080,
                 end: 0x7f00_0000_10c0,
                 name: "py::outer:/app/spin.py".into(),
+            },
+        ],
+        interpreted_code: vec![
+            InterpretedCode {
+                pid: 7,
+                runtime: "python".into(),
+                address: 0x7f00_0000_2000,
+                name: Some("Pool.acquire".into()),
+                file: Some("/app/pool.py".into()),
+                first_line: Some(10),
+            },
+            InterpretedCode {
+                pid: 7,
+                runtime: "python".into(),
+                address: 0x7f00_0000_3000,
+                name: None,
+                file: None,
+                first_line: None,
             },
         ],
         syscall_calls: vec![
@@ -261,6 +292,32 @@ fn rejects_dangling_references() {
         Error::Invalid { path, reason } => {
             assert_eq!(path, dir);
             assert!(reason.contains("stack 0 refers to frame 1"), "{reason}");
+        }
+        error => panic!("{error}"),
+    }
+}
+
+#[test]
+fn rejects_interpreted_frames_without_their_code() {
+    let dir = scratch("interpreted_dangling");
+    example().write(&dir).unwrap();
+    let other = scratch("interpreted_dangling_other");
+    let mut no_code = example();
+    no_code.frames.truncate(2);
+    no_code.stacks.truncate(2);
+    no_code.interpreted_code.clear();
+    no_code.write(&other).unwrap();
+    fs::copy(
+        other.join("interpreted_code.parquet"),
+        dir.join("interpreted_code.parquet"),
+    )
+    .unwrap();
+    match Recording::read(&dir).unwrap_err() {
+        Error::Invalid { reason, .. } => {
+            assert!(
+                reason.contains("frame 2 refers to interpreted code 0"),
+                "{reason}"
+            );
         }
         error => panic!("{error}"),
     }

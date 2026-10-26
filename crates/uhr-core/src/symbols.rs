@@ -207,6 +207,7 @@ async fn resolve(recording: &Recording) -> Symbols {
     let mut by_file: BTreeMap<FileKey, Vec<(u32, u64)>> = BTreeMap::new();
     let mut kernel_frames = Vec::new();
     let mut jit_frames = Vec::new();
+    let mut interpreted_frames = Vec::new();
     for (id, frame) in recording.frames.iter().enumerate() {
         match (frame.origin, frame.mapping, frame.file_offset) {
             (Origin::Binary, Some(mapping), Some(offset)) => {
@@ -219,12 +220,18 @@ async fn resolve(recording: &Recording) -> Symbols {
             }
             (Origin::Kernel, ..) => kernel_frames.push(id),
             (Origin::Jit, ..) => jit_frames.push(id),
+            (Origin::Interpreted, ..) => interpreted_frames.push(id),
             _ => {}
         }
     }
     if !jit_frames.is_empty() {
         sources.push(resolve_jit(recording, &jit_frames, &mut names));
     }
+    sources.extend(resolve_interpreted(
+        recording,
+        &interpreted_frames,
+        &mut names,
+    ));
 
     if !kernel_frames.is_empty() {
         sources.push(resolve_kernel(
@@ -459,6 +466,41 @@ fn resolve_jit(recording: &Recording, frames: &[usize], names: &mut [Option<Fram
         status: SourceStatus::Resolved,
         detail: Some(format!("named {named} of {} frames", frames.len())),
     }
+}
+
+/// Names interpreted frames from the code uhr read while recording, with a
+/// source for each runtime.
+fn resolve_interpreted(
+    recording: &Recording,
+    frames: &[usize],
+    names: &mut [Option<FrameName>],
+) -> Vec<Source> {
+    let mut counts: BTreeMap<&str, (usize, usize)> = BTreeMap::new();
+    for &id in frames {
+        let Some(interpreted) = recording.frames[id].interpreted else {
+            continue;
+        };
+        let code = &recording.interpreted_code[interpreted.code as usize];
+        let (named, all) = counts.entry(&code.runtime).or_default();
+        *all += 1;
+        if let Some(name) = &code.name {
+            names[id] = Some(FrameName::Symbol(name.clone()));
+            *named += 1;
+        }
+    }
+    counts
+        .into_iter()
+        .map(|(runtime, (named, all))| Source {
+            path: format!("[{runtime}]"),
+            build_id: None,
+            status: if named > 0 {
+                SourceStatus::Resolved
+            } else {
+                SourceStatus::Unavailable
+            },
+            detail: Some(format!("named {named} of {all} frames")),
+        })
+        .collect()
 }
 
 /// Only names from the binary or a matching debug artifact are evidence.
@@ -1059,6 +1101,7 @@ mod tests {
                     mapping: None,
                     file_offset: None,
                     return_address: false,
+                    interpreted: None,
                 };
                 frames
             ],
@@ -1067,6 +1110,7 @@ mod tests {
             off_cpu: Vec::new(),
             kernel_symbols: Vec::new(),
             jit_symbols: Vec::new(),
+            interpreted_code: Vec::new(),
             syscall_calls: Vec::new(),
         }
     }
@@ -1104,6 +1148,7 @@ mod tests {
             mapping,
             file_offset: None,
             return_address,
+            interpreted: None,
         };
         recording.frames = vec![
             frame(0xffffffff81001020, Some(0), false),
