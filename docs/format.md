@@ -56,7 +56,7 @@ Each stream has:
 | Field | Meaning |
 |---|---|
 | `id` | Unique within the recording |
-| `collector` | `name` plus the collector's version and settings. For perf: `version`, `event`, `frequency_hz` (what perf sampled at), `requested_frequency_hz`, `unwinding` (`frame_pointers` or `dwarf`), `stack_copy_bytes` (user stack copied with each sample as perf used it, null without `dwarf`), `context_switches` (whether perf recorded every context switch). uhr's eBPF programs are `ebpf` |
+| `collector` | `name` plus the collector's version and settings. For perf: `version`, `event`, `frequency_hz` (what perf sampled at), `requested_frequency_hz`, `unwinding` (`frame_pointers` or `dwarf`), `stack_copy_bytes` (user stack copied with each sample as perf used it, null without `dwarf`), `context_switches` (whether perf recorded every context switch). uhr's eBPF programs are `ebpf`, with `programs`, their tags in hex, as in the kernel's names for their code: `bpf_prog_<tag>_<name>` |
 | `signals` | What was captured: `user_cpu_samples`, `kernel_cpu_samples`, `user_stacks`, `kernel_stacks`, `off_cpu_time` (when threads went off CPU and came back, and whether they were preempted), `off_cpu_stacks` (where they went off CPU), `syscall_calls` (how often threads called each syscall and how long the calls took) |
 | `missing_signals` | Signals requested but not captured, each with a `reason`. Without `kernel_cpu_samples`, CPU time spent in the kernel is not in the samples at all, not merely unnamed. Threads go off CPU in the kernel, so without kernel sampling `off_cpu_stacks` is missing too |
 | `coverage.lost_events` | Events the kernel dropped |
@@ -68,7 +68,7 @@ Each stream has:
 | `coverage.stacks.stacks_at_stack_limit` | Stacks that reached that depth. This and the next two count every stack: one per sample and one per switch out |
 | `coverage.stacks.stacks_cut_at_stack_copy` | Stacks that went on past the end of their stack copy, so their outer callers are missing. Null without `dwarf` |
 | `coverage.stacks.stacks_not_unwound` | Stacks of 32-bit code, which `dwarf` unwinding cannot walk. They keep only the instruction they were taken at. Null without `dwarf` |
-| `coverage.overhead_ns` | Profiler overhead. Null until it is measured |
+| `coverage.overhead_ns` | Profiler overhead. Null until it is measured. For `ebpf`, the target's CPU time in uhr's programs, from its samples. Null without kernel stacks, or their names, to find them by |
 | `coverage.known_biases` | Biases of this collector, in words |
 
 ## Tables

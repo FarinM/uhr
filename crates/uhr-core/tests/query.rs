@@ -417,6 +417,85 @@ fn keeps_kernel_code_outside_mappings_apart() {
     }
 }
 
+/// 6 of 18 in uhr's own program, and 2 in another with other instructions.
+fn with_own_programs() -> (Recording, Symbols) {
+    const OWN: &str = "bpf_prog_8782325c7cb17f7f_sys_enter";
+    const OTHER: &str = "bpf_prog_c8b47a902f1cc68b_sd_devices";
+    let (mut recording, mut symbols) = (recording(), symbols());
+    let mut perf = perf_stream();
+    perf.signals.push(Signal::KernelStacks);
+    recording.manifest.streams.push(perf);
+    recording.manifest.streams.push(Stream {
+        id: "ebpf".into(),
+        collector: Collector::Ebpf {
+            programs: vec!["8782325c7cb17f7f".into()],
+        },
+        signals: vec![Signal::SyscallCalls],
+        missing_signals: Vec::new(),
+        coverage: StreamCoverage {
+            lost_events: 0,
+            stacks: None,
+            overhead_ns: Some(6),
+            known_biases: Vec::new(),
+        },
+    });
+    let symbol = |start, name: &str| KernelSymbol {
+        start,
+        end: start + 0x800,
+        name: name.into(),
+        module: Some("bpf".into()),
+    };
+    recording.kernel_symbols = vec![symbol(0xc0001000, OWN), symbol(0xc0002000, OTHER)];
+    for (address, name, cpu_ns) in [(0xc0001010, OWN, 6), (0xc0002010, OTHER, 2)] {
+        recording.frames.push(frame(address, None));
+        recording
+            .stacks
+            .push(vec![recording.frames.len() as u32 - 1, 5, 3]);
+        recording
+            .samples
+            .push(sample(recording.stacks.len() as u32 - 1, cpu_ns));
+        symbols.names.push(Some(FrameName::Symbol(name.into())));
+        symbols.function_addresses.push(None);
+        symbols.inline.push(Vec::new());
+    }
+    (recording, symbols)
+}
+
+#[test]
+fn tells_the_time_in_uhrs_own_programs_apart() {
+    let (mut recording, symbols) = with_own_programs();
+    let result = run(&recording, Some(&symbols), &query(10)).unwrap();
+    assert_eq!(result.coverage.own_programs_share, Some(6.0 / 18.0));
+    let overhead = &result.coverage.recording.overhead_ns;
+    assert_eq!(overhead.get("ebpf"), Some(&6));
+    assert!(
+        result
+            .coverage
+            .recording
+            .unknown
+            .iter()
+            .all(|u| u != "profiler overhead of stream ebpf"),
+        "{:?}",
+        result.coverage.recording.unknown
+    );
+
+    // The kernel's frames have to be named, and sampled, to find them.
+    recording.manifest.kernel_symbols = KernelSymbols::Unavailable {
+        reason: "hidden".into(),
+    };
+    let result = run(&recording, Some(&symbols), &query(10)).unwrap();
+    assert_eq!(result.coverage.own_programs_share, None);
+    let (mut recording, symbols) = with_own_programs();
+    recording.manifest.streams[0].signals.pop();
+    let result = run(&recording, Some(&symbols), &query(10)).unwrap();
+    assert_eq!(result.coverage.own_programs_share, None);
+
+    let (mut recording, symbols) = with_own_programs();
+    recording.manifest.streams.pop();
+    let result = run(&recording, Some(&symbols), &query(10)).unwrap();
+    assert_eq!(result.coverage.own_programs_share, None);
+}
+
 #[test]
 fn merges_the_same_function_across_mappings_and_counts_recursion_once() {
     let mut recording = recording();
@@ -1054,7 +1133,9 @@ fn with_counted_calls() -> (Recording, Symbols) {
     let (mut recording, symbols) = with_syscalls();
     recording.manifest.streams.push(Stream {
         id: "ebpf".into(),
-        collector: Collector::Ebpf,
+        collector: Collector::Ebpf {
+            programs: Vec::new(),
+        },
         signals: vec![Signal::SyscallCalls],
         missing_signals: Vec::new(),
         coverage: StreamCoverage {

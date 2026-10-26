@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use serde::Serialize;
 
-use crate::recording::{KERNEL, Origin, Recording};
+use crate::recording::{KERNEL, Origin, Recording, bpf_program};
 use crate::runtimes::{JitCode, binary_runtime, jit_code};
 use crate::symbols::{FrameName, InlineFrame, Symbols};
 
@@ -472,17 +472,6 @@ fn escape(name: &str) -> String {
         }
     }
     escaped
-}
-
-/// The tag and name of a BPF program, from its kernel symbol
-/// `bpf_prog_<tag>` or `bpf_prog_<tag>_<name>`. The name tells apart
-/// functions with the same instructions.
-fn bpf_program(name: &str) -> Option<&str> {
-    let program = name.strip_prefix("bpf_prog_")?;
-    let tag = program.get(..16)?;
-    let tagged = tag.bytes().all(|b| b.is_ascii_hexdigit())
-        && matches!(program.as_bytes().get(16), None | Some(b'_'));
-    tagged.then_some(program)
 }
 
 /// 64-bit FNV-1a over the parts, each ended by a zero byte. Part of the

@@ -81,6 +81,8 @@ pub(crate) struct Counted {
     pub(crate) calls: Vec<SyscallCalls>,
     /// Calls that found the programs' table of calls full.
     pub(crate) lost: u64,
+    /// The programs' tags, in hex.
+    pub(crate) programs: Vec<String>,
 }
 
 pub(crate) struct Syscalls {
@@ -130,11 +132,15 @@ impl Syscalls {
     pub(crate) fn stop(self) -> Result<Stopped, Error> {
         let now = monotonic_ns();
         let Self { mut ebpf, links } = self;
-        // So the maps stay as they are while read.
+        let mut programs = Vec::new();
         for (program, link) in links {
-            tracepoint(&mut ebpf, program)?
+            let tracepoint = tracepoint(&mut ebpf, program)?;
+            // So the maps stay as they are while read.
+            tracepoint
                 .detach(link)
                 .map_err(|e| Error::Program(program, e))?;
+            let info = tracepoint.info().map_err(|e| Error::Program(program, e))?;
+            programs.push(format!("{:016x}", info.tag()));
         }
         let mut take = |name| ebpf.take_map(name).ok_or(Error::Missing(name));
         let (calls, starts, lost) = (take("CALLS")?, take("STARTS")?, take("LOST")?);
@@ -181,6 +187,7 @@ impl Syscalls {
             counted: Counted {
                 calls: rows.into_values().collect(),
                 lost,
+                programs,
             },
             programs: ebpf,
         })

@@ -347,21 +347,35 @@ fn add_syscalls(
                 "Syscalls of 32-bit code are named from the 64-bit table, so their names are \
                  wrong."
                     .to_owned(),
+                "The overhead is the target's CPU time in the eBPF programs, from its samples. It \
+                 leaves out the kernel's way into them, and their cost to other processes, whose \
+                 syscalls run them too."
+                    .to_owned(),
             ];
             if attached {
                 known_biases.push(
                     "Calls a thread was already in when uhr attached are left out.".to_owned(),
                 );
             }
+            let overhead_ns = recording.in_programs(&counted.programs).map(|own| {
+                recording
+                    .samples
+                    .iter()
+                    .filter(|s| own[s.stack as usize])
+                    .map(|s| s.cpu_ns)
+                    .sum()
+            });
             recording.manifest.streams.push(recording::Stream {
                 id: "ebpf".into(),
-                collector: Collector::Ebpf,
+                collector: Collector::Ebpf {
+                    programs: counted.programs,
+                },
                 signals: vec![recording::Signal::SyscallCalls],
                 missing_signals: Vec::new(),
                 coverage: StreamCoverage {
                     lost_events: counted.lost,
                     stacks: None,
-                    overhead_ns: None,
+                    overhead_ns,
                     known_biases,
                 },
             });

@@ -250,7 +250,7 @@ fn counts_every_call_of_each_syscall() {
 }
 
 #[test]
-fn names_its_own_programs() {
+fn tells_its_own_programs_apart() {
     let _turn = one_at_a_time();
     let dir = scratch("syscalls_own_programs");
     let program = dir.join("syscalls");
@@ -292,5 +292,16 @@ fn names_its_own_programs() {
             .iter()
             .any(|p| p.ends_with("_sys_enter") || p.ends_with("_sys_exit")),
         "{programs:?}"
+    );
+
+    let streams = manifest["streams"].as_array().unwrap();
+    let ebpf = streams.iter().find(|s| s["id"] == "ebpf").unwrap();
+    let overhead = ebpf["coverage"]["overhead_ns"].as_f64().unwrap();
+    let share = result["coverage"]["own_programs_share"].as_f64().unwrap();
+    let time_ns = result["time_ns"].as_f64().unwrap();
+    assert!(overhead > 0.0, "{ebpf}");
+    assert!(
+        (share * time_ns - overhead).abs() < 1.0,
+        "{share} of {time_ns}, {ebpf}"
     );
 }

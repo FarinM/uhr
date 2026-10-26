@@ -818,6 +818,9 @@ fn write_query(out: &mut impl Write, result: &QueryResult) -> io::Result<()> {
         writeln!(out, "  unnamed {}: {:.1}%", origin.as_str(), share * 100.0)?;
     }
     write_no_stack(out, coverage.no_stack_share)?;
+    if let Some(share) = coverage.own_programs_share {
+        writeln!(out, "  time in uhr's eBPF programs: {:.1}%", share * 100.0)?;
+    }
     write_symbol_coverage(out, &coverage.symbols)?;
     write_coverage(out, &coverage.recording)
 }
@@ -991,6 +994,13 @@ fn write_coverage(out: &mut impl Write, coverage: &Coverage) -> io::Result<()> {
             "  missing {}: {}",
             missing.signal.as_str(),
             missing.reason
+        )?;
+    }
+    for (stream, ns) in &coverage.overhead_ns {
+        writeln!(
+            out,
+            "  profiler overhead of stream {stream}: {} of CPU time",
+            seconds(*ns)
         )?;
     }
     for unknown in &coverage.unknown {

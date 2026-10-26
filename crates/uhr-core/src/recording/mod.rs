@@ -411,6 +411,48 @@ impl Recording {
         Some(&symbols[index]).filter(|s| address < s.end)
     }
 
+    /// Which stacks run uhr's own eBPF programs. `None` without them, or
+    /// without the names of kernel frames to find them by.
+    pub(crate) fn in_own_programs(&self) -> Option<Vec<bool>> {
+        let tags = self
+            .manifest
+            .streams
+            .iter()
+            .find_map(|s| match &s.collector {
+                Collector::Ebpf { programs } => Some(programs),
+                Collector::Perf { .. } => None,
+            })?;
+        self.in_programs(tags)
+    }
+
+    /// Which stacks run one of the eBPF programs with these tags. `None`
+    /// without the names of kernel frames to find them by.
+    pub fn in_programs(&self, tags: &[String]) -> Option<Vec<bool>> {
+        let sampled = self
+            .manifest
+            .streams
+            .iter()
+            .any(|s| s.signals.contains(&Signal::KernelStacks));
+        if !sampled || self.manifest.kernel_symbols != KernelSymbols::Saved {
+            return None;
+        }
+        let own: Vec<bool> = self
+            .frames
+            .iter()
+            .map(|frame| {
+                self.kernel_symbol(frame)
+                    .and_then(|symbol| bpf_program(&symbol.name))
+                    .is_some_and(|program| tags.iter().any(|tag| program.get(..16) == Some(tag)))
+            })
+            .collect();
+        Some(
+            self.stacks
+                .iter()
+                .map(|stack| stack.iter().any(|&frame| own[frame as usize]))
+                .collect(),
+        )
+    }
+
     /// The saved runtime code a JIT frame falls in.
     pub fn jit_symbol(&self, frame: &Frame) -> Option<&JitSymbol> {
         if frame.origin != Origin::Jit {
@@ -792,6 +834,17 @@ fn read_off_cpu(dir: &Path) -> Result<Vec<OffCPUInterval>> {
             })
         })
         .collect()
+}
+
+/// The tag and name of a BPF program, from its kernel symbol
+/// `bpf_prog_<tag>` or `bpf_prog_<tag>_<name>`. The name tells apart
+/// functions with the same instructions.
+pub(crate) fn bpf_program(name: &str) -> Option<&str> {
+    let program = name.strip_prefix("bpf_prog_")?;
+    let tag = program.get(..16)?;
+    let tagged = tag.bytes().all(|b| b.is_ascii_hexdigit())
+        && matches!(program.as_bytes().get(16), None | Some(b'_'));
+    tagged.then_some(program)
 }
 
 fn read_kernel_symbols(dir: &Path) -> Result<Vec<KernelSymbol>> {

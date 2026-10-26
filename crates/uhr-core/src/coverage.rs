@@ -22,6 +22,9 @@ pub struct Coverage {
     /// without DWARF unwinding.
     pub stacks_not_unwound: Option<u64>,
     pub missing_signals: Vec<MissingSignal>,
+    /// The measured overhead of each stream that has one. For `ebpf`, the
+    /// target's CPU time in uhr's programs. The others are in `unknown`.
+    pub overhead_ns: BTreeMap<String, u64>,
     /// What this result cannot account for because it was not measured.
     pub unknown: Vec<String>,
     pub known_biases: Vec<String>,
@@ -36,6 +39,7 @@ impl Coverage {
             stacks_cut_at_stack_copy: None,
             stacks_not_unwound: None,
             missing_signals: Vec::new(),
+            overhead_ns: BTreeMap::new(),
             unknown: Vec::new(),
             known_biases: Vec::new(),
         };
@@ -75,10 +79,13 @@ impl Coverage {
                 ));
             }
             coverage.known_biases.extend(c.known_biases.iter().cloned());
-            if c.overhead_ns.is_none() {
-                coverage
+            match c.overhead_ns {
+                Some(ns) => {
+                    coverage.overhead_ns.insert(stream.id.clone(), ns);
+                }
+                None => coverage
                     .unknown
-                    .push(format!("profiler overhead of stream {}", stream.id));
+                    .push(format!("profiler overhead of stream {}", stream.id)),
             }
             let Collector::Perf {
                 unwinding,

@@ -194,6 +194,11 @@ from tracepoints, such as wakeups and syscall latency.
 - `uhr record` runs them when it may load eBPF, as root or with CAP_BPF and
   CAP_PERFMON, unless `--no-syscalls`. Otherwise the recording says why it
   has no syscall counts.
+- Their overhead is the target's CPU time in them, from its samples, and a
+  query gives the share of its own time in them. That leaves out the
+  kernel's way into them and their cost to other processes. The kernel's
+  run-time stats would measure those too, but they make every traced
+  syscall slower again.
 - Building them needs nightly Rust with `rust-src`, and `bpf-linker`.
   Without those uhr builds without them.
 
@@ -226,8 +231,8 @@ Requirements:
 - Resolution must be able to run after recording, from the stored mappings.
   A missing symbol file can then be supplied later without recording again.
 - JIT tier and JIT compile time are recorded when the runtime exposes them.
-- The profiler's own eBPF programs show up in the eBPF stats and count toward
-  reported overhead.
+- The profiler's own eBPF programs keep their names in the samples and count
+  toward reported overhead.
 
 ## Runtimes
 

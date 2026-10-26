@@ -129,6 +129,9 @@ pub struct QueryCoverage {
     /// Share of the time with no stack: off-CPU time whose stack was not
     /// recorded. It is in no row.
     pub no_stack_share: f64,
+    /// Share of the time in uhr's own eBPF programs, which the target's
+    /// threads run at their syscalls. `None` without them.
+    pub own_programs_share: Option<f64>,
     #[serde(flatten)]
     pub symbols: SymbolCoverage,
     #[serde(flatten)]
@@ -205,6 +208,15 @@ pub fn run(
             .map(|(origin, ns)| (origin, share(ns)))
             .collect(),
         no_stack_share: share(times.no_stack_ns),
+        own_programs_share: recording.in_own_programs().map(|own| {
+            share(
+                own.iter()
+                    .zip(&times.ns)
+                    .filter(|&(&own, _)| own)
+                    .map(|(_, &ns)| ns)
+                    .sum(),
+            )
+        }),
         symbols: SymbolCoverage::of(recording, symbols),
         recording: Coverage::of(recording),
     };

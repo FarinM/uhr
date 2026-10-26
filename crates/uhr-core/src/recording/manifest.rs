@@ -95,7 +95,11 @@ pub enum Collector {
         context_switches: bool,
     },
     /// uhr's own eBPF programs.
-    Ebpf,
+    Ebpf {
+        /// Their tags, in hex. The kernel names a program's code
+        /// `bpf_prog_<tag>_<name>`, so its frames can be told apart.
+        programs: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
