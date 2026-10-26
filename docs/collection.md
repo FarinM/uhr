@@ -2,8 +2,9 @@
 
 How observations get into the [model](model.md). This doc lists what
 collectors must do and the candidate tools for each signal. The first
-milestone is in the [README](../README.md#status). The order after that is not
-decided.
+milestone is in the [README](../README.md#status). Next, uhr's eBPF programs
+are to read interpreters' frames (see [runtimes](#runtimes)). The order after
+that is not decided.
 
 ## Collector contract
 

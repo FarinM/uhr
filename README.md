@@ -10,14 +10,18 @@ and exposes questions over that model through MCP and a CLI.
 
 ## Status
 
-Early implementation. The first milestone is in progress, and the code covers
-only part of the design. The docs describe intent, the abstractions the design
+Early implementation. The first milestone is done, and the code covers only
+part of the design. The docs describe intent, the abstractions the design
 depends on, and candidate approaches. The core is written in Rust.
 
-The first milestone targets Linux, where perf_event and eBPF give the full
+The first milestone targeted Linux, where perf_event and eBPF give the full
 depth: per-thread user and kernel time; perf sampling with kernel and user
 stacks; native symbol resolution; `overview`, `query` and `call_paths`; one
-CPU-bound and one syscall-heavy test program.
+CPU-bound and one syscall-heavy test program. Past it, uhr records off-CPU
+time, attaches to running processes, unwinds with DWARF, names the code
+Python 3.12+ and Node compile, and runs eBPF programs of its own, which count
+and time syscalls and sample in place of perf. Next, those programs are to
+read interpreters' frames; see [collection](docs/collection.md#runtimes).
 
 ## Try it
 
@@ -31,6 +35,10 @@ uhr record -o rec --pid 4312 --duration 10s
                                            # the same for a running process
 uhr record -o rec -- python3 app.py        # Python 3.12+ and Node functions get
                                            # names too
+sudo uhr record -o rec -- ./my-program     # sampled by uhr's eBPF programs, which
+                                           # also count and time the syscalls
+uhr query rec --group-by syscall           # each syscall's time, and how often
+                                           # it was called and how long it took
 uhr overview rec                           # computing or waiting? CPU time by mode
                                            # and time off CPU, runnable or blocked,
                                            # by process and thread, against time alive

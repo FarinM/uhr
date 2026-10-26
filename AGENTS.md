@@ -16,8 +16,8 @@ and lets an agent ask questions over that model through MCP and a CLI.
 
 ## Where things stand
 
-Early implementation. The first milestone (see `README.md`) is in progress,
-and the code covers only part of the design.
+Early implementation. The first milestone (see `README.md`) is done, and the
+code covers only part of the design.
 
 - Start with `docs/vision.md` (the goals), then `docs/model.md` (the core
   abstractions). `README.md` maps the rest.
