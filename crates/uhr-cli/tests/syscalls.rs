@@ -209,6 +209,47 @@ fn uhr_as_root(args: &[&str], recording: &Path) -> Option<()> {
 }
 
 #[test]
+fn counts_every_call_of_each_syscall() {
+    let _turn = one_at_a_time();
+    let dir = scratch("syscalls_counted");
+    let program = dir.join("syscalls");
+    compile("syscalls", &program, "-O2");
+    let recording = dir.join("rec");
+    let rec = recording.to_str().unwrap();
+    let args = ["record", "-o", rec, "--", program.to_str().unwrap(), "2000"];
+    if uhr_as_root(&args, &recording).is_none() {
+        eprintln!("skipped: needs root through sudo without a password");
+        return;
+    }
+    let manifest: Value =
+        serde_json::from_slice(&fs::read(recording.join("manifest.json")).unwrap()).unwrap();
+    if let Some(missing) = manifest["missing_signals"]
+        .as_array()
+        .and_then(|m| m.first())
+    {
+        eprintln!("skipped: {}", missing["reason"]);
+        return;
+    }
+    let result = json(&["query", rec, "--group-by", "syscall", "--top", "100"]);
+    let rows = result["rows"].as_array().unwrap();
+    let read = rows.iter().find(|r| r["syscall"] == "read").unwrap();
+    // Each round reads once, and the loader reads the program's libraries.
+    let calls = read["calls"]["calls"].as_u64().unwrap();
+    assert!((2000..2010).contains(&calls), "{read}");
+    assert!(
+        read["calls"]["median"]["below_ns"].as_u64().is_some(),
+        "{read}"
+    );
+    // Too quick for any sample, but counted.
+    let mmap = rows.iter().find(|r| r["syscall"] == "mmap").unwrap();
+    assert!(mmap["calls"]["calls"].as_u64().unwrap() > 0, "{mmap}");
+    assert!(
+        rows.iter().all(|r| r["syscall"] != "execve"),
+        "counted before exec"
+    );
+}
+
+#[test]
 fn names_its_own_programs() {
     let _turn = one_at_a_time();
     let dir = scratch("syscalls_own_programs");

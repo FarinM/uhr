@@ -1,5 +1,10 @@
+use std::collections::BTreeMap;
+
+use serde::Serialize;
+
+use crate::filter::Filter;
 use crate::functions::Functions;
-use crate::recording::{Origin, Recording};
+use crate::recording::{Origin, Recording, Signal, SyscallCalls};
 
 /// Where a stack stands with syscalls, read from the kernel functions on it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -156,8 +161,127 @@ fn syscall(name: &str) -> Option<&str> {
         return None;
     }
     let rest = rest.strip_prefix("compat_").unwrap_or(rest);
-    rest.strip_prefix("sys_")
-        .filter(|syscall| !syscall.is_empty())
+    let function = rest
+        .strip_prefix("sys_")
+        .filter(|syscall| !syscall.is_empty())?;
+    Some(table_name(function))
+}
+
+/// The syscall tables' name for a syscall whose function has another, as
+/// `fstat` for `newfstat`, so both name it as the counted calls do.
+fn table_name(function: &str) -> &str {
+    match function {
+        "newstat" => "stat",
+        "newfstat" => "fstat",
+        "newlstat" => "lstat",
+        "newuname" => "uname",
+        "umount" => "umount2",
+        _ => function,
+    }
+}
+
+/// What uhr's eBPF programs counted of each syscall, for the processes and
+/// threads `filter` keeps. `None` without them, or for a filter they can't
+/// take: they count each thread's calls over the whole capture, not by
+/// time, mode or stack.
+pub(crate) fn counted(recording: &Recording, filter: &Filter) -> Option<BTreeMap<String, Counted>> {
+    let streamed = recording
+        .manifest
+        .streams
+        .iter()
+        .any(|s| s.signals.contains(&Signal::SyscallCalls));
+    let whole_threads = filter.thread_names.is_empty()
+        && filter.modes.is_empty()
+        && filter.under.is_empty()
+        && filter.from_ns.is_none()
+        && filter.to_ns.is_none();
+    if !streamed || !whole_threads {
+        return None;
+    }
+    let mut counted: BTreeMap<String, Counted> = BTreeMap::new();
+    for calls in &recording.syscall_calls {
+        let name = calls_name(calls);
+        let kept = (filter.pids.is_empty() || filter.pids.contains(&calls.pid))
+            && (filter.tids.is_empty() || filter.tids.contains(&calls.tid))
+            && (filter.syscalls.is_empty() || filter.syscalls.contains(&name));
+        if kept {
+            counted.entry(name).or_default().add(calls);
+        }
+    }
+    for counted in counted.values_mut() {
+        counted.median = counted.percentile(50);
+        counted.p99 = counted.percentile(99);
+    }
+    Some(counted)
+}
+
+/// The name of a syscall that was counted, or its number for one the
+/// table has no name for, as `#439`.
+pub(crate) fn calls_name(calls: &SyscallCalls) -> String {
+    calls
+        .name
+        .clone()
+        .unwrap_or_else(|| format!("#{}", calls.number))
+}
+
+/// The calls of one syscall that uhr's eBPF programs counted.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct Counted {
+    /// Calls that returned during the capture.
+    pub calls: u64,
+    /// Their time from entry to exit, on CPU or not.
+    pub time_ns: u64,
+    /// The range of times the median call, and the 99th percentile one,
+    /// fall in. `None` without returned calls.
+    pub median: Option<Latency>,
+    pub p99: Option<Latency>,
+    /// Threads still in the syscall when the capture ended, and the time
+    /// they had spent in it then.
+    pub unfinished: u64,
+    pub unfinished_ns: u64,
+    #[serde(skip)]
+    latency: Vec<u64>,
+}
+
+/// A range of call times: one of the counted latency buckets.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct Latency {
+    pub at_least_ns: u64,
+    /// `None` for the last bucket, which has no end.
+    pub below_ns: Option<u64>,
+}
+
+impl Counted {
+    fn add(&mut self, calls: &SyscallCalls) {
+        self.calls += calls.calls;
+        self.time_ns += calls.time_ns;
+        if let Some(ns) = calls.unfinished_ns {
+            self.unfinished += 1;
+            self.unfinished_ns += ns;
+        }
+        if self.latency.len() < calls.latency.len() {
+            self.latency.resize(calls.latency.len(), 0);
+        }
+        for (sum, n) in self.latency.iter_mut().zip(&calls.latency) {
+            *sum += n;
+        }
+    }
+
+    fn percentile(&self, percent: u64) -> Option<Latency> {
+        // The call at least `percent` percent of the calls are no longer
+        // than.
+        let rank = (self.calls * percent).div_ceil(100).max(1);
+        let mut below = 0;
+        let last = self.latency.len().checked_sub(1)?;
+        let bucket = self.latency.iter().position(|&n| {
+            below += n;
+            below >= rank
+        })?;
+        Some(Latency {
+            at_least_ns: if bucket == 0 { 0 } else { 1 << bucket },
+            below_ns: (bucket < last).then(|| 1 << (bucket + 1)),
+        })
+    }
 }
 
 #[cfg(test)]
@@ -180,6 +304,8 @@ mod tests {
             Some("clock_nanosleep")
         );
         assert_eq!(syscall_of("__do_sys_clone3.isra.0"), Some("clone3"));
+        // As the syscall tables name it.
+        assert_eq!(syscall_of("__x64_sys_newfstat"), Some("fstat"));
         assert_eq!(syscall_of("__x64_sys_"), None);
         // Padding before the function, and kernel functions that are not
         // syscalls.
@@ -187,6 +313,31 @@ mod tests {
         assert_eq!(syscall_of("do_sys_openat2"), None);
         assert_eq!(syscall_of("sys_fillrect"), None);
         assert_eq!(syscall_of("ksys_read"), None);
+    }
+
+    #[test]
+    fn finds_the_latency_of_a_percentile() {
+        let mut counted = Counted::default();
+        counted.add(&SyscallCalls {
+            pid: 1,
+            tid: 1,
+            number: 0,
+            name: Some("read".into()),
+            calls: 100,
+            time_ns: 0,
+            latency: vec![1, 0, 0, 97, 2],
+            unfinished_ns: None,
+        });
+        let range = |at_least_ns, below_ns| {
+            Some(Latency {
+                at_least_ns,
+                below_ns,
+            })
+        };
+        assert_eq!(counted.percentile(50), range(8, Some(16)));
+        assert_eq!(counted.percentile(99), range(16, None));
+        assert_eq!(counted.percentile(1), range(0, Some(2)));
+        assert_eq!(Counted::default().percentile(50), None);
     }
 
     #[test]

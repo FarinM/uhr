@@ -11,6 +11,7 @@ use crate::metric::{self, Metric, StackTimes, stack_times};
 use crate::recording::{self, Origin, Recording};
 use crate::symbols::Symbols;
 use crate::syscalls::{self, InSyscall};
+pub use crate::syscalls::{Counted, Latency};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -112,6 +113,10 @@ pub struct SyscallRow {
     pub syscall: Option<String>,
     pub time_ns: u64,
     pub share: f64,
+    /// The calls uhr's eBPF programs counted, for a named syscall. `None`
+    /// without them, or with a filter by time, mode, stack or thread name:
+    /// they count each thread's calls over the whole capture.
+    pub calls: Option<Counted>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -172,7 +177,13 @@ pub fn run(
             &share,
         )),
         GroupBy::Module => Rows::Modules(module_rows(recording, &functions, &times.ns, &share)),
-        GroupBy::Syscall => Rows::Syscalls(syscall_rows(recording, &functions, &times, &share)),
+        GroupBy::Syscall => Rows::Syscalls(syscall_rows(
+            recording,
+            &functions,
+            &times,
+            syscalls::counted(recording, &query.filter),
+            &share,
+        )),
     };
     let rows_omitted = rows.truncate(query.top);
 
@@ -340,6 +351,7 @@ fn syscall_rows(
     recording: &Recording,
     functions: &Functions,
     times: &StackTimes,
+    mut counted: Option<BTreeMap<String, Counted>>,
     share: &impl Fn(u64) -> f64,
 ) -> Vec<SyscallRow> {
     let in_syscall = syscalls::of_stacks(recording, functions);
@@ -368,17 +380,38 @@ fn syscall_rows(
                 InSyscall::Outside => (Some(false), None),
                 InSyscall::Unknown => (None, None),
             };
+            // Counted, a syscall with no calls has zero of them.
+            let calls = syscall.as_ref().and_then(|name| {
+                let counted = counted.as_mut()?;
+                Some(counted.remove(name).unwrap_or_default())
+            });
             SyscallRow {
                 in_syscall,
                 syscall,
                 time_ns,
                 share: share(time_ns),
+                calls,
             }
         })
         .collect();
+    // Syscalls too quick to be in any stack.
+    rows.extend(
+        counted
+            .into_iter()
+            .flatten()
+            .map(|(name, calls)| SyscallRow {
+                in_syscall: Some(true),
+                syscall: Some(name),
+                time_ns: 0,
+                share: 0.0,
+                calls: Some(calls),
+            }),
+    );
+    let calls = |row: &SyscallRow| row.calls.as_ref().map(|c| c.calls);
     rows.sort_by(|a, b| {
         b.time_ns
             .cmp(&a.time_ns)
+            .then_with(|| calls(b).cmp(&calls(a)))
             .then_with(|| a.syscall.cmp(&b.syscall))
             .then_with(|| a.in_syscall.cmp(&b.in_syscall))
     });

@@ -44,7 +44,8 @@ pub enum Error {
     #[error("the recording has no kernel function names, so its syscalls are unknown: {0}")]
     NoKernelNames(String),
     #[error(
-        "no stack in the recording is in the syscall {name:?}. Its stacks are in: {}",
+        "no stack in the recording is in the syscall {name:?}, and no call of it was counted. \
+         Its syscalls are: {}",
         if .known.is_empty() { "none".to_owned() } else { .known.join(", ") }
     )]
     NoSuchSyscall { name: String, known: Vec<String> },
@@ -141,12 +142,18 @@ impl Filter {
             return Err(Error::NoKernelNames(reason.clone()));
         }
         let in_syscall = syscalls::of_stacks(recording, functions);
+        let counted: Vec<String> = recording
+            .syscall_calls
+            .iter()
+            .map(syscalls::calls_name)
+            .collect();
         let mut known: Vec<&str> = in_syscall
             .iter()
             .filter_map(|s| match s {
                 Some(InSyscall::Named(name)) => Some(*name),
                 _ => None,
             })
+            .chain(counted.iter().map(String::as_str))
             .collect();
         known.sort_unstable();
         known.dedup();

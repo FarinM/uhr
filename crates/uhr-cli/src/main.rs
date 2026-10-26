@@ -21,7 +21,7 @@ use uhr_core::functions::Function;
 use uhr_core::metric::Metric;
 use uhr_core::overview::{self, CPUTime, Overview};
 use uhr_core::query::{
-    self, FunctionRow, GroupBy, ModuleRow, Query, QueryResult, Rows, SyscallRow,
+    self, FunctionRow, GroupBy, Latency, ModuleRow, Query, QueryResult, Rows, SyscallRow,
 };
 use uhr_core::recording::{Exit, Mode};
 use uhr_core::symbols;
@@ -865,7 +865,16 @@ fn write_module_rows(out: &mut impl Write, rows: &[ModuleRow]) -> io::Result<()>
 }
 
 fn write_syscall_rows(out: &mut impl Write, rows: &[SyscallRow]) -> io::Result<()> {
-    writeln!(out, "{:>7}  syscall", "time")?;
+    let counted = rows.iter().any(|row| row.calls.is_some());
+    if counted {
+        writeln!(
+            out,
+            "{:>7} {:>9} {:>10} {:>9} {:>9}  syscall",
+            "time", "calls", "in calls", "median", "p99"
+        )?;
+    } else {
+        writeln!(out, "{:>7}  syscall", "time")?;
+    }
     for row in rows {
         let syscall = match (row.in_syscall, &row.syscall) {
             (_, Some(name)) => name,
@@ -873,9 +882,55 @@ fn write_syscall_rows(out: &mut impl Write, rows: &[SyscallRow]) -> io::Result<(
             (Some(false), None) => "(not in a syscall)",
             (None, None) => "(unknown)",
         };
-        writeln!(out, "{:>6.1}%  {syscall}", row.share * 100.0)?;
+        write!(out, "{:>6.1}%", row.share * 100.0)?;
+        match &row.calls {
+            Some(calls) => {
+                let mut called = calls.calls.to_string();
+                if calls.unfinished > 0 {
+                    called = format!("{called}+{}", calls.unfinished);
+                }
+                write!(
+                    out,
+                    " {called:>9} {:>10} {:>9} {:>9}",
+                    duration(calls.time_ns + calls.unfinished_ns),
+                    calls.median.map(latency).unwrap_or_default(),
+                    calls.p99.map(latency).unwrap_or_default(),
+                )?;
+            }
+            None if counted => write!(out, " {:>9} {:>10} {:>9} {:>9}", "", "", "", "")?,
+            None => {}
+        }
+        writeln!(out, "  {syscall}")?;
+    }
+    if rows
+        .iter()
+        .any(|row| row.calls.as_ref().is_some_and(|c| c.unfinished > 0))
+    {
+        writeln!(
+            out,
+            "(+n: calls still running when the capture ended, in the time)"
+        )?;
     }
     Ok(())
+}
+
+/// The range a call time is in, by its end: `<2.0us`, or `>=34.4s` for the
+/// last one, which has none.
+fn latency(latency: Latency) -> String {
+    match latency.below_ns {
+        Some(below) => format!("<{}", duration(below)),
+        None => format!(">={}", duration(latency.at_least_ns)),
+    }
+}
+
+fn duration(ns: u64) -> String {
+    let ns = ns as f64;
+    match ns {
+        _ if ns < 1e3 => format!("{ns:.0}ns"),
+        _ if ns < 1e6 => format!("{:.1}us", ns / 1e3),
+        _ if ns < 1e9 => format!("{:.1}ms", ns / 1e6),
+        _ => format!("{:.1}s", ns / 1e9),
+    }
 }
 
 fn describe_time(metric: Metric, samples: u64, intervals: u64, time_ns: u64) -> String {

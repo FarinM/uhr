@@ -62,10 +62,15 @@ threads is nearly all of it.
 A stack's syscall is read from the kernel functions on it: the one the
 syscall entered, such as `__x64_sys_read` for `read`. That needs no tracing,
 but gives the time in each syscall, not how often it was called or how long
-each call took. Where only the code every syscall passes through is on the
-stack, as on the way back to user space, where threads are often preempted,
-the time is in a syscall, but which one is unknown. User code, faults and
-interrupts from user space, and the start of a thread are not in a syscall.
+each call took. Where uhr's eBPF programs ran, each syscall's row also has
+its `calls`: how many returned, their time, the ranges the median and the
+99th percentile call fall in, and the calls still running at the end. They
+count whole threads over the whole capture, so a filter by time, mode,
+stack or thread name leaves them out. Where only the code every syscall
+passes through is on the stack, as on the way back to user space, where
+threads are often preempted, the time is in a syscall, but which one is
+unknown. User code, faults and interrupts from user space, and the start of
+a thread are not in a syscall.
 Where the stack does not show how the kernel was entered, that is unknown:
 its kernel functions have no names, or it reached the depth limit, which can
 cut a fault or interrupt off from the syscall it happened in, since x86

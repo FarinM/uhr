@@ -3,7 +3,8 @@ use uhr_core::filter::{self, Filter};
 use uhr_core::functions;
 use uhr_core::metric::{self, Metric};
 use uhr_core::query::{
-    Error, FunctionRow, GroupBy, ModuleRow, Query, QueryResult, Rows, SyscallRow, run,
+    Counted, Error, FunctionRow, GroupBy, Latency, ModuleRow, Query, QueryResult, Rows, SyscallRow,
+    run,
 };
 use uhr_core::recording::*;
 use uhr_core::symbols::{FrameName, InlineFrame, Source, SourceStatus, Symbols};
@@ -1044,6 +1045,103 @@ fn off_cpu_time_without_kernel_functions_is_in_an_unknown_syscall() {
     };
     let result = run(&with_off_cpu(recording()), Some(&symbols()), &query).unwrap();
     assert_eq!(syscall_rows(&result), [(None, None, 40)]);
+}
+
+/// `with_syscalls`, with the calls uhr's eBPF programs counted: 3 and 1 in
+/// read by threads 1 and 2, of which thread 2's was still running, none in
+/// futex, and 1000 quick ones in getppid, which no stack is in.
+fn with_counted_calls() -> (Recording, Symbols) {
+    let (mut recording, symbols) = with_syscalls();
+    recording.manifest.streams.push(Stream {
+        id: "ebpf".into(),
+        collector: Collector::Ebpf,
+        signals: vec![Signal::SyscallCalls],
+        missing_signals: Vec::new(),
+        coverage: StreamCoverage {
+            lost_events: 0,
+            stacks: None,
+            overhead_ns: None,
+            known_biases: Vec::new(),
+        },
+    });
+    let calls = |tid, name: &str, calls, latency: Vec<u64>, unfinished_ns| SyscallCalls {
+        pid: 1,
+        tid,
+        number: 0,
+        name: Some(name.into()),
+        calls,
+        time_ns: calls * 10,
+        latency,
+        unfinished_ns,
+    };
+    recording.syscall_calls = vec![
+        calls(1, "read", 3, vec![0, 3, 0], None),
+        calls(2, "read", 1, vec![0, 0, 1], Some(50)),
+        calls(1, "getppid", 1000, vec![1000, 0, 0], None),
+    ];
+    (recording, symbols)
+}
+
+fn counted_rows(result: &QueryResult) -> Vec<(Option<&str>, u64, Option<Counted>)> {
+    let Rows::Syscalls(rows) = &result.rows else {
+        panic!("rows of another grouping: {:?}", result.rows)
+    };
+    rows.iter()
+        .map(|r| (r.syscall.as_deref(), r.time_ns, r.calls.clone()))
+        .collect()
+}
+
+#[test]
+fn joins_the_counted_calls_to_the_syscalls_on_stacks() {
+    let (recording, symbols) = with_counted_calls();
+    let by_syscall = |filter| Query {
+        group_by: GroupBy::Syscall,
+        filter,
+        ..query(20)
+    };
+    let result = run(&recording, Some(&symbols), &by_syscall(Filter::default())).unwrap();
+    let rows = counted_rows(&result);
+    let read = rows.iter().find(|r| r.0 == Some("read")).unwrap();
+    let read = read.2.as_ref().unwrap();
+    assert_eq!((read.calls, read.time_ns), (4, 40));
+    assert_eq!((read.unfinished, read.unfinished_ns), (1, 50));
+    let range = |at_least_ns, below_ns| Latency {
+        at_least_ns,
+        below_ns,
+    };
+    assert_eq!(read.median, Some(range(2, Some(4))));
+    assert_eq!(read.p99, Some(range(4, None)));
+    let futex = rows.iter().find(|r| r.0 == Some("futex")).unwrap();
+    assert_eq!(futex.2.as_ref().unwrap().calls, 0);
+    assert_eq!(rows.last().unwrap().0, Some("getppid"));
+    assert_eq!(rows.last().unwrap().1, 0);
+    assert!(rows.iter().filter(|r| r.0.is_none()).all(|r| r.2.is_none()));
+
+    let thread_2 = Filter {
+        tids: vec![2],
+        ..Filter::default()
+    };
+    let result = run(&recording, Some(&symbols), &by_syscall(thread_2)).unwrap();
+    let rows = counted_rows(&result);
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].2.as_ref().unwrap().calls, 1);
+
+    // They count whole threads over the whole capture.
+    let later = Filter {
+        from_ns: Some(1),
+        ..Filter::default()
+    };
+    let result = run(&recording, Some(&symbols), &by_syscall(later)).unwrap();
+    assert!(counted_rows(&result).iter().all(|r| r.2.is_none()));
+
+    let getppid = Filter {
+        syscalls: vec!["getppid".into()],
+        ..Filter::default()
+    };
+    let result = run(&recording, Some(&symbols), &by_syscall(getppid)).unwrap();
+    let rows = counted_rows(&result);
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].2.as_ref().unwrap().calls, 1000);
 }
 
 fn in_syscalls(syscalls: &[&str], under: &[&str]) -> Query {
