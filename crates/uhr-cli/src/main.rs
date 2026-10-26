@@ -129,8 +129,9 @@ struct RecordArgs {
     #[arg(long, value_enum, default_value_t = UnwindArg::Fp)]
     unwind: UnwindArg,
     /// Bytes of user stack to copy with each sample, for `--unwind
-    /// dwarf`. Deeper stacks lose their outer callers [default: 32768]
-    #[arg(long, value_name = "BYTES", value_parser = clap::value_parser!(u32).range(8..=65528))]
+    /// dwarf`, a multiple of 8. Deeper stacks lose their outer callers
+    /// [default: 32768]
+    #[arg(long, value_name = "BYTES", value_parser = parse_stack_size)]
     stack_size: Option<u32>,
     /// Don't record context switches. Saves their cost in programs that
     /// switch often, but then nothing says why threads were off CPU
@@ -295,6 +296,14 @@ fn parse_offset(text: &str) -> Result<u64, String> {
     match number.parse::<f64>() {
         Ok(value) if value.is_finite() && value >= 0.0 => Ok((value * scale).round() as u64),
         _ => Err(format!("{number:?} is not a non-negative number")),
+    }
+}
+
+/// In whole words, as stacks are unwound, up to perf's limit.
+fn parse_stack_size(text: &str) -> Result<u32, String> {
+    match text.parse::<u32>() {
+        Ok(bytes) if (8..=65528).contains(&bytes) && bytes % 8 == 0 => Ok(bytes),
+        _ => Err("must be a multiple of 8 from 8 to 65528".into()),
     }
 }
 

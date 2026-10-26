@@ -184,3 +184,17 @@ fn a_stack_size_needs_dwarf_unwinding() {
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("--unwind dwarf"));
 }
+
+#[test]
+fn a_stack_size_is_in_whole_words() {
+    let dir = scratch("dwarf_stack_size_in_words");
+    let output = Command::new(common::UHR)
+        .arg("record")
+        .arg("-o")
+        .arg(dir.join("rec"))
+        .args(["--unwind", "dwarf", "--stack-size", "9", "--", "true"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("multiple of 8"));
+}
