@@ -134,7 +134,9 @@ impl Unwinding {
         let end = sp.saturating_add(stack.len() as u64);
         let mut read_stack = |address: u64| {
             let offset = address.checked_sub(sp).ok_or(())? as usize;
-            let bytes = stack.get(offset..offset + 8).ok_or(())?;
+            let bytes = stack
+                .get(offset..offset.checked_add(8).ok_or(())?)
+                .ok_or(())?;
             Ok(u64::from_le_bytes(bytes.try_into().unwrap()))
         };
         let mut frames = Vec::new();
@@ -153,7 +155,8 @@ impl Unwinding {
                 )),
                 Ok(None) => break,
                 Err(UnwindError::CouldNotReadStack(address)) => {
-                    cut = address >= end;
+                    // A word can start in the copy and end past it.
+                    cut = address >= sp && address.saturating_add(8) > end;
                     break;
                 }
                 // Corrupt or unusual stacks end where unwinding cannot go on.
@@ -552,6 +555,23 @@ mod tests {
                 (0x101400..0x101450, true),
             ]
         );
+    }
+
+    #[test]
+    fn counts_a_stack_cut_where_a_word_runs_past_the_copy() {
+        // Without unwind tables, the caller's frame pointer is at bp and
+        // the return address right after it, past the 9 bytes copied.
+        let stack = [0; 9];
+        let copy = UserCopy {
+            ip: 0x1000,
+            sp: 0x7000,
+            bp: 0x7000,
+            compat: false,
+            stack: &stack,
+        };
+        let user = Unwinding::new().unwind(&copy, 1, &[], &[], 10);
+        assert_eq!(user.frames, [(0x1000, false)]);
+        assert!(user.cut);
     }
 
     fn object(dir: &std::path::Path, name: &str, flags: &[&str]) -> String {
