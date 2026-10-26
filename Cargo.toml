@@ -10,9 +10,12 @@ publish = false
 [workspace.dependencies]
 uhr-core = { path = "crates/uhr-core" }
 uhr-linux = { path = "crates/uhr-linux" }
+uhr-ebpf = { path = "crates/uhr-ebpf" }
 addr2line = { version = "0.24", default-features = false, features = ["std", "rustc-demangle", "cpp_demangle"] }
 anyhow = "1.0"
 arrow-array = "60"
+aya = { version = "0.14", default-features = false }
+aya-ebpf = { version = "0.2.1", default-features = false }
 arrow-buffer = "60"
 arrow-schema = "60"
 arrow-select = "60"
@@ -29,6 +32,7 @@ rustix = { version = "1", features = ["event", "fs", "param", "pipe", "process",
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 stable_deref_trait = "1.2"
+syscalls = { version = "0.8", default-features = false }
 tempfile = "3"
 thiserror = "2"
 tokio = { version = "1", features = ["rt"] }

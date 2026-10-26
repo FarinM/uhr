@@ -97,6 +97,7 @@ fn recording() -> Recording {
             start_ns: Some(1_000),
             end_ns: Some(11_000),
             streams: vec![stream(true)],
+            missing_signals: Vec::new(),
             kernel_symbols: KernelSymbols::Saved,
         },
         threads: vec![
@@ -133,6 +134,7 @@ fn recording() -> Recording {
         off_cpu: Vec::new(),
         kernel_symbols: Vec::new(),
         jit_symbols: Vec::new(),
+        syscall_calls: Vec::new(),
     }
 }
 

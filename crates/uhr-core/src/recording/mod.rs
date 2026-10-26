@@ -21,6 +21,7 @@ const STACKS: &str = "stacks.parquet";
 const SAMPLES: &str = "samples.parquet";
 const KERNEL_SYMBOLS: &str = "kernel_symbols.parquet";
 const JIT_SYMBOLS: &str = "jit_symbols.parquet";
+const SYSCALL_CALLS: &str = "syscall_calls.parquet";
 const OFF_CPU: &str = "off_cpu.parquet";
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -125,6 +126,7 @@ pub struct Recording {
     pub kernel_symbols: Vec<KernelSymbol>,
     /// Sorted by pid and start, and not overlapping in a process.
     pub jit_symbols: Vec<JitSymbol>,
+    pub syscall_calls: Vec<SyscallCalls>,
 }
 
 /// One lifetime of a thread. The kernel reuses ids, so `(pid, tid)` can
@@ -227,6 +229,28 @@ pub struct JitSymbol {
     /// Exclusive.
     pub end: u64,
     pub name: String,
+}
+
+/// The calls a thread made to one syscall during the capture.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyscallCalls {
+    pub pid: u32,
+    pub tid: u32,
+    /// The syscall's number, in the table of the recording's architecture.
+    pub number: u32,
+    /// `None` for a number that table has no name for.
+    pub name: Option<String>,
+    /// Calls that returned during the capture.
+    pub calls: u64,
+    /// Their time from entry to exit, on CPU or not.
+    pub time_ns: u64,
+    /// The returned calls by time: bucket `i` counts those of at least
+    /// `2^i` ns and less than `2^(i + 1)`, and the last one also every longer
+    /// call.
+    pub latency: Vec<u64>,
+    /// The time so far of a call the thread was still in when the capture
+    /// ended. `None` if it was in none.
+    pub unfinished_ns: Option<u64>,
 }
 
 /// A kernel function or BPF program, as the kernel listed it while
@@ -361,6 +385,7 @@ impl Recording {
             off_cpu: read_off_cpu(dir)?,
             kernel_symbols: read_kernel_symbols(dir)?,
             jit_symbols: read_jit_symbols(dir)?,
+            syscall_calls: read_syscall_calls(dir)?,
         };
         recording
             .check_references()
@@ -525,6 +550,25 @@ impl Recording {
                 Column::u64("end", symbols.iter().map(|s| s.end).collect()),
                 Column::string("name", symbols.iter().map(|s| s.name.as_str()).collect()),
             ],
+        )?;
+
+        let calls = &self.syscall_calls;
+        let latency: Vec<Vec<u64>> = calls.iter().map(|c| c.latency.clone()).collect();
+        table::write(
+            &dir.join(SYSCALL_CALLS),
+            vec![
+                Column::u32("pid", calls.iter().map(|c| c.pid).collect()),
+                Column::u32("tid", calls.iter().map(|c| c.tid).collect()),
+                Column::u32("number", calls.iter().map(|c| c.number).collect()),
+                Column::optional_string("name", calls.iter().map(|c| c.name.as_deref()).collect()),
+                Column::u64("calls", calls.iter().map(|c| c.calls).collect()),
+                Column::u64("time_ns", calls.iter().map(|c| c.time_ns).collect()),
+                Column::u64_lists("latency", &latency),
+                Column::optional_u64(
+                    "unfinished_ns",
+                    calls.iter().map(|c| c.unfinished_ns).collect(),
+                ),
+            ],
         )
     }
 
@@ -577,6 +621,15 @@ impl Recording {
             {
                 return Err(format!(
                     "JIT symbol {index} is not after the one before it in pid and address"
+                ));
+            }
+        }
+        for (index, calls) in self.syscall_calls.iter().enumerate() {
+            if calls.latency.iter().sum::<u64>() != calls.calls {
+                return Err(format!(
+                    "syscall calls {index} has {} calls, but {} by latency",
+                    calls.calls,
+                    calls.latency.iter().sum::<u64>()
                 ));
             }
         }
@@ -769,6 +822,30 @@ fn read_jit_symbols(dir: &Path) -> Result<Vec<JitSymbol>> {
             start: start[i],
             end: end[i],
             name: std::mem::take(&mut name[i]),
+        })
+        .collect())
+}
+
+fn read_syscall_calls(dir: &Path) -> Result<Vec<SyscallCalls>> {
+    let table = Table::read(&dir.join(SYSCALL_CALLS))?;
+    let pid = table.u32("pid")?;
+    let tid = table.u32("tid")?;
+    let number = table.u32("number")?;
+    let mut name = table.optional_string("name")?;
+    let calls = table.u64("calls")?;
+    let time_ns = table.u64("time_ns")?;
+    let mut latency = table.u64_lists("latency")?;
+    let unfinished_ns = table.optional_u64("unfinished_ns")?;
+    Ok((0..table.len())
+        .map(|i| SyscallCalls {
+            pid: pid[i],
+            tid: tid[i],
+            number: number[i],
+            name: name[i].take(),
+            calls: calls[i],
+            time_ns: time_ns[i],
+            latency: std::mem::take(&mut latency[i]),
+            unfinished_ns: unfinished_ns[i],
         })
         .collect())
 }

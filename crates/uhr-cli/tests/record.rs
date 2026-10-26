@@ -652,3 +652,34 @@ fn says_why_perf_could_not_record() {
     assert!(!ran.exists(), "the target ran");
     assert!(!dir.join("rec.partial").exists());
 }
+
+/// Without the privileges to load eBPF, a recording says why it has no
+/// syscall counts. Asked for none, it says nothing.
+#[test]
+fn says_why_syscalls_were_not_counted() {
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipped: runs as root, which may load eBPF");
+        return;
+    }
+    let dir = common::scratch("says_why_syscalls_were_not_counted");
+    let recording = dir.join("rec");
+    assert!(record(&recording, &[], &["true"]).status.success());
+    let missing = &manifest(&recording)["missing_signals"];
+    assert_eq!(missing[0]["signal"], "syscall_calls", "{missing}");
+    let reason = missing[0]["reason"].as_str().unwrap();
+    assert!(
+        reason.contains("needs root") || reason.contains("built without its eBPF programs"),
+        "{reason}"
+    );
+
+    let recording = dir.join("none");
+    assert!(
+        record(&recording, &["--no-syscalls"], &["true"])
+            .status
+            .success()
+    );
+    assert_eq!(
+        manifest(&recording)["missing_signals"],
+        serde_json::json!([])
+    );
+}

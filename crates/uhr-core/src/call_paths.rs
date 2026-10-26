@@ -188,8 +188,13 @@ pub fn run(
 
     let mut recording_coverage = Coverage::of(recording);
     let frame_pointers = recording.manifest.streams.iter().any(|stream| {
-        let Collector::Perf { unwinding, .. } = &stream.collector;
-        *unwinding == Unwinding::FramePointers
+        matches!(
+            stream.collector,
+            Collector::Perf {
+                unwinding: Unwinding::FramePointers,
+                ..
+            }
+        )
     });
     if frame_pointers {
         recording_coverage.unknown.push(

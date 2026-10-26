@@ -8,7 +8,7 @@ use arrow_array::{
     StringArray, UInt32Array, UInt64Array,
 };
 use arrow_buffer::OffsetBuffer;
-use arrow_schema::{DataType, Field, Schema};
+use arrow_schema::{Field, Schema};
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::basic::{Compression, ZstdLevel};
@@ -52,9 +52,17 @@ impl Column {
     }
 
     pub fn u32_lists(name: &'static str, lists: &[Vec<u32>]) -> Self {
-        let item = Arc::new(Field::new("item", DataType::UInt32, false));
+        Self::lists::<UInt32Type>(name, lists)
+    }
+
+    pub fn u64_lists(name: &'static str, lists: &[Vec<u64>]) -> Self {
+        Self::lists::<UInt64Type>(name, lists)
+    }
+
+    fn lists<T: ArrowPrimitiveType>(name: &'static str, lists: &[Vec<T::Native>]) -> Self {
+        let item = Arc::new(Field::new("item", T::DATA_TYPE, false));
         let offsets = OffsetBuffer::from_lengths(lists.iter().map(Vec::len));
-        let values = UInt32Array::from(lists.concat());
+        let values = PrimitiveArray::<T>::from_iter_values(lists.iter().flatten().copied());
         let array = ListArray::new(item, offsets, Arc::new(values), None);
         Self::new(name, Arc::new(array), false)
     }
@@ -163,13 +171,23 @@ impl Table {
     }
 
     pub fn u32_lists(&self, column: &str) -> Result<Vec<Vec<u32>>> {
+        self.lists::<UInt32Type>(column)
+    }
+
+    pub fn u64_lists(&self, column: &str) -> Result<Vec<Vec<u64>>> {
+        self.lists::<UInt64Type>(column)
+    }
+
+    fn lists<T: ArrowPrimitiveType>(&self, column: &str) -> Result<Vec<Vec<T::Native>>> {
         let array = self.array::<ListArray>(column)?;
         self.check_no_nulls(column, array)?;
         let values = array
             .values()
             .as_any()
-            .downcast_ref::<UInt32Array>()
-            .ok_or_else(|| self.invalid(format!("column {column} is not a list of u32")))?;
+            .downcast_ref::<PrimitiveArray<T>>()
+            .ok_or_else(|| {
+                self.invalid(format!("column {column} is not a list of {}", T::DATA_TYPE))
+            })?;
         self.check_no_nulls(column, values)?;
         let values = values.values();
         Ok(array

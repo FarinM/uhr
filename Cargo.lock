@@ -219,6 +219,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "assert_matches"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9b34d609dfbaf33d6889b2b7106d3ca345eacad44200913df5ba02bfd31d2ba9"
+
+[[package]]
 name = "async-compression"
 version = "0.4.51"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -242,6 +248,92 @@ name = "autocfg"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
+
+[[package]]
+name = "aya"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "66e644424fada9fff4fdc63848db1732fb69b626e8328202ef55c03df1f4d939"
+dependencies = [
+ "assert_matches",
+ "aya-obj",
+ "bitflags",
+ "hashbrown",
+ "libc",
+ "log",
+ "object 0.39.1",
+ "once_cell",
+ "scopeguard",
+ "thiserror",
+]
+
+[[package]]
+name = "aya-build"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "609b414caa508f04d2dbbc9481ad6869f43ab9ab1dc9abd237fca27c0818f663"
+dependencies = [
+ "anyhow",
+ "cargo_metadata",
+ "rustc_version",
+ "which",
+]
+
+[[package]]
+name = "aya-ebpf"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eace5970943931fea46a8cbdca208a8f6a9e0413d85a5a6c4e168f0b909570bc"
+dependencies = [
+ "aya-build",
+ "aya-ebpf-bindings",
+ "aya-ebpf-cty",
+ "aya-ebpf-macros",
+ "rustversion",
+]
+
+[[package]]
+name = "aya-ebpf-bindings"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cf1f19286ebbda6673099b68d049034838f08e4939cef66c998a8d3e62825d76"
+dependencies = [
+ "aya-build",
+ "aya-ebpf-cty",
+]
+
+[[package]]
+name = "aya-ebpf-cty"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0884264bc8a51a49fed03df8feada3a21d703cf501dae33c28bdba5d2313ef33"
+dependencies = [
+ "aya-build",
+]
+
+[[package]]
+name = "aya-ebpf-macros"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "23e3a7f86e914df106dd00f9d757bc93f7d5c93380c51eead23d8d2ccd15a87a"
+dependencies = [
+ "proc-macro2",
+ "proc-macro2-diagnostics",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "aya-obj"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8c76b9c75d9cdc155ff8f6a06d61e873f67bf47be8cfa92a3b5aaea43f4b4077"
+dependencies = [
+ "bytes",
+ "log",
+ "object 0.39.1",
+ "thiserror",
+]
 
 [[package]]
 name = "base64"
@@ -316,6 +408,39 @@ dependencies = [
  "flate2",
  "lzxd",
  "time",
+]
+
+[[package]]
+name = "camino"
+version = "1.2.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bbbad30e4b4c14a39e3cc8aed085a12a327257c316619c93581e017bc52be591"
+dependencies = [
+ "serde_core",
+]
+
+[[package]]
+name = "cargo-platform"
+version = "0.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dd0061da739915fae12ea00e16397555ed4371a6bb285431aab930f61b0aa4ba"
+dependencies = [
+ "serde",
+ "serde_core",
+]
+
+[[package]]
+name = "cargo_metadata"
+version = "0.23.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ef987d17b0a113becdd19d3d0022d04d7ef41f9efe4f3fb63ac44ba61df3ade9"
+dependencies = [
+ "camino",
+ "cargo-platform",
+ "semver",
+ "serde",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]
@@ -575,6 +700,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "equivalent"
+version = "1.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "00d174d5400e5e8fd687ad1049e2f578285fa914201b1af7e8b112a4546bd826"
+
+[[package]]
 name = "errno"
 version = "0.3.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -622,6 +753,12 @@ dependencies = [
  "miniz_oxide",
  "zlib-rs",
 ]
+
+[[package]]
+name = "foldhash"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 
 [[package]]
 name = "form_urlencoded"
@@ -789,6 +926,10 @@ name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
+dependencies = [
+ "equivalent",
+ "foldhash",
+]
 
 [[package]]
 name = "heck"
@@ -1020,6 +1161,16 @@ checksum = "cb68373c0d6620ef8105e855e7745e18b0d00d3bdb07fb532e434244cdb9a714"
 dependencies = [
  "icu_normalizer",
  "icu_properties",
+]
+
+[[package]]
+name = "indexmap"
+version = "2.14.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cc4e190f5d26ca7051642629da2c52fc03bde85a03197c99408dcd291734c855"
+dependencies = [
+ "equivalent",
+ "hashbrown",
 ]
 
 [[package]]
@@ -1348,6 +1499,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "object"
+version = "0.39.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2e5a6c098c7a3b6547378093f5cc30bc54fd361ce711e05293a5cc589562739b"
+dependencies = [
+ "crc32fast",
+ "hashbrown",
+ "indexmap",
+ "memchr",
+]
+
+[[package]]
 name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1456,6 +1619,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "proc-macro2-diagnostics"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "af066a9c399a26e020ada66a034357a868728e72cd426f3adcd35f80d88d88c8"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+ "version_check",
 ]
 
 [[package]]
@@ -1835,7 +2010,7 @@ dependencies = [
  "memchr",
  "msvc-demangler",
  "nom",
- "object",
+ "object 0.36.7",
  "pdb-addr2line",
  "rangemap",
  "rustc-demangle",
@@ -1872,6 +2047,10 @@ name = "semver"
 version = "1.0.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
+dependencies = [
+ "serde",
+ "serde_core",
+]
 
 [[package]]
 name = "seq-macro"
@@ -2070,6 +2249,12 @@ dependencies = [
  "quote",
  "syn 3.0.9",
 ]
+
+[[package]]
+name = "syscalls"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "81c645a4de0d803ced6ef0388a2646aa1ef8467173b5d59a2c33c88de4ab76e7"
 
 [[package]]
 name = "tempfile"
@@ -2366,17 +2551,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "uhr-ebpf"
+version = "0.1.0"
+dependencies = [
+ "aya",
+ "aya-ebpf",
+]
+
+[[package]]
 name = "uhr-linux"
 version = "0.1.0"
 dependencies = [
+ "aya",
  "framehop",
  "gimli 0.31.1",
  "linux-perf-data 0.13.0",
  "rustix",
+ "syscalls",
  "tempfile",
  "thiserror",
  "tracing",
  "uhr-core",
+ "uhr-ebpf",
  "wholesym",
 ]
 
@@ -2558,6 +2754,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f5f280bbb2b287bc8e7de7e3852945a0ff50d1bbcb5ed42b6c7a568c546df171"
 dependencies = [
  "rustls-pki-types",
+]
+
+[[package]]
+name = "which"
+version = "8.0.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bae2f2b2b816647a1cab1acc91f5bd20812d53cb344382635ec2181940c8034f"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

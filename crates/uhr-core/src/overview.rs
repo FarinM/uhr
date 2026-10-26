@@ -308,7 +308,9 @@ pub fn run(
         .unknown
         .push("memory use: no memory signal was recorded".into());
     for stream in &manifest.streams {
-        let Collector::Perf { frequency_hz, .. } = &stream.collector;
+        let Collector::Perf { frequency_hz, .. } = &stream.collector else {
+            continue;
+        };
         coverage.unknown.push(format!(
             "CPU time per thread more precise than one sample period ({:.1} ms at \
              {frequency_hz} Hz in stream {})",

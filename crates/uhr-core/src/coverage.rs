@@ -84,7 +84,10 @@ impl Coverage {
                 unwinding,
                 stack_copy_bytes,
                 ..
-            } = &stream.collector;
+            } = &stream.collector
+            else {
+                continue;
+            };
             match (unwinding, stacks.and_then(|s| s.stacks_cut_at_stack_copy)) {
                 (Unwinding::FramePointers, _) => coverage.unknown.push(format!(
                     "stacks of stream {} cut short where frame pointers are missing",
@@ -99,6 +102,9 @@ impl Coverage {
                 (Unwinding::Dwarf, _) => {}
             }
         }
+        coverage
+            .missing_signals
+            .extend(recording.manifest.missing_signals.iter().cloned());
         coverage
     }
 }

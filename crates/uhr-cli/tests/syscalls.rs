@@ -6,10 +6,20 @@ mod common;
 
 use std::fs;
 use std::path::Path;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use serde_json::Value;
 
 use common::{compile, scratch, uhr};
+
+/// While a test records as root, uhr's programs run at every process's
+/// syscalls, outside the syscall's own function, so the tests here take
+/// turns.
+static EBPF: Mutex<()> = Mutex::new(());
+
+fn one_at_a_time() -> MutexGuard<'static, ()> {
+    EBPF.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 fn json(args: &[&str]) -> Value {
     let mut args = args.to_vec();
@@ -19,6 +29,7 @@ fn json(args: &[&str]) -> Value {
 
 #[test]
 fn the_time_is_in_the_kernel_on_behalf_of_read_zero() {
+    let _turn = one_at_a_time();
     let dir = scratch("syscalls_kernel_time");
     let program = dir.join("syscalls");
     compile("syscalls", &program, "-O2");
@@ -171,5 +182,74 @@ fn the_time_is_in_the_kernel_on_behalf_of_read_zero() {
     assert!(
         (outside - (1.0 - kernel)).abs() <= 0.05,
         "{outside} of the time not in a syscall, {kernel} in the kernel: {syscalls}"
+    );
+}
+
+/// Runs uhr as root through sudo, and gives the recording back to this
+/// user. `None` where sudo asks for a password.
+fn uhr_as_root(args: &[&str], recording: &Path) -> Option<()> {
+    let sudo = |args: &[&str]| {
+        std::process::Command::new("sudo")
+            .arg("-n")
+            .args(args)
+            .output()
+            .is_ok_and(|output| output.status.success())
+    };
+    if !sudo(&["true"]) {
+        return None;
+    }
+    let mut command = vec![common::UHR];
+    command.extend(args);
+    assert!(sudo(&command), "sudo uhr {args:?} failed");
+    let owner = format!("{}:{}", unsafe { libc::getuid() }, unsafe {
+        libc::getgid()
+    });
+    assert!(sudo(&["chown", "-R", &owner, recording.to_str().unwrap()]));
+    Some(())
+}
+
+#[test]
+fn names_its_own_programs() {
+    let _turn = one_at_a_time();
+    let dir = scratch("syscalls_own_programs");
+    let program = dir.join("syscalls");
+    compile("syscalls", &program, "-O2");
+    let recording = dir.join("rec");
+    let rec = recording.to_str().unwrap();
+    let args = [
+        "record",
+        "-o",
+        rec,
+        "--",
+        program.to_str().unwrap(),
+        "200000",
+    ];
+    if uhr_as_root(&args, &recording).is_none() {
+        eprintln!("skipped: needs root through sudo without a password");
+        return;
+    }
+    let manifest: Value =
+        serde_json::from_slice(&fs::read(recording.join("manifest.json")).unwrap()).unwrap();
+    if manifest["kernel_symbols"]["status"] != "saved"
+        || manifest["streams"].as_array().unwrap().len() < 2
+    {
+        eprintln!("skipped: no kernel symbols or no syscall counts");
+        return;
+    }
+    let result = json(&["query", rec, "--group-by", "function", "--top", "1000"]);
+    let programs: Vec<&str> = result["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|r| r["function"].as_str())
+        .filter(|f| f.starts_with("bpf_prog_"))
+        .collect();
+    // Each round's syscall runs the programs that time it, so samples land
+    // in them.
+    assert!(
+        programs
+            .iter()
+            .any(|p| p.ends_with("_sys_enter") || p.ends_with("_sys_exit")),
+        "{programs:?}"
     );
 }

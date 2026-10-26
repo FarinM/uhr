@@ -6,9 +6,47 @@ use std::process::{ChildStderr, Command, ExitStatus, Stdio};
 use linux_perf_data::{PerfFileReader, linux_perf_event_reader::AttrFlags};
 use uhr_core::doctor::{Check, Report, Status};
 
+use crate::ebpf;
 use crate::kallsyms;
 use crate::launch::Held;
 use crate::perf::{Perf, RecordOptions, Target, Unwind, finished, is_dummy, perf_args};
+
+/// What recording needs on this host.
+pub fn check() -> Report {
+    let mut report = check_perf();
+    report.checks.push(check_ebpf());
+    report
+}
+
+/// What counting syscalls with uhr's eBPF programs needs. Without it the
+/// recordings still have everything perf records.
+pub fn check_ebpf() -> Check {
+    match ebpf::check() {
+        Ok(()) => Check {
+            status: Status::Ok,
+            detail: "uhr can load its eBPF programs: recordings count and time the target's \
+                     syscalls"
+                .into(),
+            fix: None,
+        },
+        Err(error) => Check {
+            status: Status::Limited,
+            fix: match error {
+                ebpf::Error::NotBuilt => Some(
+                    "Install nightly Rust with rust-src and bpf-linker, and build uhr again: \
+                     `rustup toolchain install nightly --component rust-src` and \
+                     `cargo binstall bpf-linker`."
+                        .into(),
+                ),
+                ebpf::Error::NotPermitted => Some(
+                    "Record under sudo, or give the uhr executable CAP_BPF and CAP_PERFMON.".into(),
+                ),
+                _ => None,
+            },
+            detail: format!("{}, so recordings have no syscall counts", error.reason()),
+        },
+    }
+}
 
 /// What CPU sampling with perf needs on this host.
 pub fn check_perf() -> Report {
@@ -204,6 +242,7 @@ fn probe_recording(perf: &Path) -> Result<bool, String> {
         unwind: Unwind::FramePointers,
         off_cpu: true,
         runtime_support: false,
+        syscalls: false,
     };
     let held = Held::spawn(&["true".into()], &[]).map_err(|e| format!("starting `true`: {e}"))?;
     let mut args = perf_args(&data, &options);

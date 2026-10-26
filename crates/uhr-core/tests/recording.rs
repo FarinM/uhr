@@ -64,6 +64,10 @@ fn example() -> Recording {
                     known_biases: vec!["example bias".into()],
                 },
             }],
+            missing_signals: vec![MissingSignal {
+                signal: Signal::SyscallCalls,
+                reason: "loading eBPF needs root".into(),
+            }],
             kernel_symbols: KernelSymbols::Saved,
         },
         threads: vec![
@@ -182,6 +186,28 @@ fn example() -> Recording {
                 name: "py::outer:/app/spin.py".into(),
             },
         ],
+        syscall_calls: vec![
+            SyscallCalls {
+                pid: 7,
+                tid: 8,
+                number: 0,
+                name: Some("read".into()),
+                calls: 3,
+                time_ns: 4_500,
+                latency: vec![0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 1],
+                unfinished_ns: None,
+            },
+            SyscallCalls {
+                pid: 7,
+                tid: 8,
+                number: 4_000,
+                name: None,
+                calls: 0,
+                time_ns: 0,
+                latency: vec![0; 12],
+                unfinished_ns: Some(7_000),
+            },
+        ],
     }
 }
 
@@ -191,6 +217,15 @@ fn round_trips() {
     let recording = example();
     recording.write(&dir).unwrap();
     assert_eq!(Recording::read(&dir).unwrap(), recording);
+}
+
+#[test]
+fn will_not_write_calls_its_latency_does_not_count() {
+    let dir = scratch("uncounted_calls");
+    let mut recording = example();
+    recording.syscall_calls[0].calls = 4;
+    let error = recording.write(&dir).unwrap_err();
+    assert!(error.to_string().contains("syscall calls 0"), "{error}");
 }
 
 #[test]

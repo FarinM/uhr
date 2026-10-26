@@ -184,6 +184,19 @@ they can walk an interpreter's frames in its memory without runtime flags,
 also in processes uhr attaches to. They can also capture what perf gets only
 from tracepoints, such as wakeups and syscall latency.
 
+- So far they count and time the target's syscalls. At each syscall's entry
+  and exit they add, per thread and syscall, the call, its time and a log2
+  histogram of times in the kernel, so nothing is written per call. Each call
+  still runs them, which a program making millions of quick calls notices,
+  and while they run every process's syscalls take the kernel's slower path
+  for traced ones. They follow the processes the target starts, and count a
+  launched target from its exec on.
+- `uhr record` runs them when it may load eBPF, as root or with CAP_BPF and
+  CAP_PERFMON, unless `--no-syscalls`. Otherwise the recording says why it
+  has no syscall counts.
+- Building them needs nightly Rust with `rust-src`, and `bpf-linker`.
+  Without those uhr builds without them.
+
 ## Cost control
 
 - Aggregate in the kernel by default: counts, total time and latency

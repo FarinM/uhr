@@ -141,6 +141,11 @@ struct RecordArgs {
     /// a little time, and without it their functions have no names
     #[arg(long, conflicts_with = "pid")]
     no_runtime_support: bool,
+    /// Don't count and time the target's syscalls. uhr does that with its
+    /// eBPF programs when it may load them: as root, or with CAP_BPF and
+    /// CAP_PERFMON
+    #[arg(long)]
+    no_syscalls: bool,
     /// Record this running process, and the threads and processes it
     /// starts, rather than a command. It is not signalled
     #[arg(long, conflicts_with = "command")]
@@ -370,7 +375,7 @@ fn run_doctor(json: bool) -> Result<ExitCode> {
 
 #[cfg(target_os = "linux")]
 fn host_report() -> Report {
-    uhr_linux::doctor::check_perf()
+    uhr_linux::doctor::check()
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -428,6 +433,7 @@ fn run_record(args: RecordArgs) -> Result<ExitCode> {
         unwind,
         off_cpu: !args.no_off_cpu,
         runtime_support: !args.no_runtime_support,
+        syscalls: !args.no_syscalls,
     };
     let handlers = Handlers::install().context("installing the signal handlers")?;
     let recorded = perf::record(&options, &INTERRUPTS, &args.output);

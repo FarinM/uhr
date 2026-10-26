@@ -18,6 +18,7 @@ A recording is a directory:
 | `off_cpu.parquet` | Times threads spent off CPU, with why and where |
 | `kernel_symbols.parquet` | The kernel functions kernel frames fall in, read while recording |
 | `jit_symbols.parquet` | The code runtimes compiled that frames fall in, named in the runtimes' perf maps while recording |
+| `syscall_calls.parquet` | How often each thread called each syscall, and how long the calls took |
 | `symbols.parquet` | Function name per frame, after symbol resolution |
 | `symbol_sources.parquet` | Files the names came from, and why some frames have none |
 | `inline_frames.parquet` | Inlined calls and source lines per frame, from debug info |
@@ -32,7 +33,7 @@ replaces them.
 - Ids count up from 0 in row order, so an id is also a row number.
 - Null never stands for zero. Each nullable column says what null means.
 - Only standard Parquet types: unsigned integers, UTF-8 strings, booleans and
-  lists of `uint32`. Pages are zstd-compressed.
+  lists of unsigned integers. Pages are zstd-compressed.
 
 ## manifest.json
 
@@ -47,6 +48,7 @@ replaces them.
 | `clock` | `CLOCK_MONOTONIC` |
 | `start_ns`, `end_ns` | When the capture started and stopped: the first and last event, or when perf began sampling a process uhr attached to if that came earlier, and when uhr stopped the recording if that came later, at an interrupt or the end of `--duration`. Null if nothing was recorded |
 | `streams` | One per collector that ran |
+| `missing_signals` | The signals of collectors that could not run, each with a `reason`, as `syscall_calls` without the privileges to load eBPF |
 | `kernel_symbols` | `{"status": "saved"}` if the kernel's symbols were read while recording, or `{"status": "unavailable", "reason": ...}` if not, and then kernel frames have no names |
 
 Each stream has:
@@ -54,8 +56,8 @@ Each stream has:
 | Field | Meaning |
 |---|---|
 | `id` | Unique within the recording |
-| `collector` | `name` plus the collector's version and settings. For perf: `version`, `event`, `frequency_hz` (what perf sampled at), `requested_frequency_hz`, `unwinding` (`frame_pointers` or `dwarf`), `stack_copy_bytes` (user stack copied with each sample as perf used it, null without `dwarf`), `context_switches` (whether perf recorded every context switch) |
-| `signals` | What was captured: `user_cpu_samples`, `kernel_cpu_samples`, `user_stacks`, `kernel_stacks`, `off_cpu_time` (when threads went off CPU and came back, and whether they were preempted), `off_cpu_stacks` (where they went off CPU) |
+| `collector` | `name` plus the collector's version and settings. For perf: `version`, `event`, `frequency_hz` (what perf sampled at), `requested_frequency_hz`, `unwinding` (`frame_pointers` or `dwarf`), `stack_copy_bytes` (user stack copied with each sample as perf used it, null without `dwarf`), `context_switches` (whether perf recorded every context switch). uhr's eBPF programs are `ebpf` |
+| `signals` | What was captured: `user_cpu_samples`, `kernel_cpu_samples`, `user_stacks`, `kernel_stacks`, `off_cpu_time` (when threads went off CPU and came back, and whether they were preempted), `off_cpu_stacks` (where they went off CPU), `syscall_calls` (how often threads called each syscall and how long the calls took) |
 | `missing_signals` | Signals requested but not captured, each with a `reason`. Without `kernel_cpu_samples`, CPU time spent in the kernel is not in the samples at all, not merely unnamed. Threads go off CPU in the kernel, so without kernel sampling `off_cpu_stacks` is missing too |
 | `coverage.lost_events` | Events the kernel dropped |
 | `coverage.stacks` | For a collector that takes stacks, the counts below. Null for one that takes none |
@@ -174,6 +176,20 @@ newer name holds, so samples of the older code there get the newer name.
 | `pid` | uint32 | The process the code ran in |
 | `start`, `end` | uint64 | Address range, end exclusive |
 | `name` | string | As the runtime wrote it, as in `py::inner:/app/spin.py` or `JS:*parse /app/x.js:42:7` |
+
+`syscall_calls`, one row per thread and syscall, from uhr's eBPF programs.
+They count the target's processes and those they start, from the first
+syscall after the target's exec, and when attached from the attach on.
+
+| Column | Type | Meaning |
+|---|---|---|
+| `pid`, `tid` | uint32 | |
+| `number` | uint32 | In the syscall table of the recording's `platform.arch` |
+| `name` | string, nullable | Null for a number the table has no name for |
+| `calls` | uint64 | Calls that returned during the capture |
+| `time_ns` | uint64 | Their time from entry to exit, on CPU or not |
+| `latency` | list of uint64 | Those calls by time: entry `i` counts the ones of at least 2^i ns and less than 2^(i+1), and the last also every longer one. Sums to `calls` |
+| `unfinished_ns` | uint64, nullable | The time so far of a call the thread was still in when the capture ended. Null if it was in none |
 
 ## Symbols
 

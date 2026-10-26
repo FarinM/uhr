@@ -1,0 +1,19 @@
+[package]
+name = "uhr-ebpf"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[features]
+# The aya traits that let uhr-linux read these types from the maps.
+user = ["dep:aya"]
+
+[dependencies]
+aya = { workspace = true, optional = true }
+
+[target.'cfg(target_arch = "bpf")'.dependencies]
+aya-ebpf.workspace = true
+
+[[bin]]
+name = "uhr-ebpf"
+path = "src/main.rs"

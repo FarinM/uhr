@@ -1044,6 +1044,7 @@ mod tests {
                 start_ns: None,
                 end_ns: None,
                 streams: Vec::new(),
+                missing_signals: Vec::new(),
                 kernel_symbols: KernelSymbols::Saved,
             },
             threads: Vec::new(),
@@ -1064,6 +1065,7 @@ mod tests {
             off_cpu: Vec::new(),
             kernel_symbols: Vec::new(),
             jit_symbols: Vec::new(),
+            syscall_calls: Vec::new(),
         }
     }
 

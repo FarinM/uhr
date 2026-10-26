@@ -40,6 +40,12 @@ and the code covers only part of the design.
   its C dependencies need a MinGW compiler.
 - The end-to-end tests in `crates/uhr-cli/tests` run perf and a C compiler on
   the host. `uhr doctor` shows what is missing.
+- uhr's eBPF programs, in `uhr-ebpf`, build when nightly Rust with `rust-src`
+  and `bpf-linker` are installed. Without them uhr builds without the
+  programs. The checks above leave their code out; lint it with
+  `CARGO_ENCODED_RUSTFLAGS='--cfg=bpf_target_arch="x86_64"' cargo +nightly
+  clippy -p uhr-ebpf --bin uhr-ebpf --target bpfel-unknown-none -Z
+  build-std=core`.
 - `uhr-core` holds the model, the recording format, symbol resolution and
   queries, and builds on every platform: nothing in it depends on Linux, so a
   recording can be read anywhere. `uhr-linux` records on Linux: perf,

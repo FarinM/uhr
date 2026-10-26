@@ -6,10 +6,13 @@ publish.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 uhr-core.workspace = true
+uhr-ebpf = { workspace = true, features = ["user"] }
+aya.workspace = true
 framehop.workspace = true
 gimli.workspace = true
 linux-perf-data.workspace = true
 rustix.workspace = true
+syscalls.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

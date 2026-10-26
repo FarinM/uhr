@@ -358,6 +358,7 @@ pub(super) fn convert(input: Input) -> Result<Recording> {
             start_ns: state.start_ns,
             end_ns: state.end_ns,
             streams: vec![stream],
+            missing_signals: Vec::new(),
             kernel_symbols: saved,
         },
         threads: state.take_threads(),
@@ -369,6 +370,7 @@ pub(super) fn convert(input: Input) -> Result<Recording> {
         off_cpu: state.off_cpu,
         kernel_symbols,
         jit_symbols: Vec::new(),
+        syscall_calls: Vec::new(),
     })
 }
 

@@ -14,6 +14,8 @@ pub struct Manifest {
     pub start_ns: Option<u64>,
     pub end_ns: Option<u64>,
     pub streams: Vec<Stream>,
+    /// The signals of collectors that could not run, each with the reason.
+    pub missing_signals: Vec<MissingSignal>,
     pub kernel_symbols: KernelSymbols,
 }
 
@@ -92,6 +94,8 @@ pub enum Collector {
         /// thread going off CPU.
         context_switches: bool,
     },
+    /// uhr's own eBPF programs.
+    Ebpf,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -124,6 +128,10 @@ pub enum Signal {
     /// The stack of each thread going off CPU.
     #[serde(rename = "off_cpu_stacks")]
     OffCPUStacks,
+    /// How often each thread called each syscall, and how long the calls
+    /// took.
+    #[serde(rename = "syscall_calls")]
+    SyscallCalls,
 }
 
 impl Signal {
@@ -135,6 +143,7 @@ impl Signal {
             Signal::KernelStacks => "kernel_stacks",
             Signal::OffCPUTime => "off_cpu_time",
             Signal::OffCPUStacks => "off_cpu_stacks",
+            Signal::SyscallCalls => "syscall_calls",
         }
     }
 }

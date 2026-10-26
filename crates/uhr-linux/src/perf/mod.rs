@@ -23,13 +23,14 @@ use rustix::process::{Pid, Signal, geteuid, kill_process, set_parent_process_dea
 use tracing::{debug, info, warn};
 
 use crate::doctor;
+use crate::ebpf::{self, Syscalls};
 use crate::kallsyms::Kallsyms;
 use crate::launch::{self, Held, Interrupts, Process, monotonic_ns};
 use crate::perf_map;
 use crate::runtimes;
 use uhr_core::doctor::Status;
 use uhr_core::perf_map::name_jit_frames;
-use uhr_core::recording::{self, Collector, Exit, Recording};
+use uhr_core::recording::{self, Collector, Exit, MissingSignal, Recording, StreamCoverage};
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -117,6 +118,9 @@ pub struct RecordOptions {
     /// Set the variables that make runtimes, such as Python 3.12 and later
     /// and Node, name the code they compile in perf maps.
     pub runtime_support: bool,
+    /// Count and time the target's syscalls with uhr's eBPF programs, if
+    /// this host lets uhr load them.
+    pub syscalls: bool,
 }
 
 /// What to record.
@@ -224,8 +228,10 @@ pub fn record(options: &RecordOptions, interrupts: &Interrupts, out: &Path) -> R
             return Err(diagnose(error));
         }
     };
-    // While the boot and the loaded modules are still the ones recorded.
+    // While the boot, the loaded modules and uhr's own eBPF programs are
+    // still the ones recorded.
     let kallsyms = Kallsyms::read();
+    let syscalls = ended.syscalls.map(|s| s.map(ebpf::Stopped::unload));
 
     let recording = convert::convert(convert::Input {
         perf_data: &perf_data,
@@ -285,6 +291,12 @@ pub fn record(options: &RecordOptions, interrupts: &Interrupts, out: &Path) -> R
         );
     }
 
+    add_syscalls(
+        &mut recording,
+        syscalls,
+        matches!(ready, Ready::Attach { .. }),
+    );
+
     // uhr made the runtimes it launched write them, so it cleans them up
     // once the recording holds the names.
     let clean_up = matches!(ready, Ready::Launch(_)) && options.runtime_support;
@@ -317,6 +329,50 @@ pub fn record(options: &RecordOptions, interrupts: &Interrupts, out: &Path) -> R
     fs::rename(&staging, out).map_err(io_error("renaming into place", out))?;
     log_summary(&recording, out);
     Ok(recording)
+}
+
+/// Adds what the eBPF programs counted as a stream of its own, or says why
+/// there is none.
+fn add_syscalls(
+    recording: &mut Recording,
+    counted: Option<Result<ebpf::Counted, ebpf::Error>>,
+    attached: bool,
+) {
+    match counted {
+        Some(Ok(counted)) => {
+            let mut known_biases = vec![
+                "Each call's time includes part of what the eBPF programs take, which for a \
+                 quick syscall is more than the call itself."
+                    .to_owned(),
+                "Syscalls of 32-bit code are named from the 64-bit table, so their names are \
+                 wrong."
+                    .to_owned(),
+            ];
+            if attached {
+                known_biases.push(
+                    "Calls a thread was already in when uhr attached are left out.".to_owned(),
+                );
+            }
+            recording.manifest.streams.push(recording::Stream {
+                id: "ebpf".into(),
+                collector: Collector::Ebpf,
+                signals: vec![recording::Signal::SyscallCalls],
+                missing_signals: Vec::new(),
+                coverage: StreamCoverage {
+                    lost_events: counted.lost,
+                    stacks: None,
+                    overhead_ns: None,
+                    known_biases,
+                },
+            });
+            recording.syscall_calls = counted.calls;
+        }
+        Some(Err(error)) => recording.manifest.missing_signals.push(MissingSignal {
+            signal: recording::Signal::SyscallCalls,
+            reason: error.reason(),
+        }),
+        None => {}
+    }
 }
 
 /// Removes the perf maps the processes `pids` wrote since `since`, and the
@@ -373,13 +429,17 @@ fn log_summary(recording: &Recording, out: &Path) {
         Some(Exit::Unknown(reason)) => info!(%reason, "target exit status unknown"),
         None => info!("target was still running"),
     }
+    for missing in &recording.manifest.missing_signals {
+        warn!(signal = missing.signal.as_str(), reason = %missing.reason, "signal not captured");
+    }
     for stream in &recording.manifest.streams {
-        let Collector::Perf {
+        if let Collector::Perf {
             frequency_hz,
             requested_frequency_hz,
             ..
-        } = &stream.collector;
-        if frequency_hz != requested_frequency_hz {
+        } = &stream.collector
+            && frequency_hz != requested_frequency_hz
+        {
             warn!(
                 requested_hz = requested_frequency_hz,
                 actual_hz = frequency_hz,
@@ -484,6 +544,8 @@ struct Ended {
     stopped_ns: Option<u64>,
     /// When perf started sampling a process uhr attached to.
     attached_ns: Option<u64>,
+    /// `None` when not asked for.
+    syscalls: Option<Result<ebpf::Stopped, ebpf::Error>>,
 }
 
 /// A target checked and ready to record.
@@ -515,6 +577,7 @@ fn run(
                 runtimes::environment(|v| env::var_os(v), options.runtime_support);
             let held = Held::spawn(command, &environment)?;
             let pid = held.pid();
+            let syscalls = options.syscalls.then(|| Syscalls::start(pid, true));
             let mut sampling = sample(perf_data, options, pid)?;
             sampling.stop_if_interrupted(interrupts)?;
             let mut target = held.release()?;
@@ -529,6 +592,7 @@ fn run(
                 perf,
                 stopped_ns: interrupts.first_ns(),
                 attached_ns: None,
+                syscalls: syscalls.map(|s| s.and_then(Syscalls::stop)),
             })
         }
         Ready::Attach {
@@ -538,6 +602,7 @@ fn run(
             ..
         } => {
             let mut sampling = sample(perf_data, options, *pid)?;
+            let syscalls = options.syscalls.then(|| Syscalls::start(*pid, false));
             let attached_ns = monotonic_ns();
             sampling.stop_if_interrupted(interrupts)?;
             match duration {
@@ -568,6 +633,7 @@ fn run(
                 perf,
                 stopped_ns,
                 attached_ns: Some(attached_ns),
+                syscalls: syscalls.map(|s| s.and_then(Syscalls::stop)),
             })
         }
     }
