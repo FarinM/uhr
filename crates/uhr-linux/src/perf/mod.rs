@@ -447,16 +447,12 @@ fn log_summary(recording: &Recording, out: &Path) {
         warn!(signal = missing.signal.as_str(), reason = %missing.reason, "signal not captured");
     }
     for stream in &recording.manifest.streams {
-        if let Collector::Perf {
-            frequency_hz,
-            requested_frequency_hz,
-            ..
-        } = &stream.collector
-            && frequency_hz != requested_frequency_hz
+        if let Some(sampling) = stream.collector.sampling()
+            && sampling.frequency_hz != sampling.requested_frequency_hz
         {
             warn!(
-                requested_hz = requested_frequency_hz,
-                actual_hz = frequency_hz,
+                requested_hz = sampling.requested_frequency_hz,
+                actual_hz = sampling.frequency_hz,
                 "perf lowered the sampling frequency to the kernel's limit"
             );
         }

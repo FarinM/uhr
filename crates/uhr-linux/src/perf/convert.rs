@@ -21,7 +21,7 @@ use super::{Error, Result, io_error};
 use crate::kallsyms::{self, Kallsyms};
 use uhr_core::recording::{
     Clock, Collector, Exit, FORMAT_VERSION, Frame, KERNEL, KernelSymbols, Manifest, Mapping,
-    MissingSignal, Mode, OffCPUInterval, Origin, Platform, Recording, Sample, Signal,
+    MissingSignal, Mode, OffCPUInterval, Origin, Platform, Recording, Sample, Sampling, Signal,
     StackCoverage, Stream, StreamCoverage, Target, Thread, ThreadName, ThreadState, Unwinding,
 };
 
@@ -301,14 +301,11 @@ pub(super) fn convert(input: Input) -> Result<Recording> {
         id: "perf".into(),
         collector: Collector::Perf {
             version: input.perf_version,
-            event: "cpu-clock".into(),
-            frequency_hz,
-            requested_frequency_hz: input.requested_frequency_hz,
-            unwinding: match stack_copy_bytes {
-                Some(_) => Unwinding::Dwarf,
-                None => Unwinding::FramePointers,
-            },
-            stack_copy_bytes,
+            sampling: Some(Sampling {
+                event: "cpu-clock".into(),
+                frequency_hz,
+                requested_frequency_hz: input.requested_frequency_hz,
+            }),
             context_switches: switches.is_some(),
         },
         signals,
@@ -316,6 +313,11 @@ pub(super) fn convert(input: Input) -> Result<Recording> {
         coverage: StreamCoverage {
             lost_events: state.lost_events,
             stacks: Some(StackCoverage {
+                unwinding: match stack_copy_bytes {
+                    Some(_) => Unwinding::Dwarf,
+                    None => Unwinding::FramePointers,
+                },
+                stack_copy_bytes,
                 samples: state.samples.len() as u64,
                 off_cpu_intervals: switches.map(|_| state.off_cpu.len() as u64),
                 throttle_events: state.throttle_events,

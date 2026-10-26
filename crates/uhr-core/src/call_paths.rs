@@ -7,7 +7,7 @@ use crate::coverage::{Coverage, SymbolCoverage};
 use crate::filter::{self, Filter};
 use crate::functions::{self, Function, Functions};
 use crate::metric::{self, Metric, stack_times};
-use crate::recording::{self, Collector, Origin, Recording, Unwinding};
+use crate::recording::{self, Origin, Recording, Unwinding};
 use crate::symbols::Symbols;
 
 #[derive(Debug, Clone)]
@@ -188,13 +188,8 @@ pub fn run(
 
     let mut recording_coverage = Coverage::of(recording);
     let frame_pointers = recording.manifest.streams.iter().any(|stream| {
-        matches!(
-            stream.collector,
-            Collector::Perf {
-                unwinding: Unwinding::FramePointers,
-                ..
-            }
-        )
+        let stacks = stream.coverage.stacks.as_ref();
+        stacks.is_some_and(|stacks| stacks.unwinding == Unwinding::FramePointers)
     });
     if frame_pointers {
         recording_coverage.unknown.push(

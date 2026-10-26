@@ -7,7 +7,7 @@ use crate::coverage::Coverage;
 use crate::filter::{self, Filter};
 use crate::functions::Functions;
 use crate::recording::{
-    self, Collector, Exit, Mode, OffCPUInterval, Recording, Sample, Signal, Thread, ThreadState,
+    self, Exit, Mode, OffCPUInterval, Recording, Sample, Signal, Thread, ThreadState,
 };
 use crate::symbols::Symbols;
 use crate::threads::ThreadNames;
@@ -308,13 +308,14 @@ pub fn run(
         .unknown
         .push("memory use: no memory signal was recorded".into());
     for stream in &manifest.streams {
-        let Collector::Perf { frequency_hz, .. } = &stream.collector else {
+        let Some(sampling) = stream.collector.sampling() else {
             continue;
         };
         coverage.unknown.push(format!(
-            "CPU time per thread more precise than one sample period ({:.1} ms at \
-             {frequency_hz} Hz in stream {})",
-            1e3 / *frequency_hz as f64,
+            "CPU time per thread more precise than one sample period ({:.1} ms at {} Hz in \
+             stream {})",
+            1e3 / sampling.frequency_hz as f64,
+            sampling.frequency_hz,
             stream.id
         ));
     }

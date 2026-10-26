@@ -81,9 +81,10 @@ fn unwinds_binaries_built_without_frame_pointers() {
     let recording = record(&dir, &program, &[], &["100"]);
 
     let stream = &manifest(&recording)["streams"][0];
-    assert_eq!(stream["collector"]["unwinding"], "dwarf");
-    assert_eq!(stream["collector"]["stack_copy_bytes"], 32768);
-    assert_eq!(stream["coverage"]["stacks"]["stacks_cut_at_stack_copy"], 0);
+    let stacks = &stream["coverage"]["stacks"];
+    assert_eq!(stacks["unwinding"], "dwarf");
+    assert_eq!(stacks["stack_copy_bytes"], 32768);
+    assert_eq!(stacks["stacks_cut_at_stack_copy"], 0);
 
     let callers = callers(&recording, "spin");
     let share = |name: &str| {

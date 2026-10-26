@@ -56,11 +56,14 @@ Each stream has:
 | Field | Meaning |
 |---|---|
 | `id` | Unique within the recording |
-| `collector` | `name` plus the collector's version and settings. For perf: `version`, `event`, `frequency_hz` (what perf sampled at), `requested_frequency_hz`, `unwinding` (`frame_pointers` or `dwarf`), `stack_copy_bytes` (user stack copied with each sample as perf used it, null without `dwarf`), `context_switches` (whether perf recorded every context switch). uhr's eBPF programs are `ebpf`, with `programs`, their tags in hex, as in the kernel's names for their code: `bpf_prog_<tag>_<name>` |
+| `collector` | `name` plus the collector's version and settings. For perf: `version`, `sampling`, `context_switches` (whether perf recorded every context switch). uhr's eBPF programs are `ebpf`, with `programs`, their tags in hex, as in the kernel's names for their code: `bpf_prog_<tag>_<name>` |
+| `collector.sampling` | How the collector sampled CPU time: `event`, `frequency_hz` (what it sampled at), `requested_frequency_hz`. Null for one that did not |
 | `signals` | What was captured: `user_cpu_samples`, `kernel_cpu_samples`, `user_stacks`, `kernel_stacks`, `off_cpu_time` (when threads went off CPU and came back, and whether they were preempted), `off_cpu_stacks` (where they went off CPU), `syscall_calls` (how often threads called each syscall and how long the calls took) |
 | `missing_signals` | Signals requested but not captured, each with a `reason`. Without `kernel_cpu_samples`, CPU time spent in the kernel is not in the samples at all, not merely unnamed. Threads go off CPU in the kernel, so without kernel sampling `off_cpu_stacks` is missing too |
 | `coverage.lost_events` | Events the kernel dropped |
 | `coverage.stacks` | For a collector that takes stacks, the counts below. Null for one that takes none |
+| `coverage.stacks.unwinding` | How user stacks were walked: `frame_pointers` or `dwarf` |
+| `coverage.stacks.stack_copy_bytes` | User stack copied with each stack, as the collector used it. Null without `dwarf` |
 | `coverage.stacks.samples` | Samples written |
 | `coverage.stacks.off_cpu_intervals` | Off-CPU intervals written. Null without `context_switches` |
 | `coverage.stacks.throttle_events` | Times the kernel throttled sampling |

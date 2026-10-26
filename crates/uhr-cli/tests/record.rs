@@ -45,9 +45,9 @@ fn records_the_frequency_perf_actually_used() {
     );
     assert!(output.status.success());
 
-    let collector = &manifest(&recording)["streams"][0]["collector"];
-    assert_eq!(collector["requested_frequency_hz"], 10_000_000);
-    assert!(collector["frequency_hz"].as_u64().unwrap() < 10_000_000);
+    let sampling = &manifest(&recording)["streams"][0]["collector"]["sampling"];
+    assert_eq!(sampling["requested_frequency_hz"], 10_000_000);
+    assert!(sampling["frequency_hz"].as_u64().unwrap() < 10_000_000);
     assert!(
         String::from_utf8_lossy(&output.stderr).contains("perf lowered the sampling frequency")
     );

@@ -223,11 +223,11 @@ fn perf_stream() -> Stream {
         id: "perf".into(),
         collector: Collector::Perf {
             version: "6.8".into(),
-            event: "cpu-clock".into(),
-            frequency_hz: 999,
-            requested_frequency_hz: 999,
-            unwinding: Unwinding::FramePointers,
-            stack_copy_bytes: None,
+            sampling: Some(Sampling {
+                event: "cpu-clock".into(),
+                frequency_hz: 999,
+                requested_frequency_hz: 999,
+            }),
             context_switches: false,
         },
         signals: vec![Signal::UserCPUSamples],
@@ -235,6 +235,8 @@ fn perf_stream() -> Stream {
         coverage: StreamCoverage {
             lost_events: 0,
             stacks: Some(StackCoverage {
+                unwinding: Unwinding::FramePointers,
+                stack_copy_bytes: None,
                 samples: 4,
                 off_cpu_intervals: None,
                 throttle_events: 3,

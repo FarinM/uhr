@@ -50,11 +50,11 @@ fn stream(kernel: bool) -> Stream {
         id: "perf".into(),
         collector: Collector::Perf {
             version: "6.8".into(),
-            event: "cpu-clock".into(),
-            frequency_hz: 1000,
-            requested_frequency_hz: 1000,
-            unwinding: Unwinding::FramePointers,
-            stack_copy_bytes: None,
+            sampling: Some(Sampling {
+                event: "cpu-clock".into(),
+                frequency_hz: 1000,
+                requested_frequency_hz: 1000,
+            }),
             context_switches: false,
         },
         signals,
@@ -62,6 +62,8 @@ fn stream(kernel: bool) -> Stream {
         coverage: StreamCoverage {
             lost_events: 0,
             stacks: Some(StackCoverage {
+                unwinding: Unwinding::FramePointers,
+                stack_copy_bytes: None,
                 samples: 7,
                 off_cpu_intervals: None,
                 throttle_events: 0,

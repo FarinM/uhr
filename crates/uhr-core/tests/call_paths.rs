@@ -409,11 +409,11 @@ fn follows_off_cpu_time_through_the_paths() {
         id: "perf".into(),
         collector: Collector::Perf {
             version: "6.8".into(),
-            event: "cpu-clock".into(),
-            frequency_hz: 999,
-            requested_frequency_hz: 999,
-            unwinding: Unwinding::FramePointers,
-            stack_copy_bytes: None,
+            sampling: Some(Sampling {
+                event: "cpu-clock".into(),
+                frequency_hz: 999,
+                requested_frequency_hz: 999,
+            }),
             context_switches: true,
         },
         signals: vec![Signal::OffCPUTime, Signal::OffCPUStacks],
@@ -421,6 +421,8 @@ fn follows_off_cpu_time_through_the_paths() {
         coverage: StreamCoverage {
             lost_events: 0,
             stacks: Some(StackCoverage {
+                unwinding: Unwinding::FramePointers,
+                stack_copy_bytes: None,
                 samples: 15,
                 off_cpu_intervals: Some(3),
                 throttle_events: 0,

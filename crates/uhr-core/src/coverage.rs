@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use serde::Serialize;
 
-use crate::recording::{Collector, MissingSignal, Origin, Recording, Signal, Unwinding};
+use crate::recording::{MissingSignal, Origin, Recording, Signal, Unwinding};
 use crate::symbols::{Source, SourceStatus, Symbols};
 
 /// What a result can't see because of how the recording was made. Every
@@ -87,15 +87,10 @@ impl Coverage {
                     .unknown
                     .push(format!("profiler overhead of stream {}", stream.id)),
             }
-            let Collector::Perf {
-                unwinding,
-                stack_copy_bytes,
-                ..
-            } = &stream.collector
-            else {
+            let Some(stacks) = stacks else {
                 continue;
             };
-            match (unwinding, stacks.and_then(|s| s.stacks_cut_at_stack_copy)) {
+            match (stacks.unwinding, stacks.stacks_cut_at_stack_copy) {
                 (Unwinding::FramePointers, _) => coverage.unknown.push(format!(
                     "stacks of stream {} cut short where frame pointers are missing",
                     stream.id
@@ -104,7 +99,7 @@ impl Coverage {
                     "outer callers of {cut} stacks of stream {}, which were deeper than \
                      their {}-byte stack copy",
                     stream.id,
-                    stack_copy_bytes.unwrap_or_default()
+                    stacks.stack_copy_bytes.unwrap_or_default()
                 )),
                 (Unwinding::Dwarf, _) => {}
             }

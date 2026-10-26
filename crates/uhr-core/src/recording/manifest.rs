@@ -82,14 +82,7 @@ pub struct Stream {
 pub enum Collector {
     Perf {
         version: String,
-        event: String,
-        /// What perf sampled at. perf lowers requests above the kernel's limit.
-        frequency_hz: u64,
-        requested_frequency_hz: u64,
-        unwinding: Unwinding,
-        /// Bytes of user stack copied with each sample, as perf used it.
-        /// `None` without DWARF unwinding.
-        stack_copy_bytes: Option<u32>,
+        sampling: Option<Sampling>,
         /// Whether perf recorded every context switch, and the stack of each
         /// thread going off CPU.
         context_switches: bool,
@@ -100,6 +93,24 @@ pub enum Collector {
         /// `bpf_prog_<tag>_<name>`, so its frames can be told apart.
         programs: Vec<String>,
     },
+}
+
+impl Collector {
+    pub fn sampling(&self) -> Option<&Sampling> {
+        match self {
+            Collector::Perf { sampling, .. } => sampling.as_ref(),
+            Collector::Ebpf { .. } => None,
+        }
+    }
+}
+
+/// How a collector sampled CPU time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Sampling {
+    pub event: String,
+    /// What it sampled at. perf lowers requests above the kernel's limit.
+    pub frequency_hz: u64,
+    pub requested_frequency_hz: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -173,6 +184,10 @@ pub struct StreamCoverage {
 /// per thread going off CPU.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StackCoverage {
+    pub unwinding: Unwinding,
+    /// Bytes of user stack copied with each stack, as the collector used it.
+    /// `None` without DWARF unwinding.
+    pub stack_copy_bytes: Option<u32>,
     pub samples: u64,
     /// `None` without context switches.
     pub off_cpu_intervals: Option<u64>,
