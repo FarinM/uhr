@@ -83,7 +83,7 @@ fn unwinds_binaries_built_without_frame_pointers() {
     let stream = &manifest(&recording)["streams"][0];
     assert_eq!(stream["collector"]["unwinding"], "dwarf");
     assert_eq!(stream["collector"]["stack_copy_bytes"], 32768);
-    assert_eq!(stream["coverage"]["stacks_cut_at_stack_copy"], 0);
+    assert_eq!(stream["coverage"]["stacks"]["stacks_cut_at_stack_copy"], 0);
 
     let callers = callers(&recording, "spin");
     let share = |name: &str| {
@@ -146,7 +146,7 @@ fn counts_the_stacks_cut_at_the_stack_copy() {
     let program = dir.join("paths");
     compile_without_frame_pointers("paths", &program, "-O2");
     let recording = record(&dir, &program, &["--stack-size", "64"], &["30"]);
-    let coverage = &manifest(&recording)["streams"][0]["coverage"];
+    let coverage = &manifest(&recording)["streams"][0]["coverage"]["stacks"];
     let stacks =
         coverage["samples"].as_f64().unwrap() + coverage["off_cpu_intervals"].as_f64().unwrap();
     let cut = coverage["stacks_cut_at_stack_copy"].as_f64().unwrap();
@@ -162,7 +162,7 @@ fn does_not_unwind_32_bit_code_whose_file_is_gone() {
     compile_with_flags("i386", &program, &["-m32", "-static", "-nostdlib", "-O2"]);
     let recording = record(&dir, &program, &[], &[]);
     assert!(!program.exists(), "the program deletes itself");
-    let coverage = &manifest(&recording)["streams"][0]["coverage"];
+    let coverage = &manifest(&recording)["streams"][0]["coverage"]["stacks"];
     let samples = coverage["samples"].as_u64().unwrap();
     assert!(samples > 0, "{coverage}");
     let stacks = samples + coverage["off_cpu_intervals"].as_u64().unwrap();

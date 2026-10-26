@@ -50,14 +50,16 @@ fn example() -> Recording {
                     })
                     .to_vec(),
                 coverage: StreamCoverage {
-                    samples: 2,
-                    off_cpu_intervals: Some(2),
                     lost_events: 0,
-                    throttle_events: 0,
-                    max_stack_depth: 127,
-                    stacks_at_stack_limit: 0,
-                    stacks_cut_at_stack_copy: None,
-                    stacks_not_unwound: None,
+                    stacks: Some(StackCoverage {
+                        samples: 2,
+                        off_cpu_intervals: Some(2),
+                        throttle_events: 0,
+                        max_stack_depth: 127,
+                        stacks_at_stack_limit: 0,
+                        stacks_cut_at_stack_copy: None,
+                        stacks_not_unwound: None,
+                    }),
                     overhead_ns: None,
                     known_biases: vec!["example bias".into()],
                 },

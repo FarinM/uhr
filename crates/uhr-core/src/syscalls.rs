@@ -53,7 +53,8 @@ pub(crate) fn of_stacks<'a>(
         .manifest
         .streams
         .iter()
-        .map(|s| s.coverage.max_stack_depth as usize)
+        .filter_map(|s| s.coverage.stacks.as_ref())
+        .map(|s| s.max_stack_depth as usize)
         .min();
     recording
         .stacks

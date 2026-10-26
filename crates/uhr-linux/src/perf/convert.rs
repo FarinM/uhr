@@ -21,8 +21,8 @@ use super::{Error, Result, io_error};
 use crate::kallsyms::{self, Kallsyms};
 use uhr_core::recording::{
     Clock, Collector, Exit, FORMAT_VERSION, Frame, KERNEL, KernelSymbols, Manifest, Mapping,
-    MissingSignal, Mode, OffCPUInterval, Origin, Platform, Recording, Sample, Signal, Stream,
-    StreamCoverage, Target, Thread, ThreadName, ThreadState, Unwinding,
+    MissingSignal, Mode, OffCPUInterval, Origin, Platform, Recording, Sample, Signal,
+    StackCoverage, Stream, StreamCoverage, Target, Thread, ThreadName, ThreadState, Unwinding,
 };
 
 pub(super) struct Input<'a> {
@@ -314,14 +314,16 @@ pub(super) fn convert(input: Input) -> Result<Recording> {
         signals,
         missing_signals,
         coverage: StreamCoverage {
-            samples: state.samples.len() as u64,
-            off_cpu_intervals: switches.map(|_| state.off_cpu.len() as u64),
             lost_events: state.lost_events,
-            throttle_events: state.throttle_events,
-            max_stack_depth: input.max_stack_depth,
-            stacks_at_stack_limit: state.stacks_at_stack_limit,
-            stacks_cut_at_stack_copy: stack_copy_bytes.map(|_| state.stacks_cut_at_stack_copy),
-            stacks_not_unwound: stack_copy_bytes.map(|_| state.stacks_not_unwound),
+            stacks: Some(StackCoverage {
+                samples: state.samples.len() as u64,
+                off_cpu_intervals: switches.map(|_| state.off_cpu.len() as u64),
+                throttle_events: state.throttle_events,
+                max_stack_depth: input.max_stack_depth,
+                stacks_at_stack_limit: state.stacks_at_stack_limit,
+                stacks_cut_at_stack_copy: stack_copy_bytes.map(|_| state.stacks_cut_at_stack_copy),
+                stacks_not_unwound: stack_copy_bytes.map(|_| state.stacks_not_unwound),
+            }),
             overhead_ns: None,
             known_biases: known_biases.iter().map(|b| b.to_string()).collect(),
         },

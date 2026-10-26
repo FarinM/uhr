@@ -145,15 +145,24 @@ pub struct MissingSignal {
     pub reason: String,
 }
 
-/// Counts are measured; `None` means the value is unknown, never zero. The
-/// stack counts cover every stack recorded: one per CPU sample, and one per
-/// thread going off CPU.
+/// Counts are measured; `None` means the value is unknown, never zero.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StreamCoverage {
+    /// Events the collector dropped.
+    pub lost_events: u64,
+    /// `None` for a collector that takes no stacks.
+    pub stacks: Option<StackCoverage>,
+    pub overhead_ns: Option<u64>,
+    pub known_biases: Vec<String>,
+}
+
+/// The stack counts cover every stack recorded: one per CPU sample, and one
+/// per thread going off CPU.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StackCoverage {
     pub samples: u64,
     /// `None` without context switches.
     pub off_cpu_intervals: Option<u64>,
-    pub lost_events: u64,
     pub throttle_events: u64,
     /// Stacks longer than this were cut by the kernel.
     pub max_stack_depth: u32,
@@ -165,6 +174,4 @@ pub struct StreamCoverage {
     /// only the instruction they were taken at. `None` without DWARF
     /// unwinding.
     pub stacks_not_unwound: Option<u64>,
-    pub overhead_ns: Option<u64>,
-    pub known_biases: Vec<String>,
 }

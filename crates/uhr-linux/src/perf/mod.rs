@@ -396,10 +396,14 @@ fn log_summary(recording: &Recording, out: &Path) {
                 "the kernel dropped events"
             );
         }
-        if coverage.stacks_at_stack_limit > 0 {
+        if let Some(stacks) = coverage
+            .stacks
+            .as_ref()
+            .filter(|s| s.stacks_at_stack_limit > 0)
+        {
             warn!(
-                stacks = coverage.stacks_at_stack_limit,
-                max_stack_depth = coverage.max_stack_depth,
+                stacks = stacks.stacks_at_stack_limit,
+                max_stack_depth = stacks.max_stack_depth,
                 "stacks were cut at the depth limit"
             );
         }

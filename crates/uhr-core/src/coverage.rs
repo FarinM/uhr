@@ -42,19 +42,22 @@ impl Coverage {
         for stream in &recording.manifest.streams {
             let c = &stream.coverage;
             coverage.lost_events += c.lost_events;
-            coverage.throttle_events += c.throttle_events;
-            coverage.stacks_at_stack_limit += c.stacks_at_stack_limit;
-            if let Some(cut) = c.stacks_cut_at_stack_copy {
-                *coverage.stacks_cut_at_stack_copy.get_or_insert(0) += cut;
-            }
-            if let Some(skipped) = c.stacks_not_unwound {
-                *coverage.stacks_not_unwound.get_or_insert(0) += skipped;
-                if skipped > 0 {
-                    coverage.unknown.push(format!(
-                        "callers in {skipped} stacks of 32-bit code in stream {}, which DWARF \
-                         unwinding cannot walk",
-                        stream.id
-                    ));
+            let stacks = c.stacks.as_ref();
+            if let Some(stacks) = stacks {
+                coverage.throttle_events += stacks.throttle_events;
+                coverage.stacks_at_stack_limit += stacks.stacks_at_stack_limit;
+                if let Some(cut) = stacks.stacks_cut_at_stack_copy {
+                    *coverage.stacks_cut_at_stack_copy.get_or_insert(0) += cut;
+                }
+                if let Some(skipped) = stacks.stacks_not_unwound {
+                    *coverage.stacks_not_unwound.get_or_insert(0) += skipped;
+                    if skipped > 0 {
+                        coverage.unknown.push(format!(
+                            "callers in {skipped} stacks of 32-bit code in stream {}, which DWARF \
+                             unwinding cannot walk",
+                            stream.id
+                        ));
+                    }
                 }
             }
             coverage
@@ -82,7 +85,7 @@ impl Coverage {
                 stack_copy_bytes,
                 ..
             } = &stream.collector;
-            match (unwinding, c.stacks_cut_at_stack_copy) {
+            match (unwinding, stacks.and_then(|s| s.stacks_cut_at_stack_copy)) {
                 (Unwinding::FramePointers, _) => coverage.unknown.push(format!(
                     "stacks of stream {} cut short where frame pointers are missing",
                     stream.id

@@ -230,14 +230,16 @@ fn perf_stream() -> Stream {
         signals: vec![Signal::UserCPUSamples],
         missing_signals: Vec::new(),
         coverage: StreamCoverage {
-            samples: 4,
-            off_cpu_intervals: None,
             lost_events: 0,
-            throttle_events: 3,
-            max_stack_depth: 127,
-            stacks_at_stack_limit: 0,
-            stacks_cut_at_stack_copy: None,
-            stacks_not_unwound: None,
+            stacks: Some(StackCoverage {
+                samples: 4,
+                off_cpu_intervals: None,
+                throttle_events: 3,
+                max_stack_depth: 127,
+                stacks_at_stack_limit: 0,
+                stacks_cut_at_stack_copy: None,
+                stacks_not_unwound: None,
+            }),
             overhead_ns: None,
             known_biases: Vec::new(),
         },
@@ -939,7 +941,7 @@ fn syscall_rows(result: &QueryResult) -> Vec<(Option<bool>, Option<&str>, u64)> 
 fn with_syscalls() -> (Recording, Symbols) {
     let (mut recording, mut symbols) = (recording(), symbols());
     let mut stream = perf_stream();
-    stream.coverage.max_stack_depth = 4;
+    stream.coverage.stacks.as_mut().unwrap().max_stack_depth = 4;
     recording.manifest.streams.push(stream);
     let entry = [
         Some("do_syscall_64"),

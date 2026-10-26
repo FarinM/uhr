@@ -88,7 +88,7 @@ fn an_interrupt_records_how_the_target_ended() {
         manifest["target"]
     );
     assert!(
-        manifest["streams"][0]["coverage"]["samples"]
+        manifest["streams"][0]["coverage"]["stacks"]["samples"]
             .as_u64()
             .unwrap()
             > 0
@@ -453,7 +453,7 @@ fn attaching_records_for_the_duration_and_leaves_the_process_alone() {
         / 1e9;
     assert!((0.9..1.5).contains(&seconds), "captured {seconds} s");
     assert!(
-        manifest["streams"][0]["coverage"]["samples"]
+        manifest["streams"][0]["coverage"]["stacks"]["samples"]
             .as_u64()
             .unwrap()
             > 0
