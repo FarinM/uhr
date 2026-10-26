@@ -751,7 +751,7 @@ fn run(
         // instruction.
         Ready::Launch(command) => {
             let (environment, runtimes) =
-                runtimes::environment(|v| env::var_os(v), options.runtime_support);
+                uhr_core::runtimes::environment(|v| env::var_os(v), options.runtime_support);
             let held = Held::spawn(command, &environment)?;
             let pid = held.pid();
             let mut ebpf = start_ebpf(pid, true, options, tick, samples)?;

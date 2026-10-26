@@ -53,7 +53,8 @@ code covers only part of the design.
   launching and attaching, kernel symbols and the Linux `doctor` checks.
   Elsewhere it is empty. `uhr-cli` is the `uhr` binary. Put new tools in the
   core, so the CLI and a later MCP server share them, and code for one
-  platform in that platform's crate.
+  platform in that platform's crate. Each runtime uhr supports is a module
+  of `uhr-core/src/runtimes`.
 - Core returns typed errors, one `thiserror` enum per module, so callers can
   tell failures apart. Only the CLI uses `anyhow`, to print them.
 - Diagnostics go through `tracing` to stderr. Command results go to stdout

@@ -1,31 +1,85 @@
-/// The runtime a binary is, by its file name: `python3.12`, or a
-/// `libpython3.12.so` another program embeds it with, or Node's.
-pub fn binary_runtime(file: &str) -> Option<&'static str> {
-    if file.starts_with("python3") || file.starts_with("libpython3") {
-        Some("python")
-    } else if file == "node" || file == "nodejs" || file.starts_with("libnode.so") {
-        Some("node")
-    } else {
-        None
+//! Node, and the V8 engine it runs on.
+
+use super::{JitCode, JitFunction, PerfMaps, Runtime, Setting};
+
+pub(super) struct Node;
+
+static PERF_MAPS: PerfMaps = PerfMaps {
+    variable: "NODE_OPTIONS",
+    // Without the second, code V8 interprets has no frame of its own.
+    setting: Setting::Options {
+        wanted: &[
+            &["--perf-basic-prof", "--perf-basic-prof-only-functions"],
+            &["--interpreted-frames-native-stack"],
+        ],
+        split: options,
+    },
+    on,
+    code,
+};
+
+impl Runtime for Node {
+    fn name(&self) -> &'static str {
+        "node"
+    }
+
+    fn is_binary(&self, file: &str) -> bool {
+        file == "node" || file == "nodejs" || file.starts_with("libnode.so")
+    }
+
+    fn perf_maps(&self) -> Option<&PerfMaps> {
+        Some(&PERF_MAPS)
     }
 }
 
-/// What a runtime's perf map says about a piece of the code it compiled.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct JitCode<'a> {
-    pub runtime: &'static str,
-    /// The program's function, or `None` for the runtime's own code, such as
-    /// V8's builtins.
-    pub function: Option<JitFunction<'a>>,
+/// V8 takes the last of an option and its `--no-` form.
+fn on(value: &str) -> bool {
+    let (mut all, mut functions) = (false, false);
+    for option in options(value) {
+        match option.as_str() {
+            "--perf-basic-prof" => all = true,
+            "--no-perf-basic-prof" => all = false,
+            "--perf-basic-prof-only-functions" => functions = true,
+            "--no-perf-basic-prof-only-functions" => functions = false,
+            _ => {}
+        }
+    }
+    all || functions
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct JitFunction<'a> {
-    /// `None` for an anonymous function.
-    pub name: Option<&'a str>,
-    pub file: &'a str,
-    /// Where it starts, as `line` or `line:column`, when the runtime says.
-    pub start: Option<&'a str>,
+/// The options in `NODE_OPTIONS`, split as Node splits them: at spaces
+/// outside double quotes, in which `\` escapes the next character. V8 reads
+/// its options with `_` and `-` alike.
+fn options(value: &str) -> Vec<String> {
+    let mut options: Vec<String> = Vec::new();
+    let (mut quoted, mut next) = (false, true);
+    let mut chars = value.chars();
+    while let Some(mut c) = chars.next() {
+        match c {
+            '\\' if quoted => match chars.next() {
+                Some(escaped) => c = escaped,
+                None => break,
+            },
+            ' ' if !quoted => {
+                next = true;
+                continue;
+            }
+            '"' => {
+                quoted = !quoted;
+                continue;
+            }
+            _ => {}
+        }
+        match options.last_mut() {
+            Some(option) if !next => option.push(c),
+            _ => options.push(c.to_string()),
+        }
+        next = false;
+    }
+    options
+        .iter()
+        .map(|option| option.replace('_', "-"))
+        .collect()
 }
 
 /// V8's kinds of code that run the program's JavaScript.
@@ -40,21 +94,8 @@ const V8_PROGRAM: [&str; 6] = [
 
 const V8_RUNTIME: [&str; 5] = ["Builtin", "BytecodeHandler", "Stub", "RegExp", "Handler"];
 
-/// Reads a name from a perf map: CPython's `py::<qualname>:<file>`, or V8's
-/// `<kind>:<tier><name> <file>:<line>[:<column>]`. `None` for one no runtime
-/// uhr knows wrote.
-pub fn jit_code(name: &str) -> Option<JitCode<'_>> {
-    if let Some(function) = name.strip_prefix("py::") {
-        let (name, file) = function.split_once(':')?;
-        return Some(JitCode {
-            runtime: "python",
-            function: Some(JitFunction {
-                name: Some(name),
-                file,
-                start: None,
-            }),
-        });
-    }
+/// V8 names code `<kind>:<tier><name> <file>:<line>[:<column>]`.
+fn code(name: &str) -> Option<JitCode<'_>> {
     let (kind, code) = name.split_once(':')?;
     if V8_RUNTIME.contains(&kind) {
         return Some(JitCode {
@@ -140,19 +181,11 @@ mod tests {
     use super::*;
 
     fn function(name: &str) -> Option<JitFunction<'_>> {
-        jit_code(name).unwrap().function
+        code(name).unwrap().function
     }
 
     #[test]
-    fn reads_the_names_runtimes_write() {
-        assert_eq!(
-            function("py::Pool.acquire:/app/pool.py"),
-            Some(JitFunction {
-                name: Some("Pool.acquire"),
-                file: "/app/pool.py",
-                start: None
-            })
-        );
+    fn reads_the_names_v8_writes() {
         // Node 18, and Node 24 with columns.
         assert_eq!(
             function("LazyCompile:*parse /app/x.js:42"),
@@ -185,8 +218,8 @@ mod tests {
         assert_eq!(name("JS:o*outer /app/x.js:1:1"), Some("outer"));
         assert_eq!(name("JS:outer /app/x.js:1:1"), Some("outer"));
         // Spaces in names and scripts, unless the boundary can't be told.
-        assert_eq!(jit_code("JS:*GET /api /app/x.js:1:1"), None);
-        assert_eq!(jit_code("JS:*stage file:parse /app/x.js:1:1"), None);
+        assert_eq!(code("JS:*GET /api /app/x.js:1:1"), None);
+        assert_eq!(code("JS:*stage file:parse /app/x.js:1:1"), None);
         assert_eq!(
             function("JS:~get x /app/has space.js:3:5"),
             Some(JitFunction {
@@ -220,13 +253,23 @@ mod tests {
             })
         );
         assert_eq!(
-            jit_code("Builtin:ArrayPrototypePush"),
+            code("Builtin:ArrayPrototypePush"),
             Some(JitCode {
                 runtime: "node",
                 function: None
             })
         );
-        assert_eq!(jit_code("[OptimizedTier1] Main()"), None);
-        assert_eq!(jit_code("Lcom/example/Main;.run"), None);
+        assert_eq!(code("[OptimizedTier1] Main()"), None);
+        assert_eq!(code("Lcom/example/Main;.run"), None);
+        assert_eq!(code("py::Pool.acquire:/app/pool.py"), None);
+    }
+
+    #[test]
+    fn splits_options_as_node_does() {
+        assert_eq!(
+            options(r#"--a "--b c" --d_e="f\"g"  "--no-perf_basic_prof""#),
+            ["--a", "--b c", "--d-e=f\"g", "--no-perf-basic-prof"]
+        );
+        assert_eq!(options("--a\t--b"), ["--a\t--b"]);
     }
 }
