@@ -197,7 +197,7 @@ at its address later, which then keeps the name of the first.
 | `runtime` | string | As in `python` |
 | `address` | uint64 | Where the process kept it |
 | `name` | string, nullable | The function's name, as in `Pool.acquire`, empty for an anonymous one. Null if the code could not be read, as when the process freed it before uhr read it |
-| `file` | string, nullable | Its source file. In this and `name`, `\` is written `\\`, and what the runtime keeps that is no character, as CPython keeps the bytes of a file name that are not UTF-8, as `\u` and four hex digits |
+| `file` | string, nullable | Its source file. In this and `name`, `\` is written `\\`, and what the runtime keeps that is no character, as CPython keeps the bytes of a file name that are not UTF-8, as `\u` and four hex digits. A runtime that keeps bytes has each byte that is not UTF-8 written as CPython keeps it, from `\udc80` to `\udcff` |
 | `first_line` | uint32, nullable | The line it starts at |
 | `first_column` | uint32, nullable | The column it starts at, from 1, where the runtime says |
 

@@ -284,7 +284,15 @@ native stack, each JavaScript function's frame with its `JSFunction`, whose
 moves functions. That names its functions and their files, and the line
 and column each starts at, from the script's source. Lines within a
 function are not read yet.
-uhr detects the runtimes in a target and records their versions. What it knows about a
+They read the frames of CRuby 3.2, in a `ruby` program or a `libruby`, from
+the headers of 3.2: CRuby keeps them in an array in each thread's
+execution context, which the thread-local `ruby_current_ec` points to, and
+says the line of each instruction, so that lines within a function are
+read. Its eval loop, which says where the frames go in the native stack, is
+a static function, which only the debug info of a stripped `libruby`
+names, where the system keeps it by build id. Without it they go just
+above the function that calls the eval loop, inside it. uhr detects the
+runtimes in a target and records their versions. What it knows about a
 runtime's frames is kept apart from how it reads memory, so other platforms
 can use it too.
 
@@ -316,7 +324,12 @@ read at the time of the sample at an offset from a pointer the copy holds,
 as for objects a garbage collector can move before uhr reads them. The
 offsets come from what the runtime publishes, such as CPython's
 `_Py_DebugOffsets` and V8's `v8dbg_` symbols, from debug info, or from tables
-by version.
+by version. A thread-local's path from the thread pointer comes from where
+glibc keeps the thread-locals of each module, and what the dynamic linker
+writes where the module's relocations say: the index it gave the module,
+or, for a TLS descriptor, as arm64 builds use, the variable's offset from
+the thread pointer or the module's index. Until it has written them, uhr
+looks again later.
 
 uhr looks for a process's runtime at its first sample, and again each time
 the process maps more code, as a runtime's library can be mapped after the

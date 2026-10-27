@@ -493,6 +493,14 @@ impl Process for LiveProcess {
         fs::read(mapped).or_else(|_| fs::read(&mapping.path))
     }
 
+    /// Where distributions put it, by the build id's first byte and the
+    /// rest, in hex.
+    fn debug_file(&self, build_id: &[u8]) -> Option<Vec<u8>> {
+        let (first, rest) = build_id.split_first()?;
+        let rest: String = rest.iter().map(|b| format!("{b:02x}")).collect();
+        fs::read(format!("/usr/lib/debug/.build-id/{first:02x}/{rest}.debug")).ok()
+    }
+
     fn memory(&self) -> &dyn Memory {
         &self.memory
     }

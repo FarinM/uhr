@@ -1,7 +1,7 @@
-//! End to end: uhr's eBPF programs reading the frames of CPython and V8.
-//! Needs root through sudo without a password, perf, a C compiler, and
-//! Python 3.11 or later or Node with V8 13, and skips without sudo. The test
-//! of a runtime that is missing checks nothing.
+//! End to end: uhr's eBPF programs reading the frames of CPython, V8 and
+//! CRuby. Needs root through sudo without a password, perf, a C compiler,
+//! and Python 3.11 or later, Node with V8 13 or Ruby 3.2, and skips without
+//! sudo. The test of a runtime that is missing checks nothing.
 #![cfg(target_os = "linux")]
 
 mod common;
@@ -136,6 +136,7 @@ fn has_the_split_of(recording: &str, runtime: &str, program: &str) {
         .unwrap_or_else(|| panic!("{hot}"));
     let line = match (runtime, program) {
         ("python", _) => "",
+        (_, "jit.rb") => "@7",
         _ => "@8",
     };
     assert!(
@@ -686,4 +687,81 @@ fn counts_a_v8_call_a_perf_map_names_once() {
         let again = |node: &Value| node["id"].as_str() == Some(&id);
         assert!(!has(&paths["callees"], &again), "{name}: {paths}");
     }
+}
+
+/// A `ruby` whose frames uhr reads.
+fn ruby() -> Option<PathBuf> {
+    let ruby = find("ruby").filter(|ruby| {
+        let output = Command::new(ruby)
+            .args(["-e", "print RUBY_VERSION"])
+            .output();
+        output.is_ok_and(|output| output.stdout.starts_with(b"3.2."))
+    });
+    if ruby.is_none() {
+        eprintln!("skipped: needs Ruby 3.2");
+    }
+    ruby
+}
+
+/// That jit.rb spent its time as it does, under work(), and on the lines
+/// of hot()'s loop.
+fn has_the_split_of_jit_rb(recording: &str) {
+    has_the_split_of(recording, "ruby", "jit.rb");
+    let rows = functions(recording);
+    let work = runtime_function(&rows, "ruby", "work");
+    assert!(share(work, "total_share") > 0.85, "{work}");
+    let lines = json(&["query", recording, "--group-by", "line", "--top", "100"]);
+    let lines = lines["rows"].as_array().unwrap();
+    let hot: Vec<u64> = lines
+        .iter()
+        .filter(|r| r["function"] == "hot" && share(r, "self_share") > 0.05)
+        .map(|r| r["line"]["line"].as_u64().unwrap())
+        .collect();
+    assert!(
+        !hot.is_empty() && hot.iter().all(|line| (10..=12).contains(line)),
+        "{hot:?}"
+    );
+}
+
+#[test]
+fn reads_ruby_frames() {
+    let Some(ruby) = ruby() else {
+        return;
+    };
+    let dir = scratch("interpreters_ruby");
+    let program = format!("{PROGRAMS}/jit.rb");
+    let command = [ruby.to_str().unwrap(), &program, "80"];
+    let Some(recording) = record(&dir, &[], &command) else {
+        return;
+    };
+    has_the_split_of_jit_rb(&recording);
+}
+
+#[test]
+fn reads_ruby_frames_when_attached() {
+    let Some(ruby) = ruby() else {
+        return;
+    };
+    let dir = scratch("interpreters_ruby_attached");
+    let program = format!("{PROGRAMS}/jit.rb");
+    let mut target = Command::new(&ruby)
+        .args([&program, "300"])
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    thread::sleep(Duration::from_millis(300));
+    let pid = target.id().to_string();
+    let recording = record(&dir, &["--pid", &pid, "--duration", "1s"], &[]);
+    let _ = target.kill();
+    let _ = target.wait();
+    let Some(recording) = recording else {
+        return;
+    };
+    has_the_split_of_jit_rb(&recording);
+    // A leaf that sets up no frame loses its caller, the eval loop, to the
+    // walk of frame pointers, so that where its frames went is a guess.
+    let walked = interpreters(&recording).unwrap();
+    let ruby = walked.iter().find(|w| w["runtime"] == "ruby").unwrap();
+    let unmatched = ruby["unmatched"].as_f64().unwrap() / ruby["samples"].as_f64().unwrap();
+    assert!(unmatched < 0.2, "{ruby}");
 }

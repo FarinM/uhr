@@ -11,6 +11,7 @@ pub use process::{Memory, Process};
 mod node;
 mod process;
 mod python;
+mod ruby;
 mod text;
 
 /// A runtime uhr supports.
@@ -318,7 +319,7 @@ pub enum Setting {
     },
 }
 
-pub static RUNTIMES: [&dyn Runtime; 2] = [&python::Python, &node::Node];
+pub static RUNTIMES: [&dyn Runtime; 3] = [&python::Python, &node::Node, &ruby::Ruby];
 
 /// The runtime a binary is, by its file name.
 pub fn binary_runtime(file: &str) -> Option<&'static str> {
@@ -551,6 +552,7 @@ mod tests {
         assert_eq!(binary_runtime("libpython3.13.so.1.0"), Some("python"));
         assert_eq!(binary_runtime("node"), Some("node"));
         assert_eq!(binary_runtime("libnode.so.115"), Some("node"));
+        assert_eq!(binary_runtime("libruby-3.2.so.3.2"), Some("ruby"));
         assert_eq!(binary_runtime("nodemon"), None);
     }
 }
