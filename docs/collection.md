@@ -268,56 +268,56 @@ for a native sampler, in perf map files or jitdump; a collector can read the
 interpreter's frames from its memory; or the runtime's own profiler can
 record them. Which way a runtime uses is decided when it is supported, and
 each supported runtime gets a test program. Python 3.12 and later and Node
-name their code in perf maps. uhr's eBPF programs read the frames of
-CPython 3.11 to 3.14 with the GIL, in a `python3` program or a `libpython`
-another program embeds it with, from offsets 3.13 and later publish and
-from the headers of 3.11 and 3.12. Off-CPU stacks come from perf's context
-switches, which read no frames, so only perf maps name Python's code in
-them. 3.12 and later keep the frame that starts each call into the
-interpreter in the call's native frame, and mark the state each thread runs
-in, among those of its interpreters. 3.11 does neither. They read the
-frames of V8 11 to 13, as Node 20 to 24 run them, without pointer
-compression, in a `node` program or a `libnode`, from the offsets their
-`v8dbg_` symbols publish and their headers for what they don't: V8 keeps them on the
-native stack, each JavaScript function's frame with its `JSFunction`, whose
-`SharedFunctionInfo` they read at the sample, as V8's garbage collector
-moves functions. That names its functions and their files, and the line
-and column each starts at, from the script's source. Lines within a
-function are not read yet.
-They read the frames of JavaScriptCore as Bun 1.4.3 runs it, by its build id:
-Bun's releases keep no symbols, and JavaScriptCore publishes no offsets,
-so they are those found in the build with symbols Bun publishes with each
-release, from the code that reads them, and the build ids of other
-releases are not read. Each JavaScript function's frame holds its
-`CodeBlock`, whose executable names it and its script. Where the build
-with symbols is kept by its build id with the system's debug info, it also
-names the interpreter's code, so that its frames take the place of the
-interpreter's native ones; without it they go just above them. Lines are
-not read yet. They read the frames of CRuby 3.2, in a `ruby` program or a `libruby`, from
-the headers of 3.2: CRuby keeps them in an array in each thread's
-execution context, which the thread-local `ruby_current_ec` points to, and
-says the line of each instruction, so that lines within a function are
-read. Its eval loop, which says where the frames go in the native stack, is
-a static function, which only the debug info of a stripped `libruby`
-names, where the system keeps it by build id. Without it they go just
-above the function that calls the eval loop, inside it. They read the
-frames of PHP 8.3 built without thread safety, as its command line is, from
-the headers of 8.3: a list from `executor_globals`, with each function's
-name, class and file, and the line of each instruction. PHP's VM keeps the
-instruction it runs in a register and saves it to the frame only when it
-calls, so the innermost frame's line is not known. They read the
-frames of Lua 5.4 as its `lua` program runs it, from the headers of 5.4:
-the program keeps the state it runs a script in, for its signal handler, in
-a static variable, which only its debug info names, as its eval loop. Lua
-functions have no names, so each is named as Lua's tracebacks name it, as
-in `function <app.lua:12>`, and the line of each instruction is read. As
-PHP's, Lua's VM saves the instruction it runs to the frame only before
-some instructions, such as calls, so the innermost frame's line is not
-known. The frames of coroutines other than the one the script runs in are
-not read.
-uhr detects the runtimes in a target and records their versions. What it knows about a
-runtime's frames is kept apart from how it reads memory, so other platforms
-can use it too.
+name their code in perf maps. uhr detects the runtimes in a target and
+records their versions. What it knows about a runtime's frames is kept apart
+from how it reads memory, so other platforms can use it too. uhr's eBPF
+programs read the frames of:
+
+- CPython 3.11 to 3.14 with the GIL, in a `python3` program or a
+  `libpython` another program embeds it with, from offsets 3.13 and later
+  publish and from the headers of 3.11 and 3.12. Off-CPU stacks come from
+  perf's context switches, which read no frames, so only perf maps name
+  Python's code in them. 3.12 and later keep the frame that starts each
+  call into the interpreter in the call's native frame, and mark the state
+  each thread runs in, among those of its interpreters. 3.11 does neither.
+- V8 11 to 13, as Node 20 to 24 run them, without pointer compression, in a
+  `node` program or a `libnode`, from the offsets their `v8dbg_` symbols
+  publish and their headers for what those don't. V8 keeps its frames on
+  the native stack, each JavaScript function's frame with its `JSFunction`,
+  whose `SharedFunctionInfo` the programs read at the sample, as V8's
+  garbage collector moves functions. That names its functions and their
+  files, and the line and column each starts at, from the script's source.
+  Lines within a function are not read yet.
+- JavaScriptCore as Bun 1.4.3 runs it, by its build id. Bun's releases keep
+  no symbols, and JavaScriptCore publishes no offsets, so they are those
+  found in the build with symbols Bun publishes with each release, from the
+  code that reads them, and other releases are not read. Each JavaScript
+  function's frame holds its `CodeBlock`, whose executable names it and its
+  script. Where the build with symbols is kept by its build id with the
+  system's debug info, it also names the interpreter's code, so that its
+  frames take the place of the interpreter's native ones; without it they
+  go just above them. Lines are not read yet.
+- CRuby 3.2, in a `ruby` program or a `libruby`, from the headers of 3.2.
+  CRuby keeps its frames in an array in each thread's execution context,
+  which the thread-local `ruby_current_ec` points to, and says the line of
+  each instruction. Its eval loop, which says where the frames go in the
+  native stack, is a static function, which only the debug info of a
+  stripped `libruby` names, where the system keeps it by build id. Without
+  it they go just above the function that calls the eval loop, inside it.
+- PHP 8.3 built without thread safety, as its command line is, from the
+  headers of 8.3: a list from `executor_globals`, with each function's name,
+  class and file, and the line of each instruction. PHP's VM keeps the
+  instruction it runs in a register and saves it to the frame only when it
+  calls, so the innermost frame's line is not known.
+- Lua 5.4 as its `lua` program runs it, from the headers of 5.4. The program
+  keeps the state it runs a script in, for its signal handler, in a static
+  variable, which only its debug info names, as its eval loop. Lua
+  functions have no names, so each is named as Lua's tracebacks name it, as
+  in `function <app.lua:12>`, and the line of each instruction is read. As
+  PHP's, Lua's VM saves the instruction it runs to the frame only before
+  some instructions, such as calls, so the innermost frame's line is not
+  known. The frames of coroutines other than the one the script runs in are
+  not read.
 
 uhr's eBPF programs walk interpreters' frames at each CPU sample, and know
 no runtime. Each runtime uhr supports is a module of `uhr-core`. One whose
@@ -341,9 +341,9 @@ and a runtime picks one and gives its offsets:
   first with frames. They search the first 256 states. uhr reads the rest
   from the process's memory, where samples say they did not find a thread's,
   and tells them.
-- On the native stack: each frame the programs' walk of the frame pointers
-  finds, at its frame pointer. This needs that walk, which they take on
-  x86-64, and not `--unwind dwarf` yet.
+- On the native stack, as V8 and JavaScriptCore keep them: each frame the
+  programs' walk of the frame pointers finds, at its frame pointer. This
+  needs that walk, which they take on x86-64, and not `--unwind dwarf` yet.
 
 Of each frame they copy the bytes at an offset from it, and up to two words
 read at the time of the sample at an offset from a pointer the copy holds,
@@ -351,9 +351,11 @@ as for objects a garbage collector can move before uhr reads them. The
 offsets come from what the runtime publishes, such as CPython's
 `_Py_DebugOffsets` and V8's `v8dbg_` symbols, from debug info, or from tables
 by version. A thread-local's path from the thread pointer comes from where
-the C library keeps the thread-locals of each module, and the index the
-dynamic linker gave the module, which it writes where the module's
-relocations say.
+glibc keeps the thread-locals of each module, and what the dynamic linker
+writes where the module's relocations say: the index it gave the module,
+or, for a TLS descriptor, as arm64 builds use, the variable's offset from
+the thread pointer or the module's index. Until it has written them, uhr
+looks again later.
 
 uhr looks for a process's runtime at its first sample, and again each time
 the process maps more code, as a runtime's library can be mapped after the
