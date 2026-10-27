@@ -4,7 +4,8 @@
 //!
 //! V8 says where its structures keep most of what uhr reads, for debuggers,
 //! in its `v8dbg_` symbols. Those don't say how a `ScopeInfo` lays out what
-//! follows its fixed fields, which is that of V8 13's headers.
+//! follows its fixed fields, which is that of the headers of V8 11, 12 and
+//! 13, as Node 20, 22 and 24 run them.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -26,19 +27,64 @@ const MAX_LINES: usize = 1 << 24;
 /// How deep a string of strings is read.
 const MAX_PARTS: usize = 64;
 
+/// The bit of `kUncachedExternalStringMask` in V8's headers, for V8 11,
+/// which does not publish its types of uncached strings.
+const UNCACHED_EXTERNAL_STRING: u16 = 1 << 4;
+
 /// Below this, no address is an object's.
 const MIN_ADDRESS: u64 = 4096;
 
-/// What V8 13 keeps in a `ScopeInfo` past its map, of 8-byte tagged
-/// values: its flags, the number of context locals and where the function
-/// starts in its script, then the parts its flags say it has.
+/// What a `ScopeInfo` keeps past its map, of 8-byte tagged values: its
+/// flags, the number of context locals, then the parts its flags say it
+/// has, with where the function starts in its script among them.
 const SCOPE_FLAGS: u64 = 8;
 const SCOPE_CONTEXT_LOCALS: u64 = 24;
-const SCOPE_START: u64 = 32;
-const SCOPE_PARTS: u64 = 48;
+const SCOPE_PARTS: u64 = 32;
 /// Context locals past this many keep their names in a table of their own.
 const SCOPE_MAX_INLINED_NAMES: u64 = 75;
-const MODULE_SCOPE: u32 = 5;
+
+/// How one major version of V8 lays out a `ScopeInfo`'s parts.
+#[derive(Debug, Clone, Copy)]
+struct Scopes {
+    /// Whether its flags are a Smi rather than 32 bits.
+    smi_flags: bool,
+    /// Whether where the function starts comes first, rather than after
+    /// its name, for the scopes that say.
+    position_first: bool,
+    /// Whether a module's scope keeps its number of variables before the
+    /// names of its locals, rather than last.
+    module_count_first: bool,
+    module_scope: u32,
+    /// The scopes that say where they start, where that comes after the
+    /// name, and a class's scope, which does where it is not empty.
+    positioned: &'static [u32],
+    class_scope: u32,
+}
+
+fn scopes(major: u32) -> Option<Scopes> {
+    // Function, script, eval, module and shadow realm scopes, as V8 11 and
+    // 12 number them.
+    let positioned = &[2, 4, 1, 3, 8];
+    match major {
+        11 | 12 => Some(Scopes {
+            smi_flags: true,
+            position_first: false,
+            module_count_first: major == 12,
+            module_scope: 3,
+            positioned,
+            class_scope: 0,
+        }),
+        13 => Some(Scopes {
+            smi_flags: false,
+            position_first: true,
+            module_count_first: true,
+            module_scope: 5,
+            positioned: &[],
+            class_scope: 2,
+        }),
+        _ => None,
+    }
+}
 
 /// The `v8dbg_` constants uhr reads, by name or by the start of one.
 #[derive(Debug, Clone)]
@@ -128,7 +174,10 @@ impl Layout {
             instance_type: offset("class_Map__instance_type")?,
             function_shared: offset("class_JSFunction__shared")?,
             shared_name: offset("class_SharedFunctionInfo__name_or_scope_info")?,
-            shared_script: offset("class_SharedFunctionInfo__script")?,
+            // A `DebugInfo` there before V8 12 is for a function being
+            // debugged.
+            shared_script: offset("class_SharedFunctionInfo__script")
+                .or_else(|_| offset("class_SharedFunctionInfo__script_or_debug_info"))?,
             script_name: offset("class_Script__name")?,
             script_source: offset("class_Script__source")?,
             script_line_ends: offset("class_Script__line_ends")?,
@@ -156,8 +205,13 @@ impl Layout {
             thin_tag: small("ThinStringTag")?,
             sliced_tag: small("SlicedStringTag")?,
             external_tag: small("ExternalStringTag")?,
-            uncached: small("type_UncachedExternalString__UNCACHED_EXTERNAL_ONE_BYTE_STRING_TYPE")?
-                ^ small("type_ExternalOneByteString__EXTERNAL_ONE_BYTE_STRING_TYPE")?,
+            uncached: match (
+                small("type_UncachedExternalString__UNCACHED_EXTERNAL_ONE_BYTE_STRING_TYPE"),
+                small("type_ExternalOneByteString__EXTERNAL_ONE_BYTE_STRING_TYPE"),
+            ) {
+                (Ok(uncached), Ok(cached)) => uncached ^ cached,
+                _ => UNCACHED_EXTERNAL_STRING,
+            },
         })
     }
 }
@@ -165,6 +219,7 @@ impl Layout {
 struct V8 {
     version: String,
     layout: Layout,
+    scopes: Scopes,
     walk: Walk,
     eval_loop: Vec<Range<u64>>,
     /// The lines of each script, by its address, `None` for one whose
@@ -217,12 +272,12 @@ impl V8 {
         };
         let (major, minor) = (part("6major")?, part("6minor")?);
         let version = format!("{major}.{minor}.{}.{}", part("6build")?, part("6patch")?);
-        if major != 13 {
+        let Some(scopes) = scopes(major) else {
             return Err(Error::Unsupported {
                 runtime: "node",
                 version: format!("V8 {version}"),
             });
-        }
+        };
         let layout = Layout::read(memory, symbols)?;
         let mut eval_loop: Vec<Range<u64>> = symbols
             .iter()
@@ -250,6 +305,7 @@ impl V8 {
         Ok(Self {
             version,
             layout,
+            scopes,
             walk,
             eval_loop,
             lines: RefCell::new(HashMap::new()),
@@ -399,22 +455,31 @@ impl V8 {
     /// script.
     fn scope(&self, memory: &dyn Memory, scope: u64) -> Result<(String, Option<u64>), Error> {
         let start = self.start(scope);
-        let flags = u32_at(memory, "a V8 scope's flags", start + SCOPE_FLAGS)?;
+        let scopes = &self.scopes;
         let word = |offset: u64| u64_at(memory, "a V8 scope", start + offset);
-        let is_empty = (flags >> 29) & 1 == 1;
+        let flags = match scopes.smi_flags {
+            true => self.smi(word(SCOPE_FLAGS)?).unwrap_or(0) as u32,
+            false => u32_at(memory, "a V8 scope's flags", start + SCOPE_FLAGS)?,
+        };
+        let (kind, is_empty) = (flags & 15, (flags >> 29) & 1 == 1);
         if is_empty {
             return Ok((String::new(), None));
         }
-        let position = self
-            .smi(word(SCOPE_START)?)
-            .and_then(|p| u64::try_from(p).ok());
+        let position_at = |at: u64| -> Result<Option<u64>, Error> {
+            Ok(self.smi(word(at)?).and_then(|p| u64::try_from(p).ok()))
+        };
         let locals = self
             .smi(word(SCOPE_CONTEXT_LOCALS)?)
             .and_then(|n| u64::try_from(n).ok())
             .filter(|&n| n < 1 << 20)
             .ok_or_else(|| Error::Invalid(format!("no V8 scope at {scope:#x}")))?;
         let mut at = SCOPE_PARTS;
-        if flags & 15 == MODULE_SCOPE {
+        let mut position = None;
+        if scopes.position_first {
+            position = position_at(at)?;
+            at += 16;
+        }
+        if kind == scopes.module_scope && scopes.module_count_first {
             at += 8;
         }
         // The names of the locals, or a table of them, then their kinds.
@@ -432,7 +497,16 @@ impl V8 {
             name = Some(word(at)?);
             at += 16;
         }
-        let inferred = ((flags >> 14) & 1 == 1).then(|| word(at)).transpose()?;
+        let mut inferred = None;
+        if (flags >> 14) & 1 == 1 {
+            inferred = Some(word(at)?);
+            at += 8;
+        }
+        if !scopes.position_first
+            && (scopes.positioned.contains(&kind) || kind == scopes.class_scope)
+        {
+            position = position_at(at)?;
+        }
         for candidate in [name, inferred].into_iter().flatten() {
             if self.is_string(memory, candidate)? {
                 let text = self.string(memory, candidate)?;

@@ -1,6 +1,6 @@
 //! End to end: uhr's eBPF programs reading the frames of CPython, V8,
 //! JavaScriptCore, CRuby and PHP. Needs root through sudo without a password,
-//! perf, a C compiler, and Python 3.11 or later, Node with V8 13, Bun 1.4.3,
+//! perf, a C compiler, and Python 3.11 or later, Node 20 or later, Bun 1.4.3,
 //! Ruby 3.2 or PHP 8.3, and skips without sudo. The test of a runtime that is
 //! missing checks nothing.
 #![cfg(target_os = "linux")]
@@ -618,9 +618,9 @@ fn v8_major(node: &Path) -> Option<u32> {
 
 /// A `node` whose V8 uhr reads the frames of.
 fn node() -> Option<PathBuf> {
-    let node = find("node").filter(|node| v8_major(node) == Some(13));
+    let node = find("node").filter(|node| v8_major(node).is_some_and(|v8| (11..=13).contains(&v8)));
     if node.is_none() {
-        eprintln!("skipped: needs Node with V8 13");
+        eprintln!("skipped: needs Node 20 or later");
     }
     node
 }
@@ -662,7 +662,6 @@ fn reads_v8_frames_when_attached() {
     has_the_split_of_jit_js(&recording);
     let walked = interpreters(&recording).unwrap();
     let v8 = walked.iter().find(|w| w["runtime"] == "node").unwrap();
-    assert!(v8["version"].as_str().unwrap().starts_with("13."), "{v8}");
     assert_eq!(v8["unread_frames"], 0, "{v8}");
 }
 

@@ -21,7 +21,8 @@ CPU-bound and one syscall-heavy test program. Past it, uhr records off-CPU
 time, attaches to running processes, unwinds with DWARF, names the code
 Python 3.12+ and Node compile, and runs eBPF programs of its own, which count
 and time syscalls, sample in place of perf and read the frames of CPython
-3.11 and later, of V8 13, as Node 24 runs it, of JavaScriptCore, as Bun
+3.11 and later, of V8 11 to 13, as Node 20 to 24 run them, of
+JavaScriptCore, as Bun
 1.4.3 runs it, of CRuby 3.2 and of PHP 8.3; see
 [collection](docs/collection.md#runtimes).
 
@@ -41,7 +42,7 @@ sudo uhr record -o rec -- ./my-program     # sampled by uhr's eBPF programs, whi
                                            # also count and time the syscalls
 sudo uhr record -o rec --pid 4312 --duration 10s
                                            # and they read the frames of Python
-                                           # 3.11+, Node 24, Bun 1.4.3, Ruby 3.2
+                                           # 3.11+, Node 20+, Bun 1.4.3, Ruby 3.2
                                            # and PHP 8.3, started any way
 uhr query rec --group-by syscall           # each syscall's time, and how often
                                            # it was called and how long it took

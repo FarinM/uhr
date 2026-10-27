@@ -276,9 +276,9 @@ switches, which read no frames, so only perf maps name Python's code in
 them. 3.12 and later keep the frame that starts each call into the
 interpreter in the call's native frame, and mark the state each thread runs
 in, among those of its interpreters. 3.11 does neither. They read the
-frames of V8 13, as Node 24 runs it, without pointer compression, in a
-`node` program or a `libnode`, from the offsets its `v8dbg_` symbols
-publish and the headers of V8 13 for what they don't: V8 keeps them on the
+frames of V8 11 to 13, as Node 20 to 24 run them, without pointer
+compression, in a `node` program or a `libnode`, from the offsets their
+`v8dbg_` symbols publish and their headers for what they don't: V8 keeps them on the
 native stack, each JavaScript function's frame with its `JSFunction`, whose
 `SharedFunctionInfo` they read at the sample, as V8's garbage collector
 moves functions. That names its functions and their files, and the line
