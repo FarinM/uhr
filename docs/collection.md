@@ -1,10 +1,10 @@
 # Collection
 
 How observations get into the [model](model.md). This doc lists what
-collectors must do and the candidate tools for each signal. The first
-milestone is in the [README](../README.md#status). Since it, uhr's eBPF
-programs read the frames of CPython 3.11 to 3.14, with the limits
-[runtimes](#runtimes) gives. What comes next is not decided.
+collectors must do and the candidate tools for each signal. What uhr records
+today is in the [README](../README.md#status), and the runtimes whose frames it
+reads, with their limits, in [runtimes](#runtimes). What comes next is not
+decided.
 
 ## Collector contract
 
@@ -185,22 +185,23 @@ they can walk an interpreter's frames in its memory without runtime flags,
 also in processes uhr attaches to. They can also capture what perf gets only
 from tracepoints, such as wakeups and syscall latency.
 
-- On x86-64 and arm64, they sample CPU time in place of perf, at each tick
-  of every CPU's clock, and take the kernel and user stacks of the target's
-  threads. They walk user stacks with frame pointers, or with `--unwind
-  dwarf` on x86-64 copy the user registers and stack, as perf does, for uhr
-  to unwind. perf then records only the processes' mappings and threads, and
-  the context switches. It samples instead with `--sampler perf`. The kernel
-  runs no program at a perf event while one at a kprobe or a tracepoint runs
-  on the same CPU, so the time in those, which other tools load, has no
-  samples. uhr's own that run at every syscall are at raw tracepoints, which
-  don't stop it, and the rest at rarer events, as a process starting or
-  mapping code. A thread running a virtual machine's guest has its time in
-  unknown mode and without frames, as with perf, told apart by the task flag
-  the kernel's own accounting uses, which uhr finds in the kernel's BTF. The
-  kernel drops the sampling event of a CPU going offline, as across a
-  suspend, so they see CPUs go and come back, and uhr starts sampling each
-  again once it is back.
+- On x86-64 and arm64, they sample CPU time in place of perf, at a timer on
+  each CPU, 999 times a second by default (`-F`), and take the kernel and
+  user stacks of the target's threads. The timer fires whichever process
+  runs on the CPU, and they return at once for others. They walk user stacks
+  with frame pointers, or with `--unwind dwarf` on x86-64 copy the user
+  registers and stack, as perf does, for uhr to unwind. perf then records
+  only the processes' mappings and threads, and the context switches. It
+  samples instead with `--sampler perf`. The kernel runs no program at a
+  perf event while one at a kprobe or a tracepoint runs on the same CPU, so
+  the time in those, which other tools load, has no samples. uhr's own that
+  run at every syscall are at raw tracepoints, which don't stop it, and the
+  rest at rarer events, as a process starting or mapping code. A thread
+  running a virtual machine's guest has its time in unknown mode and without
+  frames, as with perf, told apart by the task flag the kernel's own
+  accounting uses, which uhr finds in the kernel's BTF. The kernel drops the
+  sampling event of a CPU going offline, as across a suspend, so they see
+  CPUs go and come back, and uhr starts sampling each again once it is back.
 - They walk the frames of the interpreters uhr finds in the target's
   processes, and count the times each maps a file's code, so uhr knows when
   to look for one again, see [runtimes](#runtimes).
@@ -220,11 +221,16 @@ from tracepoints, such as wakeups and syscall latency.
   namespace, so uhr also has to run there, not in a container's own.
   Otherwise perf samples, and the recording says why it has no syscall
   counts. `--no-syscalls` leaves the counting out.
-- Their overhead is the target's CPU time in them, from its samples, and a
-  query gives the share of its own time in them. That leaves out the
-  kernel's way into them and their cost to other processes. The kernel's
-  run-time stats would measure those too, but they make every traced
-  syscall slower again.
+- Their overhead in a recording is the target's CPU time in them, from its
+  samples, and a query gives the share of its own time in them. That leaves
+  out the sampling program itself, as no sample lands in the program that
+  takes it, the kernel's way into them, and their cost to other processes.
+  The kernel's run-time stats measure each program's time, but they make
+  every traced syscall slower again, so uhr leaves them off. With them on,
+  on x86-64, a sample took about half a microsecond, frame walks included,
+  which at 999 a second is about 0.05% of a CPU, and a syscall's two
+  programs about 100 ns, which is 10% of a CPU at a million syscalls a
+  second.
 - Building them needs nightly Rust with `rust-src`, and `bpf-linker`.
   Without those uhr builds without them.
 
