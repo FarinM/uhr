@@ -91,9 +91,11 @@ pub(crate) struct Maps {
 }
 
 impl Finder {
-    pub(crate) fn start(maps: Maps) -> Self {
+    /// `frame_pointers` if the programs walk user stacks by their frame
+    /// pointers, rather than copy them.
+    pub(crate) fn start(maps: Maps, frame_pointers: bool) -> Self {
         let (sender, receiver) = mpsc::channel();
-        let thread = thread::spawn(move || find(receiver, maps));
+        let thread = thread::spawn(move || find(receiver, maps, frame_pointers));
         Self { sender, thread }
     }
 
@@ -146,7 +148,7 @@ const THREADS_EVERY_NS: u64 = 200_000_000;
 /// The most thread states uhr reads of a process.
 const MAX_STATES: usize = 1 << 16;
 
-fn find(receiver: Receiver<Walked>, mut maps: Maps) -> Interpreters {
+fn find(receiver: Receiver<Walked>, mut maps: Maps, frame_pointers: bool) -> Interpreters {
     let mut found = Interpreters::default();
     // By pid: the program it runs, and how far uhr is with it.
     let mut states: HashMap<u32, (u32, State)> = HashMap::new();
@@ -176,7 +178,7 @@ fn find(receiver: Receiver<Walked>, mut maps: Maps) -> Interpreters {
                 next_ns,
                 wait_ns,
             } if mapped.is_none_or(|had| walked.mapped > had) || monotonic_ns() >= *next_ns => {
-                match look(program, &mut maps.walks, &mut found) {
+                match look(program, &mut maps.walks, &mut found, frame_pointers) {
                     Ok(Some(next)) => *state = next,
                     Ok(None) => {
                         *mapped = (*mapped).max(Some(walked.mapped));
@@ -305,6 +307,7 @@ fn look(
     program: Program,
     walks: &mut BpfHashMap<MapData, u32, uhr_ebpf::Walk>,
     found: &mut Interpreters,
+    frame_pointers: bool,
 ) -> Result<Option<State>, String> {
     let pid = program.0;
     let Ok(process) = LiveProcess::open(pid) else {
@@ -320,6 +323,16 @@ fn look(
         }
         Err(error) => return Err(error.to_string()),
     };
+    // The programs walk the frame pointers themselves only on x86-64.
+    if interpreter.walk().frames == Frames::Native
+        && !(frame_pointers && cfg!(target_arch = "x86_64"))
+    {
+        return Err(format!(
+            "uhr reads the frames {} keeps on the native stack from the frame pointers its \
+             eBPF programs walk, which they do only on x86-64 and not with --unwind dwarf",
+            interpreter.runtime()
+        ));
+    }
     // Thread ids in states are in the process's PID namespace, which only
     // need translating where it is not uhr's.
     let namespace = pid_namespace(pid)

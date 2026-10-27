@@ -375,7 +375,7 @@ impl Programs {
             walks: aya::maps::HashMap::try_from(walks).map_err(|e| Error::Map("WALKS", e))?,
             threads: aya::maps::HashMap::try_from(threads).map_err(|e| Error::Map("THREADS", e))?,
         };
-        let finder = Finder::start(maps);
+        let finder = Finder::start(maps, sampling.stack_bytes.is_none());
         self.reader = Some(Reader::start(ring, &sampling.path, finder.sender())?);
         self.finder = Some(finder);
         Ok(())
