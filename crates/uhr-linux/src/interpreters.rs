@@ -314,7 +314,10 @@ fn look(
     let interpreter = match runtimes::interpreter(&process) {
         Ok(Some(interpreter)) => interpreter,
         Ok(None) => return Ok(None),
-        Err(runtimes::Error::Read { .. }) => return Ok(None),
+        Err(error @ runtimes::Error::Read { .. }) => {
+            debug!(pid, %error, "looking for its runtime again later");
+            return Ok(None);
+        }
         Err(error) => return Err(error.to_string()),
     };
     // Thread ids in states are in the process's PID namespace, which only
