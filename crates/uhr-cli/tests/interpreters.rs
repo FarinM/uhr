@@ -1,7 +1,8 @@
-//! End to end: uhr's eBPF programs reading the frames of CPython, V8, CRuby
-//! and PHP. Needs root through sudo without a password, perf, a C compiler,
-//! and Python 3.11 or later, Node with V8 13, Ruby 3.2 or PHP 8.3, and skips
-//! without sudo. The test of a runtime that is missing checks nothing.
+//! End to end: uhr's eBPF programs reading the frames of CPython, V8,
+//! JavaScriptCore, CRuby and PHP. Needs root through sudo without a password,
+//! perf, a C compiler, and Python 3.11 or later, Node with V8 13, Bun 1.4.3,
+//! Ruby 3.2 or PHP 8.3, and skips without sudo. The test of a runtime that is
+//! missing checks nothing.
 #![cfg(target_os = "linux")]
 
 mod common;
@@ -127,15 +128,15 @@ fn has_the_split_of(recording: &str, runtime: &str, program: &str) {
     let hot = runtime_function(&rows, runtime, "hot");
     let file = hot["file"].as_str().unwrap();
     assert!(file.ends_with(&format!("test-programs/{program}")), "{hot}");
-    // Python's functions group by name alone. Others group by where they
-    // start too, the line hot() is declared at.
+    // Python's functions group by name alone, and Bun's say no lines.
+    // Others group by where they start too, the line hot() is declared at.
     let id = hot["id"].as_str().unwrap();
     let start = id
         .strip_prefix(&format!("jit+{runtime}:hot"))
         .and_then(|id| id.strip_suffix(&format!(":{file}")))
         .unwrap_or_else(|| panic!("{hot}"));
     let line = match (runtime, program) {
-        ("python", _) => "",
+        ("python" | "bun", _) => "",
         (_, "jit.rb") => "@7",
         _ => "@8",
     };
@@ -818,4 +819,35 @@ fn calls_from_known_lines(recording: &str, function: &str, caller: &str, line: u
         .find(|r| r["function"] == caller && r["line"]["line"] == line)
         .unwrap_or_else(|| panic!("{lines:?}"));
     assert!(share(calls, "total_share") > 0.5, "{calls}");
+}
+
+/// A `bun` whose frames uhr reads: the release whose offsets it knows.
+fn bun() -> Option<PathBuf> {
+    let bun = find("bun").filter(|bun| {
+        let output = Command::new(bun).arg("--revision").output();
+        output.is_ok_and(|output| output.stdout.starts_with(b"1.4.3+c6da4a4d3"))
+    });
+    if bun.is_none() {
+        eprintln!("skipped: needs Bun 1.4.3");
+    }
+    bun
+}
+
+#[test]
+fn reads_bun_frames() {
+    let Some(bun) = bun() else {
+        return;
+    };
+    let dir = scratch("interpreters_bun");
+    let program = format!("{PROGRAMS}/jit.js");
+    let command = [bun.to_str().unwrap(), &program, "100"];
+    let Some(recording) = record(&dir, &[], &command) else {
+        return;
+    };
+    has_the_split_of(&recording, "bun", "jit.js");
+    let rows = functions(&recording);
+    let hot = share(runtime_function(&rows, "bun", "hot"), "total_share");
+    let warm = share(runtime_function(&rows, "bun", "warm"), "total_share");
+    let work = runtime_function(&rows, "bun", "work");
+    assert!(share(work, "total_share") >= hot + warm - 0.01, "{work}");
 }

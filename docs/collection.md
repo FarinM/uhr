@@ -284,7 +284,16 @@ native stack, each JavaScript function's frame with its `JSFunction`, whose
 moves functions. That names its functions and their files, and the line
 and column each starts at, from the script's source. Lines within a
 function are not read yet.
-They read the frames of CRuby 3.2, in a `ruby` program or a `libruby`, from
+They read the frames of JavaScriptCore as Bun 1.4.3 runs it, by its build id:
+Bun's releases keep no symbols, and JavaScriptCore publishes no offsets,
+so they are those found in the build with symbols Bun publishes with each
+release, from the code that reads them, and the build ids of other
+releases are not read. Each JavaScript function's frame holds its
+`CodeBlock`, whose executable names it and its script. Where the build
+with symbols is kept by its build id with the system's debug info, it also
+names the interpreter's code, so that its frames take the place of the
+interpreter's native ones; without it they go just above them. Lines are
+not read yet. They read the frames of CRuby 3.2, in a `ruby` program or a `libruby`, from
 the headers of 3.2: CRuby keeps them in an array in each thread's
 execution context, which the thread-local `ruby_current_ec` points to, and
 says the line of each instruction, so that lines within a function are
@@ -332,11 +341,9 @@ as for objects a garbage collector can move before uhr reads them. The
 offsets come from what the runtime publishes, such as CPython's
 `_Py_DebugOffsets` and V8's `v8dbg_` symbols, from debug info, or from tables
 by version. A thread-local's path from the thread pointer comes from where
-glibc keeps the thread-locals of each module, and what the dynamic linker
-writes where the module's relocations say: the index it gave the module,
-or, for a TLS descriptor, as arm64 builds use, the variable's offset from
-the thread pointer or the module's index. Until it has written them, uhr
-looks again later.
+the C library keeps the thread-locals of each module, and the index the
+dynamic linker gave the module, which it writes where the module's
+relocations say.
 
 uhr looks for a process's runtime at its first sample, and again each time
 the process maps more code, as a runtime's library can be mapped after the

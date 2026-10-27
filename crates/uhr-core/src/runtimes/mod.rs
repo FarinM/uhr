@@ -8,6 +8,7 @@ use std::ops::Range;
 
 pub use process::{Memory, Process};
 
+mod bun;
 mod node;
 mod php;
 mod process;
@@ -331,7 +332,13 @@ pub enum Setting {
     },
 }
 
-pub static RUNTIMES: [&dyn Runtime; 4] = [&python::Python, &node::Node, &ruby::Ruby, &php::Php];
+pub static RUNTIMES: [&dyn Runtime; 5] = [
+    &python::Python,
+    &node::Node,
+    &bun::Bun,
+    &ruby::Ruby,
+    &php::Php,
+];
 
 /// The runtime a binary is, by its file name.
 pub fn binary_runtime(file: &str) -> Option<&'static str> {
@@ -566,6 +573,7 @@ mod tests {
         assert_eq!(binary_runtime("libnode.so.115"), Some("node"));
         assert_eq!(binary_runtime("libruby-3.2.so.3.2"), Some("ruby"));
         assert_eq!(binary_runtime("php8.3"), Some("php"));
+        assert_eq!(binary_runtime("bun"), Some("bun"));
         assert_eq!(binary_runtime("nodemon"), None);
     }
 }

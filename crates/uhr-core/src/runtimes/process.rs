@@ -49,7 +49,9 @@ pub(super) fn symbols(
             let Ok(name) = symbol.name() else {
                 continue;
             };
-            if symbol.is_definition() && wanted(name) {
+            // Labels, such as one that marks where code ends, are no
+            // definitions, but are in a section.
+            if symbol.section_index().is_some() && wanted(name) {
                 let start = symbol.address().wrapping_add(bias);
                 found
                     .entry(name.to_owned())
@@ -69,6 +71,98 @@ pub(super) fn symbols(
         add(&debug);
     }
     Ok(found)
+}
+
+/// The build id of the 64-bit ELF file a mapping maps from its start, read
+/// from the notes the program headers say it holds, in the process's
+/// memory, which saves reading the file.
+pub(super) fn mapped_build_id(memory: &dyn Memory, mapping: &Mapping) -> Option<Vec<u8>> {
+    const PT_NOTE: u32 = 4;
+    const NT_GNU_BUILD_ID: u32 = 3;
+    if mapping.file_offset != 0 {
+        return None;
+    }
+    let size = mapping.end - mapping.start;
+    let header = bytes_at(memory, "an ELF header", mapping.start, 64).ok()?;
+    if &header[..5] != b"\x7fELF\x02" {
+        return None;
+    }
+    let half = |at: usize| u64::from(u16::from_le_bytes([header[at], header[at + 1]]));
+    let (table, entry, count) = (
+        u64::from_le_bytes(header[32..40].try_into().ok()?),
+        half(54),
+        half(56),
+    );
+    if table + entry * count > size || entry < 56 {
+        return None;
+    }
+    let headers = bytes_at(
+        memory,
+        "ELF program headers",
+        mapping.start + table,
+        (entry * count) as usize,
+    )
+    .ok()?;
+    for header in headers.chunks_exact(entry as usize) {
+        let kind = u32::from_le_bytes(header[0..4].try_into().ok()?);
+        let offset = u64::from_le_bytes(header[8..16].try_into().ok()?);
+        let length = u64::from_le_bytes(header[32..40].try_into().ok()?);
+        if kind != PT_NOTE || offset + length > size || length > 1 << 16 {
+            continue;
+        }
+        let notes = bytes_at(memory, "ELF notes", mapping.start + offset, length as usize).ok()?;
+        let mut at = 0;
+        while at + 12 <= notes.len() {
+            let word =
+                |at: usize| u32::from_le_bytes(notes[at..at + 4].try_into().unwrap()) as usize;
+            let (name, desc, kind) = (word(at), word(at + 4), word(at + 8) as u32);
+            let name_at = at + 12;
+            let desc_at = name_at + name.next_multiple_of(4);
+            let end = desc_at + desc.next_multiple_of(4);
+            if end > notes.len() {
+                break;
+            }
+            if kind == NT_GNU_BUILD_ID && &notes[name_at..name_at + name] == b"GNU\0" {
+                return Some(notes[desc_at..desc_at + desc].to_vec());
+            }
+            at = end;
+        }
+    }
+    None
+}
+
+/// Where the symbols `wanted` of the separate debug info of the file with
+/// `build_id` are in the process, mapped by `mapping`, where the system
+/// keeps that info. Debug info keeps the program headers of its file, which
+/// say where the mapping put it.
+pub(super) fn debug_symbols(
+    process: &dyn Process,
+    mapping: &Mapping,
+    build_id: &[u8],
+    wanted: impl Fn(&str) -> bool,
+) -> HashMap<String, Range<u64>> {
+    let mut found = HashMap::new();
+    let Some(bytes) = process.debug_file(build_id) else {
+        return found;
+    };
+    let Ok(file) = object::File::parse(&*bytes) else {
+        return found;
+    };
+    let Some(bias) = bias(&file, mapping) else {
+        return found;
+    };
+    for symbol in file.symbols() {
+        if let Ok(name) = symbol.name()
+            && symbol.section_index().is_some()
+            && wanted(name)
+        {
+            let start = symbol.address().wrapping_add(bias);
+            found
+                .entry(name.to_owned())
+                .or_insert(start..start + symbol.size());
+        }
+    }
+    found
 }
 
 fn read_file(process: &dyn Process, mapping: &Mapping) -> Result<Vec<u8>, Error> {
