@@ -275,8 +275,16 @@ from the headers of 3.11 and 3.12. Off-CPU stacks come from perf's context
 switches, which read no frames, so only perf maps name Python's code in
 them. 3.12 and later keep the frame that starts each call into the
 interpreter in the call's native frame, and mark the state each thread runs
-in, among those of its interpreters. 3.11 does neither. uhr detects the
-runtimes in a target and records their versions. What it knows about a
+in, among those of its interpreters. 3.11 does neither. They read the
+frames of V8 13, as Node 24 runs it, without pointer compression, in a
+`node` program or a `libnode`, from the offsets its `v8dbg_` symbols
+publish and the headers of V8 13 for what they don't: V8 keeps them on the
+native stack, each JavaScript function's frame with its `JSFunction`, whose
+`SharedFunctionInfo` they read at the sample, as V8's garbage collector
+moves functions. That names its functions and their files, and the line
+and column each starts at, from the script's source. Lines within a
+function are not read yet.
+uhr detects the runtimes in a target and records their versions. What it knows about a
 runtime's frames is kept apart from how it reads memory, so other platforms
 can use it too.
 

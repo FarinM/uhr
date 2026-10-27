@@ -1,7 +1,7 @@
-//! End to end: uhr's eBPF programs reading CPython's frames. Needs root
-//! through sudo without a password, perf, a C compiler and Python 3.11 or
-//! later, and skips without sudo. The test of a Python that is missing
-//! checks nothing.
+//! End to end: uhr's eBPF programs reading the frames of CPython and V8.
+//! Needs root through sudo without a password, perf, a C compiler, and
+//! Python 3.11 or later or Node with V8 13, and skips without sudo. The test
+//! of a runtime that is missing checks nothing.
 #![cfg(target_os = "linux")]
 
 mod common;
@@ -96,9 +96,13 @@ fn functions(recording: &str) -> Vec<Value> {
 /// The row of the Python function `name`, read from the interpreter's
 /// frames or named in a perf map, which are one function.
 fn python_function<'a>(rows: &'a [Value], name: &str) -> &'a Value {
+    runtime_function(rows, "python", name)
+}
+
+fn runtime_function<'a>(rows: &'a [Value], runtime: &str, name: &str) -> &'a Value {
     rows.iter()
-        .find(|r| r["module"] == "[python]" && r["function"] == name)
-        .unwrap_or_else(|| panic!("no Python function {name}"))
+        .find(|r| r["module"] == format!("[{runtime}]") && r["function"] == name)
+        .unwrap_or_else(|| panic!("no {runtime} function {name}"))
 }
 
 fn share(row: &Value, which: &str) -> f64 {
@@ -114,15 +118,33 @@ fn has_the_split_of_jit_py(recording: &str) {
 }
 
 fn has_the_split_of_hot_and_warm(recording: &str) {
+    has_the_split_of(recording, "python", "jit.py");
+}
+
+/// That `program` of `runtime` spent its time as jit.py does.
+fn has_the_split_of(recording: &str, runtime: &str, program: &str) {
     let rows = functions(recording);
-    let hot = python_function(&rows, "hot");
-    assert_eq!(hot["module"], "[python]", "{hot}");
+    let hot = runtime_function(&rows, runtime, "hot");
     let file = hot["file"].as_str().unwrap();
-    assert!(file.ends_with("test-programs/jit.py"), "{hot}");
-    assert_eq!(hot["id"], format!("jit+python:hot:{file}"));
+    assert!(file.ends_with(&format!("test-programs/{program}")), "{hot}");
+    // Python's functions group by name alone. Others group by where they
+    // start too, the line hot() is declared at.
+    let id = hot["id"].as_str().unwrap();
+    let start = id
+        .strip_prefix(&format!("jit+{runtime}:hot"))
+        .and_then(|id| id.strip_suffix(&format!(":{file}")))
+        .unwrap_or_else(|| panic!("{hot}"));
+    let line = match (runtime, program) {
+        ("python", _) => "",
+        _ => "@8",
+    };
+    assert!(
+        start == line || start.starts_with(&format!("{line}%3A")) && !line.is_empty(),
+        "{hot}"
+    );
     let (hot, warm) = (
         share(hot, "self_share"),
-        share(python_function(&rows, "warm"), "self_share"),
+        share(runtime_function(&rows, runtime, "warm"), "self_share"),
     );
     let split = hot / (hot + warm);
     assert!(hot + warm > 0.7, "hot {hot}, warm {warm}");
@@ -580,4 +602,88 @@ fn counts_each_program_a_process_runs_apart() {
     // 3.12 only starts up before its exec.
     let (old, new) = (of("3.12").unwrap_or(0), of("3.14").unwrap());
     assert!(old < 50 && new > 300, "{found:?}");
+}
+
+/// The major version of the V8 `node` runs.
+fn v8_major(node: &Path) -> Option<u32> {
+    let output = Command::new(node)
+        .args(["-p", "process.versions.v8"])
+        .output()
+        .ok()?;
+    let version = String::from_utf8(output.stdout).ok()?;
+    version.split('.').next()?.trim().parse().ok()
+}
+
+/// A `node` whose V8 uhr reads the frames of.
+fn node() -> Option<PathBuf> {
+    let node = find("node").filter(|node| v8_major(node) == Some(13));
+    if node.is_none() {
+        eprintln!("skipped: needs Node with V8 13");
+    }
+    node
+}
+
+/// That jit.js spent its time as it does, with every walked sample under
+/// work().
+fn has_the_split_of_jit_js(recording: &str) {
+    has_the_split_of(recording, "node", "jit.js");
+    let rows = functions(recording);
+    let (hot, warm, work) = (
+        runtime_function(&rows, "node", "hot"),
+        runtime_function(&rows, "node", "warm"),
+        runtime_function(&rows, "node", "work"),
+    );
+    let under = share(hot, "total_share") + share(warm, "total_share");
+    assert!(share(work, "total_share") >= under - 0.01, "{work}");
+}
+
+#[test]
+fn reads_v8_frames_when_attached() {
+    let Some(node) = node() else {
+        return;
+    };
+    let dir = scratch("interpreters_v8_attached");
+    let program = format!("{PROGRAMS}/jit.js");
+    let mut target = Command::new(&node)
+        .args([&program, "300"])
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    thread::sleep(Duration::from_millis(300));
+    let pid = target.id().to_string();
+    let recording = record(&dir, &["--pid", &pid, "--duration", "1s"], &[]);
+    let _ = target.kill();
+    let _ = target.wait();
+    let Some(recording) = recording else {
+        return;
+    };
+    has_the_split_of_jit_js(&recording);
+    let walked = interpreters(&recording).unwrap();
+    let v8 = walked.iter().find(|w| w["runtime"] == "node").unwrap();
+    assert!(v8["version"].as_str().unwrap().starts_with("13."), "{v8}");
+    assert_eq!(v8["unread_frames"], 0, "{v8}");
+}
+
+#[test]
+fn counts_a_v8_call_a_perf_map_names_once() {
+    let Some(node) = node() else {
+        return;
+    };
+    let dir = scratch("interpreters_v8_perf_maps");
+    let program = format!("{PROGRAMS}/jit.js");
+    let command = [node.to_str().unwrap(), &program, "60"];
+    let Some(recording) = record_as_root(&dir, &[], &command, true) else {
+        return;
+    };
+    has_the_split_of_jit_js(&recording);
+    for name in ["hot", "warm", "work"] {
+        let rows = functions(&recording);
+        let id = runtime_function(&rows, "node", name)["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let paths = call_paths(&recording, &id);
+        let again = |node: &Value| node["id"].as_str() == Some(&id);
+        assert!(!has(&paths["callees"], &again), "{name}: {paths}");
+    }
 }

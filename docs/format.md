@@ -113,7 +113,7 @@ Each stream has:
 | Column | Type | Meaning |
 |---|---|---|
 | `frame_id` | uint32 | |
-| `origin` | string | `binary`, `kernel`, `jit`, `interpreted` or `unresolved`. See [frames](model.md#frames). `jit` is code a runtime compiled in anonymous memory, which its perf map names. `interpreted` is a frame of an interpreter, such as CPython's, which uhr read from its memory |
+| `origin` | string | `binary`, `kernel`, `jit`, `interpreted` or `unresolved`. See [frames](model.md#frames). `jit` is code a runtime compiled in anonymous memory, which its perf map names. `interpreted` is a frame of the program's code that uhr read from its runtime, such as CPython's from its memory, or V8's from the native stack, whether the runtime interpreted that code or compiled it |
 | `address` | uint64 | Address in the process, or in the kernel |
 | `mapping_id` | uint32, nullable | Region containing the address. Null if none is known |
 | `file_offset` | uint64, nullable | Offset in the mapped file. Null without a file mapping |
@@ -185,10 +185,10 @@ newer name holds, so samples of the older code there get the newer name.
 | `name` | string | As the runtime wrote it, as in `py::inner:/app/spin.py` or `JS:*parse /app/x.js:42:7` |
 
 `interpreted_code`, one row per piece of code interpreted frames ran in a
-process, such as a Python function's code object. uhr reads it from the
-process's memory while recording, the only time it can. A process can free
-code and put other code at its address later, which then keeps the name of
-the first.
+process, such as a Python function's code object or a JavaScript function's
+`SharedFunctionInfo`. uhr reads it from the process's memory while
+recording, the only time it can. A process can free code and put other code
+at its address later, which then keeps the name of the first.
 
 | Column | Type | Meaning |
 |---|---|---|

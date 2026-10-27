@@ -20,8 +20,9 @@ stacks; native symbol resolution; `overview`, `query` and `call_paths`; one
 CPU-bound and one syscall-heavy test program. Past it, uhr records off-CPU
 time, attaches to running processes, unwinds with DWARF, names the code
 Python 3.12+ and Node compile, and runs eBPF programs of its own, which count
-and time syscalls, sample in place of perf and read CPython's frames, 3.11
-and later; see [collection](docs/collection.md#runtimes).
+and time syscalls, sample in place of perf and read the frames of CPython
+3.11 and later and of V8 13, as Node 24 runs it; see
+[collection](docs/collection.md#runtimes).
 
 ## Try it
 
@@ -39,7 +40,7 @@ sudo uhr record -o rec -- ./my-program     # sampled by uhr's eBPF programs, whi
                                            # also count and time the syscalls
 sudo uhr record -o rec --pid 4312 --duration 10s
                                            # and they read the frames of Python
-                                           # 3.11+, started any way
+                                           # 3.11+ and Node 24, started any way
 uhr query rec --group-by syscall           # each syscall's time, and how often
                                            # it was called and how long it took
 uhr overview rec                           # computing or waiting? CPU time by mode

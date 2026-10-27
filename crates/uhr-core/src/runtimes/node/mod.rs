@@ -1,6 +1,8 @@
 //! Node, and the V8 engine it runs on.
 
-use super::{JitCode, JitFunction, PerfMaps, Runtime, Setting};
+use super::{Error, Interpreter, JitCode, JitFunction, PerfMaps, Process, Runtime, Setting};
+
+mod v8;
 
 pub(super) struct Node;
 
@@ -30,6 +32,10 @@ impl Runtime for Node {
 
     fn perf_maps(&self) -> Option<&PerfMaps> {
         Some(&PERF_MAPS)
+    }
+
+    fn interpreter(&self, process: &dyn Process) -> Result<Option<Box<dyn Interpreter>>, Error> {
+        v8::find(self, process)
     }
 }
 

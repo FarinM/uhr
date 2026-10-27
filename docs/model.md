@@ -71,7 +71,7 @@ A frame must record its **origin**, not only a name:
 | kernel | kernel or kernel module function |
 | bpf_prog | JIT-compiled eBPF program |
 | jit | JIT-compiled code, with runtime and tier (baseline, optimized) when known |
-| interpreted | interpreter-level frame (Python, Ruby, bytecode VMs) |
+| interpreted | frame of the program's code read from its runtime (Python, Ruby, JavaScript, bytecode VMs), interpreted or compiled |
 | unresolved | code of unknown kind, such as anonymous executable memory without a JIT map, kept with the region it falls in |
 
 Each frame also has the address, function, module, file:line when known, and
