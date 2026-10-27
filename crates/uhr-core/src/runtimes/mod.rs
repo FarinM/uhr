@@ -11,6 +11,7 @@ pub use process::{Memory, Process};
 mod node;
 mod process;
 mod python;
+mod text;
 
 /// A runtime uhr supports.
 pub trait Runtime: Sync {

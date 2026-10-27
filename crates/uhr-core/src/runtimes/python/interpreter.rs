@@ -12,6 +12,7 @@ use std::iter::Peekable;
 use std::ops::Range;
 
 use super::super::process::{bytes_at, symbols, u32_at, u64_at};
+use super::super::text;
 use super::super::{Code, Error, Interpreter, Memory, Process, Runtime, Walk, WalkedFrame};
 use crate::recording::Mapping;
 
@@ -403,17 +404,8 @@ impl CPython {
             _ => u32::from_ne_bytes(c.try_into().unwrap()),
         });
         // CPython keeps the bytes of a file name that are not UTF-8 as
-        // lone surrogates, which are no characters. Escaped, with `\`, two
-        // names stay apart.
-        let mut text = String::with_capacity(length as usize);
-        for c in chars {
-            match char::from_u32(c) {
-                Some('\\') => text.push_str("\\\\"),
-                Some(c) => text.push(c),
-                None => text.push_str(&format!("\\u{c:04x}")),
-            }
-        }
-        Ok(text)
+        // lone surrogates, which are no characters.
+        Ok(text::chars(chars))
     }
 }
 
