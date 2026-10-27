@@ -117,9 +117,11 @@ const SYSCALLS: [&str; 2] = ["sys_enter", "sys_exit"];
 
 const SAMPLER: &str = "sample";
 
-/// The programs the sampler goes on in to walk interpreter frames: in the
-/// runtime's memory, and on the native stack.
-const WALKERS: [&str; 2] = ["walk_frames", "walk_native"];
+/// The programs the sampler goes on in to walk interpreter frames, by
+/// their place in `PROGRAMS`: to find a thread's state in the runtime, to
+/// walk frames on the native stack, and to walk them in the runtime's
+/// memory from the state.
+const WALKERS: [&str; 3] = ["walk_frames", "walk_native", "walk_memory"];
 
 /// The program that sees CPUs go offline and online, and the tracepoint it
 /// runs at.
@@ -794,20 +796,25 @@ struct Layout {
     exits: Option<(u32, u32)>,
     /// `task_struct.self_exec_id`, how many times the process exec'd.
     exec_id: Option<u32>,
+    /// Where a `task_struct` keeps the user thread pointer, which
+    /// thread-locals are found from.
+    thread_pointer: Option<u32>,
 }
 
 impl Layout {
     fn read() -> Self {
-        let [task_flags, signal, live, exec_id] = btf::kernel_member_offsets([
+        let [task_flags, signal, live, exec_id, thread_pointer] = btf::kernel_member_offsets([
             ("task_struct", "flags"),
             ("task_struct", "signal"),
             ("signal_struct", "live"),
             ("task_struct", "self_exec_id"),
+            ("task_struct", btf::THREAD_POINTER),
         ]);
         Self {
             task_flags,
             exits: signal.zip(live),
             exec_id,
+            thread_pointer,
         }
     }
 }
@@ -840,6 +847,7 @@ fn load(sampling: Option<&Sampling>, layout: Layout) -> Result<Ebpf, Error> {
     let stack_bytes = stack_bytes.unwrap_or(0);
     let task_flags = layout.task_flags.unwrap_or(u32::MAX);
     let exec_id = layout.exec_id.unwrap_or(u32::MAX);
+    let thread_pointer = layout.thread_pointer.unwrap_or(u32::MAX);
     let (signal, live) = layout.exits.unwrap_or((u32::MAX, u32::MAX));
     #[cfg(uhr_ebpf)]
     {
@@ -851,6 +859,7 @@ fn load(sampling: Option<&Sampling>, layout: Layout) -> Result<Ebpf, Error> {
             .override_global("STACK_BYTES", &stack_bytes, CAN_SAMPLE)
             .override_global("TASK_FLAGS", &task_flags, CAN_SAMPLE)
             .override_global("TASK_EXEC_ID", &exec_id, CAN_SAMPLE)
+            .override_global("TASK_THREAD_POINTER", &thread_pointer, CAN_SAMPLE)
             .override_global("TASK_SIGNAL", &signal, true)
             .override_global("SIGNAL_LIVE", &live, true)
             .load(PROGRAMS)
@@ -858,7 +867,15 @@ fn load(sampling: Option<&Sampling>, layout: Layout) -> Result<Ebpf, Error> {
     }
     #[cfg(not(uhr_ebpf))]
     {
-        let _ = (size, max_stack, stack_bytes, task_flags, signal, live);
+        let _ = (
+            size,
+            max_stack,
+            stack_bytes,
+            task_flags,
+            signal,
+            live,
+            thread_pointer,
+        );
         let _ = EbpfLoader::new;
         Err(Error::NotBuilt)
     }

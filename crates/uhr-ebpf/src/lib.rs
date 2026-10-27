@@ -98,8 +98,8 @@ pub const MAX_WALKED_BYTES: usize = 128;
 pub const WALKED_BYTES: usize = 1 << 14;
 const _: () = assert!(MAX_WALKED_FRAMES * MAX_WALKED_BYTES < WALKED_BYTES);
 
-/// The most pointers followed to a process's lists of thread states, from a
-/// state to its innermost frame, or for a read.
+/// The most pointers followed to a process's lists of thread states, or
+/// from a state to its innermost frame.
 pub const MAX_PATH: usize = 4;
 
 /// The most thread states searched for the sampled thread's, and lists of
@@ -120,18 +120,29 @@ pub mod frames {
     /// On the native stack: each frame the sampler's walk of frame pointers
     /// finds, at its frame pointer.
     pub const NATIVE: u32 = 1;
+    /// In the runtime's memory: from the sampled thread's thread pointer
+    /// to the innermost frame, as for a runtime that keeps it in a
+    /// thread-local, then from frame to frame.
+    pub const THREAD_POINTER: u32 = 2;
 }
 
-/// A word read at the time of a sample by following pointers from a word
-/// of a frame's copy.
+/// How a walk in the runtime's memory gets from a frame to the next one
+/// outward, of `Walk::step`.
+pub mod step {
+    /// By the pointer at `Walk::next_frame` in the frame.
+    pub const POINTER: u32 = 0;
+    /// `Walk::next_frame` bytes on, as in an array of frames.
+    pub const STRIDE: u32 = 1;
+}
+
+/// A word read at the time of a sample at a signed offset from a pointer a
+/// frame's copy holds. Offsets in paths in `Walk` are signed too.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Read {
-    /// Where the copy holds the word to start from.
+    /// Where the copy holds the pointer.
     pub word: u32,
-    pub path_len: u32,
-    /// Each step reads the pointer at this offset from the one before.
-    pub path: [i32; MAX_PATH],
+    pub offset: i32,
 }
 
 /// How uhr's programs find and copy a runtime's frames in one process. uhr
@@ -171,22 +182,35 @@ pub struct Walk {
     /// for a runtime that does not.
     pub active: u32,
     pub active_mask: u32,
+    /// For `frames::THREAD_POINTER`: the pointers to follow from the
+    /// thread pointer to the thread's state, as for `lists`.
+    pub state: [u32; MAX_PATH],
+    pub state_len: u32,
     /// The pointers to follow from a thread's state to its innermost frame,
     /// as for `lists`.
     pub frame: [u32; MAX_PATH],
     pub frame_len: u32,
-    /// Where a frame holds the next one outward.
+    /// How to get from a frame to the next one outward, of `step`, and
+    /// where the frame holds it or how far on it is.
+    pub step: u32,
     pub next_frame: u32,
+    /// For `step::STRIDE`: the frames end at the pointer the state holds at
+    /// `end_start`, plus `end_scale` times the number it holds at
+    /// `end_count`.
+    pub end_start: u32,
+    pub end_count: u32,
+    pub end_scale: u32,
     /// Where each frame's copy starts, from its address, and its bytes.
     pub copy_from: i32,
     pub frame_bytes: u32,
     /// The words to read for each frame, which follow its copy.
     pub reads: [Read; MAX_READS],
     pub reads_len: u32,
+    pub pad: u32,
 }
 
 // No padding, which `Pod` needs.
-const _: () = assert!(core::mem::size_of::<Walk>() == 160);
+const _: () = assert!(core::mem::size_of::<Walk>() == 168);
 
 /// How a sample's walk of interpreter frames went.
 pub mod walk {

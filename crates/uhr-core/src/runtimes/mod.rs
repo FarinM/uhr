@@ -81,6 +81,12 @@ pub enum Frames {
 pub enum Thread {
     /// In the thread's state, which the runtime keeps in lists.
     States(States),
+    /// In the thread's state, at the end of the pointers `state` follows
+    /// from its thread pointer, each at a signed offset from the one before,
+    /// as for a runtime that keeps the state in a thread-local. A null one
+    /// says the runtime does not run on the thread. Its innermost frame is
+    /// at the end of the pointers `frame` follows from the state.
+    ThreadPointer { state: Vec<i32>, frame: Vec<u32> },
 }
 
 /// How to get from a frame to the next one outward.
@@ -89,6 +95,19 @@ pub enum Step {
     /// Follow the pointer the frame holds at this offset. A null one ends
     /// the walk.
     Pointer(u32),
+    /// The next frame is `bytes` on, as in an array of frames, until
+    /// `end`.
+    Stride { bytes: i32, end: ArrayEnd },
+}
+
+/// Where an array of frames ends, as the thread's state says: at the
+/// pointer it holds at `start`, plus `scale` times the number it holds at
+/// `count`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ArrayEnd {
+    pub start: u32,
+    pub count: u32,
+    pub scale: u32,
 }
 
 /// What the sampler copies of each frame.
@@ -103,14 +122,13 @@ pub struct Copy {
     pub reads: Vec<Read>,
 }
 
-/// A word read by following pointers from a word of a frame's copy. It
-/// reads as 0 where a pointer is null or can't be read.
+/// A word read at an offset from a pointer a frame's copy holds. It reads
+/// as 0 where the pointer is null or the word can't be read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Read {
-    /// Where the copy holds the word to start from.
+    /// Where the copy holds the pointer.
     pub word: u32,
-    /// Each step reads the pointer at this offset past the one before.
-    pub path: Vec<i32>,
+    pub offset: i32,
 }
 
 /// Thread states in lists, one for each entry of an outer list, as CPython

@@ -71,9 +71,14 @@ static COPIES: Array<Copy> = Array::with_max_entries(1, 0);
 #[unsafe(no_mangle)]
 static STACK_BYTES: Global<u32> = Global::new(0);
 
-/// `walk_frames`, which uhr puts at 0, and `walk_native` at 1.
+/// `walk_frames`, which uhr puts at 0, `walk_native` at 1 and
+/// `walk_memory` at 2.
 #[map]
-static PROGRAMS: ProgramArray = ProgramArray::with_max_entries(2, 0);
+static PROGRAMS: ProgramArray = ProgramArray::with_max_entries(3, 0);
+
+/// The state of the thread `walk_frames` found, for `walk_memory`.
+#[map]
+static STATES: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
 
 /// Where `walk_frames` walks a sample's interpreter frames before it copies
 /// them into the sample, so that the verifier checks the walk once, not for
@@ -235,17 +240,45 @@ fn copied(header: &SampleHeader) -> usize {
     kernel * FRAME + copy
 }
 
-/// The rest of a sample of a process whose runtime uhr knows: walks the
-/// thread's interpreter frames, after what `sample` put together, and
-/// writes the sample.
+/// The rest of a sample of a process whose runtime uhr knows, after what
+/// `sample` put together: finds the state of the thread in the runtime, and
+/// has `walk_memory` walk its frames, so that the verifier checks the
+/// search and the walk apart. Writes the sample where it can't go on.
 #[perf_event]
-pub fn walk_frames(_ctx: PerfEventContext) -> u32 {
+pub fn walk_frames(ctx: PerfEventContext) -> u32 {
     let (tgid, tid) = current();
     let Some(walked) = WALKED.get_ptr_mut(0) else {
         return 0;
     };
     let walked = unsafe { (*walked).frames.as_mut_ptr() };
-    let found = walker::walk(walker::of(tgid), tid, walked);
+    let status = match walker::state(walker::of(tgid), tid, walked) {
+        Ok(state) => match STATES.get_ptr_mut(0) {
+            Some(states) => {
+                unsafe { *states = state };
+                unsafe { PROGRAMS.tail_call(&ctx, 2) };
+                walk::FAILED
+            }
+            None => walk::FAILED,
+        },
+        Err(status) => status,
+    };
+    finish((status, 0, 0), walked);
+    0
+}
+
+/// Walks the frames in the runtime's memory of the thread whose state
+/// `walk_frames` found, and writes the sample.
+#[perf_event]
+pub fn walk_memory(_ctx: PerfEventContext) -> u32 {
+    let (tgid, _) = current();
+    let Some(walked) = WALKED.get_ptr_mut(0) else {
+        return 0;
+    };
+    let walked = unsafe { (*walked).frames.as_mut_ptr() };
+    let found = match STATES.get_ptr(0) {
+        Some(state) => walker::frames(walker::of(tgid), unsafe { *state }, walked),
+        None => (walk::FAILED, 0, 0),
+    };
     finish(found, walked);
     0
 }

@@ -297,24 +297,26 @@ and a runtime picks one and gives its offsets:
 
 - In the runtime's memory, from the sampled thread's state to its innermost
   frame, then from each frame to the next by a pointer at an offset, as
-  CPython keeps them. The state is found by searching lists that start at a
-  global, as CPython keeps one for each interpreter, for the entries with
-  the thread's id in the process's PID namespace. A thread can have a state
-  in several lists, and the one it runs in is marked so where the runtime
-  marks it, or else is the first with frames. They search the first 256
-  states. uhr reads the rest from the process's memory, where samples say
-  they did not find a thread's, and tells them.
+  CPython keeps them, or to the next in an array, which ends where the state
+  says, as CRuby keeps them. The state is at the end of a path of pointers
+  from the thread pointer, for a runtime that keeps it in a thread-local, or
+  is found by searching lists that start at a global, as CPython keeps one
+  for each interpreter, for the entries with the thread's id in the
+  process's PID namespace. A thread can have a state in several lists, and
+  the one it runs in is marked so where the runtime marks it, or else is the
+  first with frames. They search the first 256 states. uhr reads the rest
+  from the process's memory, where samples say they did not find a thread's,
+  and tells them.
 - On the native stack: each frame the programs' walk of the frame pointers
   finds, at its frame pointer. This needs that walk, which they take on
   x86-64, and not `--unwind dwarf` yet.
 
-Of each frame they copy the bytes at an offset from it, and for objects a
-garbage collector can move before uhr reads them, a few words read at the
-time of the sample by following pointers from a word of the copy. Other ways
-to find frames, such as from a thread-local, or from frame to frame through
-an array, are for the runtimes that need them. The offsets come from what
-the runtime publishes, such as CPython's `_Py_DebugOffsets` and V8's
-`v8dbg_` symbols, from debug info, or from tables by version.
+Of each frame they copy the bytes at an offset from it, and up to two words
+read at the time of the sample at an offset from a pointer the copy holds,
+as for objects a garbage collector can move before uhr reads them. The
+offsets come from what the runtime publishes, such as CPython's
+`_Py_DebugOffsets` and V8's `v8dbg_` symbols, from debug info, or from tables
+by version.
 
 uhr looks for a process's runtime at its first sample, and again each time
 the process maps more code, as a runtime's library can be mapped after the

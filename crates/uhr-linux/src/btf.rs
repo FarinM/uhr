@@ -6,9 +6,17 @@ const MAGIC: u16 = 0xeb9f;
 const STRUCT: u32 = 4;
 const UNION: u32 = 5;
 
+/// Where a `task_struct` keeps the user thread pointer.
+#[cfg(target_arch = "x86_64")]
+pub(crate) const THREAD_POINTER: &str = "thread.fsbase";
+#[cfg(target_arch = "aarch64")]
+pub(crate) const THREAD_POINTER: &str = "thread.uw.tp_value";
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub(crate) const THREAD_POINTER: &str = "";
+
 /// The offset in bytes of each member, by its structure and its name, in
-/// the running kernel. `None` for one not found, or all if the kernel has
-/// no BTF.
+/// the running kernel. A name can go through members, as in `thread.fsbase`.
+/// `None` for one not found, or all if the kernel has no BTF.
 pub(crate) fn kernel_member_offsets<const N: usize>(
     members: [(&str, &str); N],
 ) -> [Option<u32>; N] {
@@ -82,22 +90,44 @@ impl<'a> Btf<'a> {
     }
 
     /// The offset in bytes of `member` in `structure`, looking into its
-    /// anonymous structures and unions. `None` if either is not there, or
-    /// the member is a bit field.
+    /// anonymous structures and unions, and through the members `member`
+    /// names before its last dot. `None` if either is not there, or the
+    /// member is a bit field.
     fn member_offset(&self, structure: &str, member: &str) -> Option<u32> {
-        let id = (1..self.starts.len() as u32).find(|&id| {
+        let mut id = (1..self.starts.len() as u32).find(|&id| {
             let named = self
                 .word(self.starts[id as usize])
                 .and_then(|n| self.name(n));
             self.kind(id) == Some(STRUCT) && named == Some(structure)
         })?;
-        let bits = self.find(id, 0, member)?;
+        let mut bits = 0;
+        for (i, name) in member.split('.').enumerate() {
+            if i > 0 {
+                id = self.structure_of(id)?;
+            }
+            (bits, id) = self.find(id, bits, name)?;
+        }
         (bits % 8 == 0).then_some(bits / 8)
     }
 
+    /// The structure or union the type `id` is, through typedefs and
+    /// qualifiers.
+    fn structure_of(&self, mut id: u32) -> Option<u32> {
+        // Bounded, as a malformed BTF can loop.
+        for _ in 0..16 {
+            match self.kind(id)? {
+                STRUCT | UNION => return Some(id),
+                // A typedef, `volatile`, `const` or `restrict`.
+                8..=11 => id = self.word(*self.starts.get(id as usize)? + 8)?,
+                _ => return None,
+            }
+        }
+        None
+    }
+
     /// The offset in bits of `member` in the structure or union `id`, which
-    /// starts `base` bits in.
-    fn find(&self, id: u32, base: u32, member: &str) -> Option<u32> {
+    /// starts `base` bits in, and its type.
+    fn find(&self, id: u32, base: u32, member: &str) -> Option<(u32, u32)> {
         let at = *self.starts.get(id as usize)?;
         let info = self.word(at + 4)?;
         let bitfields = info >> 31 == 1;
@@ -113,13 +143,13 @@ impl<'a> Btf<'a> {
                 };
             match (name, self.kind(kind)) {
                 (0, Some(STRUCT | UNION)) => {
-                    if let Some(bits) = self.find(kind, bits, member) {
-                        return Some(bits);
+                    if let Some(found) = self.find(kind, bits, member) {
+                        return Some(found);
                     }
                 }
                 _ if self.name(name) == Some(member) => {
                     let bitfield = bitfields && offset >> 24 != 0;
-                    return (!bitfield).then_some(bits);
+                    return (!bitfield).then_some((bits, kind));
                 }
                 _ => {}
             }
@@ -135,7 +165,7 @@ mod tests {
     /// A BTF with an int, `struct task { int state; union { int a; int
     /// flags; }; }` with the union at bit 64, and a forward declaration.
     fn btf() -> Vec<u8> {
-        let strings = b"\0int\0task\0state\0a\0flags\0fwd\0";
+        let strings = b"\0int\0task\0state\0a\0flags\0fwd\0outer\0inner\0";
         let at = |name: &str| {
             let name = format!("\0{name}\0");
             let found = strings
@@ -153,6 +183,8 @@ mod tests {
             &[at("task"), kind(4, 2), 12, at("state"), 1, 0, 0, 2, 64],
             // 4: a forward declaration.
             &[at("fwd"), kind(7, 0), 0],
+            // 5: a structure that holds a task 16 bytes in.
+            &[at("outer"), kind(4, 1), 28, at("inner"), 3, 128],
         ]
         .concat();
         let types: Vec<u8> = types.iter().flat_map(|w| w.to_ne_bytes()).collect();
@@ -180,6 +212,8 @@ mod tests {
         assert_eq!(parsed.member_offset("task", "flags"), Some(8));
         assert_eq!(parsed.member_offset("task", "missing"), None);
         assert_eq!(parsed.member_offset("fwd", "flags"), None);
+        assert_eq!(parsed.member_offset("outer", "inner.flags"), Some(24));
+        assert_eq!(parsed.member_offset("outer", "inner.missing"), None);
         assert!(Btf::parse(&btf[1..]).is_none());
     }
 
@@ -189,10 +223,11 @@ mod tests {
             eprintln!("skipped: the kernel has no BTF");
             return;
         }
-        let [flags, signal, live] = kernel_member_offsets([
+        let [flags, signal, live, thread_pointer] = kernel_member_offsets([
             ("task_struct", "flags"),
             ("task_struct", "signal"),
             ("signal_struct", "live"),
+            ("task_struct", THREAD_POINTER),
         ]);
         // After the thread info and the state, and well inside the
         // structure.
@@ -201,5 +236,10 @@ mod tests {
             "{flags:?}"
         );
         assert!(signal.is_some() && live.is_some());
+        // The thread structure comes last.
+        assert!(
+            thread_pointer.is_some_and(|offset| offset > 1024),
+            "{thread_pointer:?}"
+        );
     }
 }

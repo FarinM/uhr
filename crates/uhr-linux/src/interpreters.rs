@@ -368,14 +368,12 @@ fn programs_walk(walk: &runtimes::Walk, pid_namespace: [u64; 2]) -> Option<uhr_e
     let copy = &walk.copy;
     let mut reads = [uhr_ebpf::Read::default(); MAX_READS];
     for (read, wanted) in reads.iter_mut().zip(&copy.reads) {
-        let (path, path_len) = path(&wanted.path)?;
         if wanted.word + 8 > copy.bytes {
             return None;
         }
         *read = uhr_ebpf::Read {
             word: wanted.word,
-            path_len,
-            path,
+            offset: wanted.offset,
         };
     }
     // Each frame takes its address too.
@@ -393,32 +391,52 @@ fn programs_walk(walk: &runtimes::Walk, pid_namespace: [u64; 2]) -> Option<uhr_e
         ..uhr_ebpf::Walk::default()
     };
     match &walk.frames {
-        Frames::Memory {
-            thread: Thread::States(states),
-            step: Step::Pointer(next_frame),
-        } => {
-            let (lists, lists_len) = path(&states.lists)?;
-            let (frame, frame_len) = path(&states.frame)?;
-            let (active, active_mask) = states.active.unwrap_or((0, 0));
-            if next_frame + 8 > copy.bytes || copy.from != 0 {
+        Frames::Memory { thread, step } => {
+            match *step {
+                Step::Pointer(next) if next + 8 <= copy.bytes => {
+                    programs.step = uhr_ebpf::step::POINTER;
+                    programs.next_frame = next;
+                }
+                Step::Stride { bytes, end } => {
+                    programs.step = uhr_ebpf::step::STRIDE;
+                    programs.next_frame = bytes as u32;
+                    programs.end_start = end.start;
+                    programs.end_count = end.count;
+                    programs.end_scale = end.scale;
+                }
+                Step::Pointer(_) => return None,
+            }
+            if copy.from != 0 {
                 return None;
             }
-            programs = uhr_ebpf::Walk {
-                frames: uhr_ebpf::frames::STATES,
-                base: states.base,
-                lists,
-                lists_len,
-                next_list: states.next_list.unwrap_or(ONE_LIST),
-                first_state: states.first_state,
-                next_state: states.next_state,
-                thread_id: states.thread_id,
-                active,
-                active_mask,
-                frame,
-                frame_len,
-                next_frame: *next_frame,
-                ..programs
-            };
+            match thread {
+                Thread::States(states) => {
+                    let (lists, lists_len) = path(&states.lists)?;
+                    let (frame, frame_len) = path(&states.frame)?;
+                    let (active, active_mask) = states.active.unwrap_or((0, 0));
+                    programs = uhr_ebpf::Walk {
+                        frames: uhr_ebpf::frames::STATES,
+                        base: states.base,
+                        lists,
+                        lists_len,
+                        next_list: states.next_list.unwrap_or(ONE_LIST),
+                        first_state: states.first_state,
+                        next_state: states.next_state,
+                        thread_id: states.thread_id,
+                        active,
+                        active_mask,
+                        frame,
+                        frame_len,
+                        ..programs
+                    };
+                }
+                Thread::ThreadPointer { state, frame } => {
+                    let state: Vec<u32> = state.iter().map(|&offset| offset as u32).collect();
+                    (programs.state, programs.state_len) = path(&state)?;
+                    (programs.frame, programs.frame_len) = path(frame)?;
+                    programs.frames = uhr_ebpf::frames::THREAD_POINTER;
+                }
+            }
         }
         Frames::Native => {
             programs.frames = uhr_ebpf::frames::NATIVE;

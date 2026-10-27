@@ -242,7 +242,7 @@ impl V8 {
                 // move the `JSFunction` before uhr reads it.
                 reads: vec![Read {
                     word: (layout.fp_function - from) as u32,
-                    path: vec![(layout.function_shared - layout.heap_object_tag) as i32],
+                    offset: (layout.function_shared - layout.heap_object_tag) as i32,
                 }],
             },
             frame_pointers: true,
