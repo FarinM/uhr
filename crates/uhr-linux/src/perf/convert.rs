@@ -1285,6 +1285,7 @@ impl State {
                 name: read.map(|code| code.name.clone()),
                 file: read.map(|code| code.file.clone()),
                 first_line: read.map(|code| code.first_line),
+                first_column: read.and_then(|code| code.first_column),
             });
             table.len() as u32 - 1
         })

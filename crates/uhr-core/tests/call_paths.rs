@@ -511,6 +511,7 @@ fn counts_a_call_a_perf_map_and_the_interpreter_both_show_once() {
             name: Some(name.into()),
             file: Some("/app/x.py".into()),
             first_line: Some(1),
+            first_column: None,
         });
     }
     let mut frame = |frame: Frame, name: &str, start: Option<u32>| {

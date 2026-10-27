@@ -17,7 +17,8 @@ behaviors.
   is declared at. A BPF program's id is `bpf+` and the tag and name of its
   kernel symbol: the tag hashes its instructions, so the id stays the same
   when the program is loaded again. Code a runtime compiled or interpreted
-  has its runtime, name and file, as in `jit+python:inner:/app/spin.py`. Other code
+  has its runtime, name, file and, where known, where it starts, as in
+  `jit+node:parse@42%3A3:/app/x.js` or `jit+python:inner:/app/spin.py`. Other code
   without a known start has no id: other kernel code outside every mapping, such as BPF trampolines, a
   recording not yet symbolized, and the range a stripped binary's
   `EntryPoint` placeholder covers.

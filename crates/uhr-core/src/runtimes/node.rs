@@ -16,6 +16,7 @@ static PERF_MAPS: PerfMaps = PerfMaps {
     },
     on,
     code,
+    starts: true,
 };
 
 impl Runtime for Node {

@@ -196,9 +196,10 @@ the first.
 | `pid` | uint32 | The process that ran it |
 | `runtime` | string | As in `python` |
 | `address` | uint64 | Where the process kept it |
-| `name` | string, nullable | The function's name, as in `Pool.acquire`. Null if the code could not be read, as when the process freed it before uhr read it |
+| `name` | string, nullable | The function's name, as in `Pool.acquire`, empty for an anonymous one. Null if the code could not be read, as when the process freed it before uhr read it |
 | `file` | string, nullable | Its source file. In this and `name`, `\` is written `\\`, and what the runtime keeps that is no character, as CPython keeps the bytes of a file name that are not UTF-8, as `\u` and four hex digits |
 | `first_line` | uint32, nullable | The line it starts at |
+| `first_column` | uint32, nullable | The column it starts at, from 1, where the runtime says |
 
 `syscall_calls`, one row per thread and syscall, from uhr's eBPF programs.
 They count the target's processes and those they start, from the first
@@ -242,13 +243,18 @@ kernel symbol and has no id.
 
 Code a runtime compiled or interpreted moves from run to run, so it groups
 by what the runtime called it. One of the program's functions, from a name
-uhr can read, groups by its runtime, file and name across processes, whether
-a perf map named it or uhr read it from the interpreter, and has the id
-`jit+<runtime>:<name>:<file>`, as in `jit+python:inner:/app/spin.py`. The
-name has `%`, `:` and `@` escaped as `%25`, `%3A` and `%40`, so no two
-functions share an id. An anonymous one has `@` and where it starts, escaped
-the same way, in place of the name, as in `jit+node:@12%3A7:/app/x.js`. Its
-module is its runtime in brackets, as in `[python]` or `[node]`, and its
+uhr can read, groups by its runtime, file, name and the line and column it
+starts at, where known, across processes, whether a perf map named it or
+uhr read it from the interpreter. Where it starts tells apart functions of
+one name in a file, as two classes' methods can be. Python's perf maps don't
+say, so a Python function groups by its name alone, which its qualified
+name keeps apart. Its id is `jit+<runtime>:<name>@<start>:<file>`, as in
+`jit+node:parse@42%3A3:/app/x.js`, without `@<start>` where it is not
+known, as in `jit+python:inner:/app/spin.py`. The start is `<line>` or
+`<line>:<column>`. The name and start have `%`, `:` and `@` escaped as
+`%25`, `%3A` and `%40`, so no two functions share an id. An anonymous one
+has no name, as in `jit+node:@12%3A7:/app/x.js`. Its module is its runtime
+in brackets, as in `[python]` or `[node]`, and its
 file is the source file. Other code, such as V8's builtins, groups by its
 name in the map, with the id `jit+<runtime>+<name>`, as in
 `jit+node+Builtin:ArrayPrototypePush`, or `jit:<name>` for a runtime uhr

@@ -494,6 +494,7 @@ impl Interpreter for CPython {
             name: self.string(memory, "a code object's name", name)?,
             file: self.string(memory, "a code object's file", file)?,
             first_line,
+            first_column: None,
             lines: lines(&table, field(code.instructions), first_line),
         })
     }
@@ -634,6 +635,7 @@ mod tests {
             name: "<module>".into(),
             file: "f".into(),
             first_line: 1,
+            first_column: None,
             lines: lines(&table, 0x1000, 1),
         };
         let found: Vec<_> = (0..expected.len() as u64)

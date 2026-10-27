@@ -259,6 +259,7 @@ pub struct InterpretedCode {
     pub name: Option<String>,
     pub file: Option<String>,
     pub first_line: Option<u32>,
+    pub first_column: Option<u32>,
 }
 
 /// The calls a thread made to one syscall during the capture.
@@ -646,6 +647,10 @@ impl Recording {
                 Column::optional_string("name", code.iter().map(|c| c.name.as_deref()).collect()),
                 Column::optional_string("file", code.iter().map(|c| c.file.as_deref()).collect()),
                 Column::optional_u32("first_line", code.iter().map(|c| c.first_line).collect()),
+                Column::optional_u32(
+                    "first_column",
+                    code.iter().map(|c| c.first_column).collect(),
+                ),
             ],
         )?;
 
@@ -964,6 +969,7 @@ fn read_interpreted_code(dir: &Path) -> Result<Vec<InterpretedCode>> {
     let mut name = table.optional_string("name")?;
     let mut file = table.optional_string("file")?;
     let first_line = table.optional_u32("first_line")?;
+    let first_column = table.optional_u32("first_column")?;
     Ok((0..table.len())
         .map(|i| InterpretedCode {
             pid: pid[i],
@@ -972,6 +978,7 @@ fn read_interpreted_code(dir: &Path) -> Result<Vec<InterpretedCode>> {
             name: name[i].take(),
             file: file[i].take(),
             first_line: first_line[i],
+            first_column: first_column[i],
         })
         .collect())
 }

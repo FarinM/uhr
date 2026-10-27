@@ -210,6 +210,7 @@ fn example() -> Recording {
                 name: Some("Pool.acquire".into()),
                 file: Some("/app/pool.py".into()),
                 first_line: Some(10),
+                first_column: Some(5),
             },
             InterpretedCode {
                 pid: 7,
@@ -218,6 +219,7 @@ fn example() -> Recording {
                 name: None,
                 file: None,
                 first_line: None,
+                first_column: None,
             },
         ],
         syscall_calls: vec![

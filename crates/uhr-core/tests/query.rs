@@ -1184,6 +1184,7 @@ fn judges_the_depth_limit_by_native_frames() {
         name: Some("deep".into()),
         file: Some("/app/deep.py".into()),
         first_line: Some(1),
+        first_column: None,
     });
     for depth in 0..3 {
         let id = recording.frames.len() as u32;
@@ -1500,6 +1501,7 @@ fn with_interpreted() -> (Recording, Symbols) {
             name: name.map(str::to_owned),
             file: file.map(str::to_owned),
             first_line: name.map(|_| 1),
+            first_column: None,
         });
     }
     let mut frame = |code: u32, line: Option<u32>| {

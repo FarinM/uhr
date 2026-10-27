@@ -11,6 +11,7 @@ static PERF_MAPS: PerfMaps = PerfMaps {
     setting: Setting::Value("1"),
     on,
     code,
+    starts: false,
 };
 
 impl Runtime for Python {

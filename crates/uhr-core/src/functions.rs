@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use serde::Serialize;
 
 use crate::recording::{InterpretedCode, KERNEL, Origin, Recording, bpf_program};
-use crate::runtimes::{JitCode, RUNTIMES, binary_runtime, jit_code};
+use crate::runtimes::{JitCode, RUNTIMES, binary_runtime, jit_code, starts_tell_apart};
 use crate::symbols::{FrameName, Symbols};
 
 /// One function, or the unnamed code of one module.
@@ -107,12 +107,42 @@ enum Jit<'a> {
         runtime: &'a str,
         file: &'a str,
         name: Option<&'a str>,
-        /// Only for an anonymous function.
-        start: Option<&'a str>,
+        start: Option<Start>,
     },
     /// The runtime's own code, or code of a runtime uhr can't read the
     /// names of, by its name in the map.
     Named(&'a str),
+}
+
+/// Where one of the program's functions starts in its file, which tells
+/// apart functions of one name, as two classes' methods can be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct Start {
+    line: u32,
+    column: Option<u32>,
+}
+
+impl Start {
+    /// `line` or `line:column`, as a perf map says.
+    fn parse(start: &str) -> Option<Start> {
+        let (line, column) = match start.split_once(':') {
+            Some((line, column)) => (line, Some(column.parse().ok()?)),
+            None => (start, None),
+        };
+        Some(Start {
+            line: line.parse().ok()?,
+            column,
+        })
+    }
+}
+
+impl std::fmt::Display for Start {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.column {
+            Some(column) => write!(f, "{}:{column}", self.line),
+            None => write!(f, "{}", self.line),
+        }
+    }
 }
 
 /// A runtime's code has no origin in its key: a function is the same
@@ -217,8 +247,8 @@ impl Functions {
                         (Some(name), Some(file)) => Code::Jit(Jit::Function {
                             runtime: &code.runtime,
                             file,
-                            name: Some(name),
-                            start: None,
+                            name: Some(name.as_str()).filter(|name| !name.is_empty()),
+                            start: interpreted_start(code),
                         }),
                         _ => Code::Unnamed(&code.runtime),
                     };
@@ -239,7 +269,7 @@ impl Functions {
                             runtime,
                             file: f.file,
                             name: f.name,
-                            start: f.start.filter(|_| f.name.is_none()),
+                            start: f.start.and_then(Start::parse),
                         },
                         _ => Jit::Named(&symbol.name),
                     };
@@ -484,17 +514,21 @@ fn role(function: &Function, code: Code) -> Role {
 }
 
 /// A function of code a runtime compiled. One of the program's functions is
-/// in the runtime's module, as in `[python]`, and has an id from its name
-/// and file, which stays the same from run to run. An anonymous one has
-/// where it starts in place of a name. Code the map names in another way
-/// keeps that name.
+/// in the runtime's module, as in `[python]`, and has an id from its name,
+/// file and start, which stays the same from run to run. Code the map names
+/// in another way keeps that name.
 fn jit_function(name: &str, code: Option<JitCode>) -> Function {
     let (id, display, file) = match code {
         Some(JitCode {
             runtime,
             function: Some(function),
         }) => (
-            program_id(runtime, function.name, function.start, function.file),
+            program_id(
+                runtime,
+                function.name,
+                function.start.and_then(Start::parse),
+                function.file,
+            ),
             function.name.unwrap_or("(anonymous)").to_owned(),
             Some(function.file.to_owned()),
         ),
@@ -514,12 +548,17 @@ fn jit_function(name: &str, code: Option<JitCode>) -> Function {
     }
 }
 
-/// Escapes what ends a name in a JIT id, so that no two functions share one.
 fn interpreted_function(code: &InterpretedCode) -> Function {
     let named = code.name.as_deref().zip(code.file.as_deref());
     Function {
-        id: named.map(|(name, file)| program_id(&code.runtime, Some(name), None, file)),
-        name: code.name.clone(),
+        id: named.map(|(name, file)| {
+            let name = Some(name).filter(|name| !name.is_empty());
+            program_id(&code.runtime, name, interpreted_start(code), file)
+        }),
+        name: code.name.as_deref().map(|name| match name {
+            "" => "(anonymous)".to_owned(),
+            name => name.to_owned(),
+        }),
         placeholder: None,
         inlined: false,
         module: Some(format!("[{}]", code.runtime)),
@@ -530,16 +569,29 @@ fn interpreted_function(code: &InterpretedCode) -> Function {
     }
 }
 
+/// Where interpreted code starts, if that tells functions of its runtime
+/// apart.
+fn interpreted_start(code: &InterpretedCode) -> Option<Start> {
+    let line = code.first_line.filter(|&line| line > 0)?;
+    starts_tell_apart(&code.runtime).then_some(Start {
+        line,
+        column: code.first_column,
+    })
+}
+
 /// The id of one of the program's functions, which a runtime compiled or
 /// interpreted.
-fn program_id(runtime: &str, name: Option<&str>, start: Option<&str>, file: &str) -> String {
+fn program_id(runtime: &str, name: Option<&str>, start: Option<Start>, file: &str) -> String {
+    let start = start.map(|start| escape(&start.to_string()));
     let named = match (name, start) {
-        (Some(name), _) => escape(name),
-        (None, start) => format!("@{}", escape(start.unwrap_or_default())),
+        (Some(name), Some(start)) => format!("{}@{start}", escape(name)),
+        (Some(name), None) => escape(name),
+        (None, start) => format!("@{}", start.unwrap_or_default()),
     };
     format!("jit+{runtime}:{named}:{file}")
 }
 
+/// Escapes what ends a name in a JIT id, so that no two functions share one.
 fn escape(name: &str) -> String {
     let mut escaped = String::with_capacity(name.len());
     for c in name.chars() {
@@ -580,6 +632,10 @@ mod tests {
     #[test]
     fn gives_every_jit_function_its_own_id() {
         assert_eq!(id(Some("hot"), "/a.js", None), "jit+node:hot:/a.js");
+        assert_eq!(
+            id(Some("hot"), "/a.js", Some("6:15")),
+            "jit+node:hot@6%3A15:/a.js"
+        );
         assert_ne!(
             id(Some("b:hot"), "/a.js", None),
             id(Some("hot"), "/a.js:b", None)

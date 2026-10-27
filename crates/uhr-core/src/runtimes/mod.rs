@@ -163,6 +163,8 @@ pub struct Code {
     pub name: String,
     pub file: String,
     pub first_line: u32,
+    /// The column it starts at, where the runtime says.
+    pub first_column: Option<u32>,
     /// The line of each range of instructions, by address, sorted.
     pub lines: Vec<(Range<u64>, u32)>,
 }
@@ -222,6 +224,8 @@ pub struct PerfMaps {
     pub on: fn(&str) -> bool,
     /// What a name in its map says. `None` for one it did not write.
     pub code: for<'a> fn(&'a str) -> Option<JitCode<'a>>,
+    /// Whether its names say where each function starts.
+    pub starts: bool,
 }
 
 pub enum Setting {
@@ -262,6 +266,18 @@ pub struct JitFunction<'a> {
     pub file: &'a str,
     /// Where it starts, as `line` or `line:column`, when the runtime says.
     pub start: Option<&'a str>,
+}
+
+/// Whether functions of `runtime` that share a name and file are told apart
+/// by where they start. Not those of a runtime whose perf maps don't say,
+/// which group by name alone, so that its maps and its interpreter's frames
+/// name a function alike.
+pub fn starts_tell_apart(runtime: &str) -> bool {
+    RUNTIMES
+        .iter()
+        .find(|r| r.name() == runtime)
+        .and_then(|r| r.perf_maps())
+        .is_none_or(|maps| maps.starts)
 }
 
 /// Reads a name from a perf map. `None` for one no runtime uhr knows wrote.
