@@ -305,8 +305,17 @@ frames of PHP 8.3 built without thread safety, as its command line is, from
 the headers of 8.3: a list from `executor_globals`, with each function's
 name, class and file, and the line of each instruction. PHP's VM keeps the
 instruction it runs in a register and saves it to the frame only when it
-calls, so the innermost frame's line is not known. uhr detects the
-runtimes in a target and records their versions. What it knows about a
+calls, so the innermost frame's line is not known. They read the
+frames of Lua 5.4 as its `lua` program runs it, from the headers of 5.4:
+the program keeps the state it runs a script in, for its signal handler, in
+a static variable, which only its debug info names, as its eval loop. Lua
+functions have no names, so each is named as Lua's tracebacks name it, as
+in `function <app.lua:12>`, and the line of each instruction is read. As
+PHP's, Lua's VM saves the instruction it runs to the frame only before
+some instructions, such as calls, so the innermost frame's line is not
+known. The frames of coroutines other than the one the script runs in are
+not read.
+uhr detects the runtimes in a target and records their versions. What it knows about a
 runtime's frames is kept apart from how it reads memory, so other platforms
 can use it too.
 
@@ -323,7 +332,8 @@ and a runtime picks one and gives its offsets:
   says, as CRuby keeps them. The state is at the end of a path of pointers
   from the thread pointer, for a runtime that keeps it in a thread-local, at
   a fixed address, for one that runs on one thread, as PHP built without
-  thread safety, or is found by searching lists that start at a global, as
+  thread safety and Lua's `lua` program, or is found by searching lists that
+  start at a global, as
   CPython keeps one
   for each interpreter, for the entries with the thread's id in the
   process's PID namespace. A thread can have a state in several lists, and

@@ -1,8 +1,8 @@
 //! End to end: uhr's eBPF programs reading the frames of CPython, V8,
-//! JavaScriptCore, CRuby and PHP. Needs root through sudo without a password,
-//! perf, a C compiler, and Python 3.11 or later, Node 20 or later, Bun 1.4.3,
-//! Ruby 3.2 or PHP 8.3, and skips without sudo. The test of a runtime that is
-//! missing checks nothing.
+//! JavaScriptCore, CRuby, PHP and Lua. Needs root through sudo without a
+//! password, perf, a C compiler, and Python 3.11 or later, Node 20 or later,
+//! Bun 1.4.3, Ruby 3.2, PHP 8.3 or Lua 5.4, and skips without sudo. The test
+//! of a runtime that is missing checks nothing.
 #![cfg(target_os = "linux")]
 
 mod common;
@@ -849,4 +849,41 @@ fn reads_bun_frames() {
     let warm = share(runtime_function(&rows, "bun", "warm"), "total_share");
     let work = runtime_function(&rows, "bun", "work");
     assert!(share(work, "total_share") >= hot + warm - 0.01, "{work}");
+}
+
+#[test]
+fn reads_lua_frames() {
+    let Some(lua) = find("lua5.4") else {
+        eprintln!("skipped: needs Lua 5.4");
+        return;
+    };
+    let dir = scratch("interpreters_lua");
+    let program = format!("{PROGRAMS}/jit.lua");
+    let command = [lua.to_str().unwrap(), &program, "100"];
+    let Some(recording) = record(&dir, &[], &command) else {
+        return;
+    };
+    // Only Lua's debug info names where it keeps its state.
+    if !interpreters(&recording)
+        .unwrap()
+        .iter()
+        .any(|w| w["runtime"] == "lua")
+    {
+        eprintln!("skipped: needs the debug info of {}", lua.display());
+        return;
+    }
+    let rows = functions(&recording);
+    let named = |line: u32| {
+        let name = format!("function <{program}:{line}>");
+        share(runtime_function(&rows, "lua", &name), "self_share")
+    };
+    let (hot, warm) = (named(7), named(15));
+    let split = hot / (hot + warm);
+    assert!(hot + warm > 0.7, "hot {hot}, warm {warm}");
+    assert!((0.7..0.9).contains(&split), "hot gets {split} of the two");
+    let main = runtime_function(&rows, "lua", "main chunk");
+    assert!(share(main, "total_share") > 0.85, "{main}");
+    let hot = format!("function <{program}:7>");
+    let work = format!("function <{program}:23>");
+    calls_from_known_lines(&recording, &hot, &work, 26);
 }
