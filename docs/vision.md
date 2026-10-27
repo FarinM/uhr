@@ -9,8 +9,6 @@ are bad at the steps around it:
   computing, and a CPU profile hides that.
 - **Reading the output.** Raw profiles are tens to hundreds of MB. Agents need
   ranked, compact answers they can drill into.
-- **Telling real improvements from noise.** One before/after run proves
-  nothing on a noisy machine.
 - **Knowing when a profile is wrong.** Missing symbols, unresolved JIT code,
   truncated stacks and profiler bias produce confident, wrong conclusions.
 
@@ -32,13 +30,13 @@ views across runtimes into one thing an agent can query.
 5. **Agent-first.** Small tool surface, compact results, drill-down by ID,
    honest coverage in every answer. The same workflows are available from a
    CLI.
-6. **Sound measurement.** Comparisons report significance, not single-run
-   deltas.
-7. **Humans can check.** Every recording exports to a standard viewer.
+6. **Humans can check.** Every recording exports to a standard viewer.
 
 ## Non-goals for now
 
 - Writing a new sampler where a mature one exists.
+- Benchmarking a command over repeated runs. Tools such as hyperfine already
+  do it, and an agent can run them.
 - Running a continuous production profiling fleet. Reading existing production
   data may come later.
 - Automatic optimization. The tool finds and measures; the agent or human
@@ -51,4 +49,3 @@ views across runtimes into one thing an agent can query.
   groupings over the same data, not separate tools. See [model](model.md).
 - Results always state what was not observed.
 - The first question is "computing or waiting?", not "which function is hot?".
-- Comparisons have statistics built in.

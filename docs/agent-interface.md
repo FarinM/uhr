@@ -41,8 +41,6 @@ behaviors.
 | `call_paths` | Callers and callees of a selected node |
 | `annotate` | Per-line and per-instruction cost of one function, with hardware counters when captured |
 | `timeline` | Thread state intervals with reasons, for selected threads and a time range. Aggregated signals show one value per window |
-| `compare` | The same query on two recordings, with significance |
-| `benchmark` | Repeated runs of a command with statistics |
 | `sql` | Later: direct SQL over a recording's Parquet files. See [storage](model.md#storage) |
 | `export` | Write Perfetto, Firefox Profiler or speedscope files for human review |
 | `doctor` | For a target on this host: what each collector would capture, what blocks the rest and how to fix it, and which ones `record` would use |
@@ -124,29 +122,18 @@ runtime's own functions are hidden from stacks is not decided.
 
 ## Measurement rigor
 
-The agent's main loop is measure, change, measure. The tools must make noise
-visible.
-
-- `benchmark` runs warmups and repetitions and reports the median with a
-  confidence interval, plus noise signals (high variance, thermal throttling,
-  frequency changes).
-- `compare` returns a verdict (faster, slower, no significant difference) with
-  effect size, interval and run counts. It must not report a difference inside
-  the noise as an improvement.
-- Profiling overhead is measured and reported. Instrumenting profilers distort
-  heavily, and sampling profilers have known biases.
+Profiling overhead is measured and reported. Instrumenting profilers distort
+heavily, and sampling profilers have known biases.
 
 ## Agent skill
 
 Ship instructions that teach a method, not a list of tools:
 
-1. Benchmark a baseline.
-2. Call `overview`: is it computing or waiting?
-3. Choose signals from the answer. CPU-bound: stack sampling. Waiting: off-CPU,
+1. Call `overview`: is it computing or waiting?
+2. Choose signals from the answer. CPU-bound: stack sampling. Waiting: off-CPU,
    syscalls, locks. Growing memory: allocations and heap snapshots.
-4. Zoom with `query` and `call_paths`. Check coverage before trusting a result.
-5. Change one thing, run `compare`, and keep the change only if the difference
-   is significant.
+3. Zoom with `query` and `call_paths`. Check coverage before trusting a result.
+4. Change one thing, record again and run the same queries.
 
 ## Humans review the evidence
 
