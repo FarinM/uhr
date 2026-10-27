@@ -9,6 +9,7 @@ use std::ops::Range;
 pub use process::{Memory, Process};
 
 mod node;
+mod php;
 mod process;
 mod python;
 mod ruby;
@@ -48,6 +49,12 @@ pub trait Interpreter: Send {
     fn eval_loop(&self) -> &[Range<u64>];
     /// What the bytes the sampler copied of a frame, then its reads, say.
     fn frame(&self, bytes: &[u8]) -> WalkedFrame;
+    /// Whether the runtime keeps the instruction its innermost frame runs
+    /// in a register, and saves it to the frame only when that frame calls
+    /// out, so that the frame holds where it last called, not where it is.
+    fn saves_instruction_on_calls(&self) -> bool {
+        false
+    }
     /// The code at `address`, read from the process's memory.
     fn code(&self, memory: &dyn Memory, address: u64) -> Result<Code, Error>;
 }
@@ -88,6 +95,10 @@ pub enum Thread {
     /// says the runtime does not run on the thread. Its innermost frame is
     /// at the end of the pointers `frame` follows from the state.
     ThreadPointer { state: Vec<i32>, frame: Vec<u32> },
+    /// In a state at a fixed address, for a runtime that runs on one
+    /// thread, at the end of the pointers `frame` follows from it. Its frames
+    /// are those of every thread of the process.
+    Global { state: u64, frame: Vec<u32> },
 }
 
 /// How to get from a frame to the next one outward.
@@ -231,8 +242,9 @@ pub enum WalkedFrame {
     /// ends the frames of that call. `native` if it keeps the frame in the
     /// native frame of that call, so that where it is says which one.
     Entry { native: bool },
-    /// A native frame of other code, on a native stack the runtime keeps
-    /// its frames on, which stays as it is.
+    /// A frame of native code: on a native stack the runtime keeps its
+    /// frames on, one of other code, which stays as it is, and in the
+    /// runtime's memory, a call to native code it made.
     Native,
 }
 
@@ -319,7 +331,7 @@ pub enum Setting {
     },
 }
 
-pub static RUNTIMES: [&dyn Runtime; 3] = [&python::Python, &node::Node, &ruby::Ruby];
+pub static RUNTIMES: [&dyn Runtime; 4] = [&python::Python, &node::Node, &ruby::Ruby, &php::Php];
 
 /// The runtime a binary is, by its file name.
 pub fn binary_runtime(file: &str) -> Option<&'static str> {
@@ -553,6 +565,7 @@ mod tests {
         assert_eq!(binary_runtime("node"), Some("node"));
         assert_eq!(binary_runtime("libnode.so.115"), Some("node"));
         assert_eq!(binary_runtime("libruby-3.2.so.3.2"), Some("ruby"));
+        assert_eq!(binary_runtime("php8.3"), Some("php"));
         assert_eq!(binary_runtime("nodemon"), None);
     }
 }

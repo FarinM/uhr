@@ -1,7 +1,7 @@
-//! End to end: uhr's eBPF programs reading the frames of CPython, V8 and
-//! CRuby. Needs root through sudo without a password, perf, a C compiler,
-//! and Python 3.11 or later, Node with V8 13 or Ruby 3.2, and skips without
-//! sudo. The test of a runtime that is missing checks nothing.
+//! End to end: uhr's eBPF programs reading the frames of CPython, V8, CRuby
+//! and PHP. Needs root through sudo without a password, perf, a C compiler,
+//! and Python 3.11 or later, Node with V8 13, Ruby 3.2 or PHP 8.3, and skips
+//! without sudo. The test of a runtime that is missing checks nothing.
 #![cfg(target_os = "linux")]
 
 mod common;
@@ -764,4 +764,58 @@ fn reads_ruby_frames_when_attached() {
     let ruby = walked.iter().find(|w| w["runtime"] == "ruby").unwrap();
     let unmatched = ruby["unmatched"].as_f64().unwrap() / ruby["samples"].as_f64().unwrap();
     assert!(unmatched < 0.2, "{ruby}");
+}
+
+/// A `php` whose frames uhr reads.
+fn php() -> Option<PathBuf> {
+    let php = find("php").filter(|php| {
+        let output = Command::new(php).args(["-r", "echo PHP_VERSION;"]).output();
+        output.is_ok_and(|output| output.stdout.starts_with(b"8.3."))
+    });
+    if php.is_none() {
+        eprintln!("skipped: needs PHP 8.3");
+    }
+    php
+}
+
+#[test]
+fn reads_php_frames() {
+    let Some(php) = php() else {
+        return;
+    };
+    let dir = scratch("interpreters_php");
+    let program = format!("{PROGRAMS}/jit.php");
+    let command = [php.to_str().unwrap(), &program, "80"];
+    let Some(recording) = record(&dir, &[], &command) else {
+        return;
+    };
+    has_the_split_of(&recording, "php", "jit.php");
+    let rows = functions(&recording);
+    let work = runtime_function(&rows, "php", "work");
+    assert!(share(work, "total_share") > 0.85, "{work}");
+    let main = runtime_function(&rows, "php", "{main}");
+    assert!(share(main, "total_share") > 0.85, "{main}");
+    calls_from_known_lines(&recording, "hot", "work", 27);
+}
+
+/// That `function`, innermost, has no line, as the runtime saves where its
+/// innermost frame is only when it calls, and that `caller` calls it from
+/// `line`.
+fn calls_from_known_lines(recording: &str, function: &str, caller: &str, line: u64) {
+    let lines = json(&["query", recording, "--group-by", "line", "--top", "1000"]);
+    let lines = lines["rows"].as_array().unwrap();
+    let innermost: Vec<&Value> = lines
+        .iter()
+        .filter(|r| r["function"] == function && share(r, "self_share") > 0.05)
+        .collect();
+    assert!(!innermost.is_empty(), "{lines:?}");
+    assert!(
+        innermost.iter().all(|r| r["line"].is_null()),
+        "{innermost:?}"
+    );
+    let calls = lines
+        .iter()
+        .find(|r| r["function"] == caller && r["line"]["line"] == line)
+        .unwrap_or_else(|| panic!("{lines:?}"));
+    assert!(share(calls, "total_share") > 0.5, "{calls}");
 }

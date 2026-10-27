@@ -196,6 +196,9 @@ pub(crate) fn state(walk: Option<&Walk>, tid: u32, scratch: *mut u8) -> Result<u
     let Some(walk) = walk else {
         return Err(walk::NONE);
     };
+    if walk.frames == frames::GLOBAL {
+        return Ok(walk.base);
+    }
     if walk.frames == frames::THREAD_POINTER {
         let pointer = thread_pointer().ok_or(walk::FAILED)?;
         return match follow(pointer, &walk.state, walk.state_len) {

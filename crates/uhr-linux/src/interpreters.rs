@@ -430,6 +430,11 @@ fn programs_walk(walk: &runtimes::Walk, pid_namespace: [u64; 2]) -> Option<uhr_e
                         ..programs
                     };
                 }
+                Thread::Global { state, frame } => {
+                    (programs.frame, programs.frame_len) = path(frame)?;
+                    programs.base = *state;
+                    programs.frames = uhr_ebpf::frames::GLOBAL;
+                }
                 Thread::ThreadPointer { state, frame } => {
                     let state: Vec<u32> = state.iter().map(|&offset| offset as u32).collect();
                     (programs.state, programs.state_len) = path(&state)?;

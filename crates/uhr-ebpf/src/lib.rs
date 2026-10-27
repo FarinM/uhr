@@ -124,6 +124,9 @@ pub mod frames {
     /// to the innermost frame, as for a runtime that keeps it in a
     /// thread-local, then from frame to frame.
     pub const THREAD_POINTER: u32 = 2;
+    /// In the runtime's memory: from the state at `Walk::base`, for a
+    /// runtime that runs on one thread, then from frame to frame.
+    pub const GLOBAL: u32 = 3;
 }
 
 /// How a walk in the runtime's memory gets from a frame to the next one

@@ -291,7 +291,12 @@ says the line of each instruction, so that lines within a function are
 read. Its eval loop, which says where the frames go in the native stack, is
 a static function, which only the debug info of a stripped `libruby`
 names, where the system keeps it by build id. Without it they go just
-above the function that calls the eval loop, inside it. uhr detects the
+above the function that calls the eval loop, inside it. They read the
+frames of PHP 8.3 built without thread safety, as its command line is, from
+the headers of 8.3: a list from `executor_globals`, with each function's
+name, class and file, and the line of each instruction. PHP's VM keeps the
+instruction it runs in a register and saves it to the frame only when it
+calls, so the innermost frame's line is not known. uhr detects the
 runtimes in a target and records their versions. What it knows about a
 runtime's frames is kept apart from how it reads memory, so other platforms
 can use it too.
@@ -307,8 +312,10 @@ and a runtime picks one and gives its offsets:
   frame, then from each frame to the next by a pointer at an offset, as
   CPython keeps them, or to the next in an array, which ends where the state
   says, as CRuby keeps them. The state is at the end of a path of pointers
-  from the thread pointer, for a runtime that keeps it in a thread-local, or
-  is found by searching lists that start at a global, as CPython keeps one
+  from the thread pointer, for a runtime that keeps it in a thread-local, at
+  a fixed address, for one that runs on one thread, as PHP built without
+  thread safety, or is found by searching lists that start at a global, as
+  CPython keeps one
   for each interpreter, for the entries with the thread's id in the
   process's PID namespace. A thread can have a state in several lists, and
   the one it runs in is marked so where the runtime marks it, or else is the

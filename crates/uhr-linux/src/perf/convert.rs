@@ -1213,6 +1213,9 @@ impl State {
                         .checked_sub(1)
                         .is_some_and(|i| ranges[i].contains(&address))
             };
+            // Where the innermost frame of the program holds only where it
+            // last called, its instruction is not known.
+            let mut innermost = interpreter.saves_instruction_on_calls();
             if interpreter.walk().frames == Frames::Native {
                 let mut placed = HashMap::new();
                 for (address, frame) in records {
@@ -1254,12 +1257,16 @@ impl State {
             } else {
                 let mut groups = vec![Group::default()];
                 for (address, frame) in records {
+                    // A call the runtime made from a frame saved where it
+                    // was.
+                    let saved = !std::mem::take(&mut innermost);
                     let entry = match frame {
                         WalkedFrame::Code {
                             code,
                             instruction,
                             entered,
                         } => {
+                            let instruction = if saved { instruction } else { 0 };
                             let (id, read) = self.interpreted_frame(
                                 program,
                                 interpreter,
