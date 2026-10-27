@@ -9,6 +9,7 @@ use std::ops::Range;
 pub use process::{Memory, Process};
 
 mod bun;
+mod jvm;
 mod lua;
 mod node;
 mod php;
@@ -333,13 +334,14 @@ pub enum Setting {
     },
 }
 
-pub static RUNTIMES: [&dyn Runtime; 6] = [
+pub static RUNTIMES: [&dyn Runtime; 7] = [
     &python::Python,
     &node::Node,
     &bun::Bun,
     &ruby::Ruby,
     &php::Php,
     &lua::Lua,
+    &jvm::Jvm,
 ];
 
 /// The runtime a binary is, by its file name.
@@ -577,6 +579,7 @@ mod tests {
         assert_eq!(binary_runtime("php8.3"), Some("php"));
         assert_eq!(binary_runtime("bun"), Some("bun"));
         assert_eq!(binary_runtime("lua5.4"), Some("lua"));
+        assert_eq!(binary_runtime("libjvm.so"), Some("java"));
         assert_eq!(binary_runtime("nodemon"), None);
     }
 }

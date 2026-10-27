@@ -1214,7 +1214,9 @@ impl State {
                         .is_some_and(|i| ranges[i].contains(&address))
             };
             // Where the innermost frame of the program holds only where it
-            // last called, its instruction is not known.
+            // last called, its instruction is not known. On the native
+            // stack, other code above it may have been called without it
+            // saving where it is.
             let mut innermost = interpreter.saves_instruction_on_calls();
             if interpreter.walk().frames == Frames::Native {
                 let mut placed = HashMap::new();
@@ -1225,6 +1227,8 @@ impl State {
                     else {
                         continue;
                     };
+                    let instruction = if innermost { 0 } else { instruction };
+                    innermost = false;
                     let (id, read) = self.interpreted_frame(
                         program,
                         interpreter,

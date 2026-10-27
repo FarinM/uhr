@@ -47,6 +47,58 @@ pub(super) fn utf16(units: impl IntoIterator<Item = u16>) -> String {
     text
 }
 
+/// Text of the modified UTF-8 the JVM keeps names in: UTF-8 of UTF-16, each
+/// surrogate on its own, with NUL in two bytes.
+pub(super) fn modified_utf8(bytes: &[u8]) -> String {
+    let continues = |at: usize| bytes.get(at).filter(|&&b| b & 0xc0 == 0x80);
+    let mut units = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        let byte = bytes[at];
+        let (unit, length) = match byte {
+            0x01..0x80 => (Some(u16::from(byte)), 1),
+            0xc0..0xe0 => match continues(at + 1) {
+                Some(next) => (
+                    Some(u16::from(byte & 0x1f) << 6 | u16::from(next & 0x3f)),
+                    2,
+                ),
+                None => (None, 1),
+            },
+            0xe0..0xf0 => match (continues(at + 1), continues(at + 2)) {
+                (Some(second), Some(third)) => (
+                    Some(
+                        u16::from(byte & 0x0f) << 12
+                            | u16::from(second & 0x3f) << 6
+                            | u16::from(third & 0x3f),
+                    ),
+                    3,
+                ),
+                _ => (None, 1),
+            },
+            _ => (None, 1),
+        };
+        // A byte that is none of it, as an invalid byte of UTF-8 is.
+        units.push(unit.ok_or(byte));
+        at += length;
+    }
+    let mut text = String::new();
+    let mut units = units.into_iter().peekable();
+    while let Some(unit) = units.next() {
+        match unit {
+            Ok(high @ 0xd800..0xdc00) => match units.peek() {
+                Some(&Ok(low @ 0xdc00..0xe000)) => {
+                    units.next();
+                    text.push_str(&utf16([high, low]));
+                }
+                _ => text.push_str(&utf16([high])),
+            },
+            Ok(unit) => text.push_str(&utf16([unit])),
+            Err(byte) => text.push_str(&format!("\\u{:04x}", 0xdc00 + u32::from(byte))),
+        }
+    }
+    text
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -64,5 +116,18 @@ mod tests {
     #[test]
     fn escapes_bytes_that_are_no_utf8_as_cpython_keeps_them() {
         assert_eq!(utf8(b"caf\xe9 \xc3\xa9"), "caf\\udce9 \u{e9}");
+    }
+
+    #[test]
+    fn reads_the_jvms_modified_utf8() {
+        // U+10400 as two surrogates, NUL in two bytes, and U+E9.
+        let name = [0xed, 0xa0, 0x81, 0xed, 0xb0, 0x80, 0xc0, 0x80, 0xc3, 0xa9];
+        assert_eq!(modified_utf8(&name), "\u{10400}\0\u{e9}");
+        assert_eq!(modified_utf8(&[0xed, 0xb0, 0x81]), "\\udc01");
+        assert_eq!(modified_utf8(&[0x61, 0xff]), "a\\udcff");
+        assert_ne!(
+            modified_utf8(&[0xed, 0xa0, 0x81, 0xed, 0xb0, 0x80]),
+            modified_utf8(&[0xed, 0xa0, 0x81, 0xed, 0xb0, 0x81])
+        );
     }
 }

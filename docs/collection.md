@@ -318,6 +318,15 @@ programs read the frames of:
   some instructions, such as calls, so the innermost frame's line is not
   known. The frames of coroutines other than the one the script runs in are
   not read.
+- HotSpot's interpreter, as OpenJDK's `libjvm` runs it, from the offsets of
+  the tables HotSpot publishes for its serviceability agent, which uhr reads
+  from the process, and, for where in its frame the interpreter keeps the
+  bytecode it runs, HotSpot's x86-64 headers. That names each method, its
+  class and file, and the line of each bytecode, but the interpreter saves
+  where the innermost frame is to it only around calls, so that frame's line
+  is not known. Code HotSpot compiled keeps no method in its frame, and
+  without `-XX:+PreserveFramePointer` no frame pointer, so its frames are
+  not read, and with the JIT on most of a program's time is in them.
 
 uhr's eBPF programs walk interpreters' frames at each CPU sample, and know
 no runtime. Each runtime uhr supports is a module of `uhr-core`. One whose
@@ -341,9 +350,10 @@ and a runtime picks one and gives its offsets:
   first with frames. They search the first 256 states. uhr reads the rest
   from the process's memory, where samples say they did not find a thread's,
   and tells them.
-- On the native stack, as V8 and JavaScriptCore keep them: each frame the
-  programs' walk of the frame pointers finds, at its frame pointer. This
-  needs that walk, which they take on x86-64, and not `--unwind dwarf` yet.
+- On the native stack, as V8, JavaScriptCore and HotSpot's interpreter
+  keep them: each frame the programs' walk of the frame pointers finds, at
+  its frame pointer. This needs that walk, which they take on x86-64, and
+  not `--unwind dwarf` yet.
 
 Of each frame they copy the bytes at an offset from it, and up to two words
 read at the time of the sample at an offset from a pointer the copy holds,

@@ -1,8 +1,8 @@
 //! End to end: uhr's eBPF programs reading the frames of CPython, V8,
-//! JavaScriptCore, CRuby, PHP and Lua. Needs root through sudo without a
-//! password, perf, a C compiler, and Python 3.11 or later, Node 20 or later,
-//! Bun 1.4.3, Ruby 3.2, PHP 8.3 or Lua 5.4, and skips without sudo. The test
-//! of a runtime that is missing checks nothing.
+//! JavaScriptCore, CRuby, PHP, Lua and HotSpot. Needs root through sudo
+//! without a password, perf, a C compiler, and Python 3.11 or later, Node 20
+//! or later, Bun 1.4.3, Ruby 3.2, PHP 8.3, Lua 5.4 or a JDK, and skips
+//! without sudo. The test of a runtime that is missing checks nothing.
 #![cfg(target_os = "linux")]
 
 mod common;
@@ -886,4 +886,46 @@ fn reads_lua_frames() {
     let hot = format!("function <{program}:7>");
     let work = format!("function <{program}:23>");
     calls_from_known_lines(&recording, &hot, &work, 26);
+}
+
+#[test]
+fn reads_the_frames_of_java_it_interprets() {
+    let (Some(java), Some(javac)) = (find("java"), find("javac")) else {
+        eprintln!("skipped: needs a JDK");
+        return;
+    };
+    let dir = scratch("interpreters_java");
+    let classes = dir.join("classes");
+    let compiled = Command::new(&javac)
+        .arg("-d")
+        .arg(&classes)
+        .arg(format!("{PROGRAMS}/Jit.java"))
+        .status()
+        .unwrap();
+    assert!(compiled.success(), "javac failed");
+    let command = [
+        java.to_str().unwrap(),
+        "-Xint",
+        "-cp",
+        classes.to_str().unwrap(),
+        "Jit",
+        "100",
+    ];
+    let Some(recording) = record(&dir, &[], &command) else {
+        return;
+    };
+    let rows = functions(&recording);
+    let method = |name: &str| runtime_function(&rows, "java", name);
+    let hot = method("Jit.hot(long)");
+    assert_eq!(hot["file"], "Jit.java", "{hot}");
+    let (hot, warm) = (
+        share(hot, "self_share"),
+        share(method("Jit.warm(long)"), "self_share"),
+    );
+    let split = hot / (hot + warm);
+    assert!(hot + warm > 0.7, "hot {hot}, warm {warm}");
+    assert!((0.7..0.9).contains(&split), "hot gets {split} of the two");
+    let main = method("Jit.main(java.lang.String[])");
+    assert!(share(main, "total_share") > 0.85, "{main}");
+    calls_from_known_lines(&recording, "Jit.hot(long)", "Jit.work(int)", 28);
 }
