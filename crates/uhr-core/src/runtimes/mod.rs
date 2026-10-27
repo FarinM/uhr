@@ -48,13 +48,42 @@ pub trait Interpreter: Send {
     fn code(&self, memory: &dyn Memory, address: u64) -> Result<Code, Error>;
 }
 
-/// How uhr's sampler finds and copies an interpreter's frames, which it
-/// keeps in its memory. The thread states are in lists, one for each entry
-/// of an outer list, as CPython keeps one for each interpreter: the first
-/// entry is at the pointer `lists[0]` past `base`, then at the pointer each
-/// next offset past the one before.
+/// How uhr's sampler finds and copies an interpreter's frames, in numbers:
+/// where the sampled thread's innermost frame is, how to get from each
+/// frame to the next outward, and what to copy of each. The sampler knows
+/// no runtime, only these.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Walk {
+    pub thread: Thread,
+    pub step: Step,
+    /// How many of each frame's first bytes to copy.
+    pub frame_bytes: u32,
+    /// Whether the sampler should keep where each native frame is on the
+    /// stack, for an interpreter that keeps its entry frames there.
+    pub frame_pointers: bool,
+}
+
+/// Where the sampled thread's innermost frame is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Thread {
+    /// In the thread's state, which the runtime keeps in lists.
+    States(States),
+}
+
+/// How to get from a frame to the next one outward.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Step {
+    /// Follow the pointer the frame holds at this offset. A null one ends
+    /// the walk.
+    Pointer(u32),
+}
+
+/// Thread states in lists, one for each entry of an outer list, as CPython
+/// keeps one for each interpreter: the first entry is at the pointer
+/// `lists[0]` past `base`, then at the pointer each next offset past the one
+/// before.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct States {
     pub base: u64,
     pub lists: Vec<u32>,
     /// Where an entry holds the next one, `None` for a single list.
@@ -73,16 +102,9 @@ pub struct Walk {
     /// The pointers to follow from a thread's state to its innermost frame,
     /// as for `lists`.
     pub frame: Vec<u32>,
-    /// Where a frame holds the next one outward, and how many of its first
-    /// bytes to copy.
-    pub next_frame: u32,
-    pub frame_bytes: u32,
-    /// Whether the sampler should keep where each native frame is on the
-    /// stack, for an interpreter that keeps its entry frames there.
-    pub frame_pointers: bool,
 }
 
-/// A thread's state, as `Walk::states` reads it.
+/// A thread's state, as `States::search` reads it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ThreadState {
     pub address: u64,
@@ -92,10 +114,10 @@ pub struct ThreadState {
     pub has_frames: bool,
 }
 
-impl Walk {
+impl States {
     /// The first `limit` thread states, read from the process's memory, as
     /// the sampler searches them but further.
-    pub fn states(&self, memory: &dyn Memory, limit: usize) -> Result<Vec<ThreadState>, Error> {
+    pub fn search(&self, memory: &dyn Memory, limit: usize) -> Result<Vec<ThreadState>, Error> {
         let word = |address: u64| process::u64_at(memory, "a thread state", address);
         let follow = |mut address: u64, path: &[u32]| {
             for &offset in path {

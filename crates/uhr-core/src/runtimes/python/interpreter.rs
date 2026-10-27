@@ -13,7 +13,9 @@ use std::ops::Range;
 
 use super::super::process::{bytes_at, symbols, u32_at, u64_at};
 use super::super::text;
-use super::super::{Code, Error, Interpreter, Memory, Process, Runtime, Walk, WalkedFrame};
+use super::super::{
+    Code, Error, Interpreter, Memory, Process, Runtime, States, Step, Thread, Walk, WalkedFrame,
+};
 use crate::recording::Mapping;
 
 /// The longest name or file read, and the longest line table, in bytes.
@@ -433,15 +435,17 @@ impl Interpreter for CPython {
             flag,
         ];
         Walk {
-            base: self.runtime,
-            lists: vec![layout.interpreters_head],
-            next_list: Some(layout.interpreter_next),
-            first_state: layout.threads_head,
-            next_state: layout.thread_next,
-            thread_id: layout.native_thread_id,
-            active: layout.thread_status.map(|status| (status, ACTIVE)),
-            frame: layout.current_frame.clone(),
-            next_frame: frame.previous,
+            thread: Thread::States(States {
+                base: self.runtime,
+                lists: vec![layout.interpreters_head],
+                next_list: Some(layout.interpreter_next),
+                first_state: layout.threads_head,
+                next_state: layout.thread_next,
+                thread_id: layout.native_thread_id,
+                active: layout.thread_status.map(|status| (status, ACTIVE)),
+                frame: layout.current_frame.clone(),
+            }),
+            step: Step::Pointer(frame.previous),
             frame_bytes: end.into_iter().max().unwrap_or(0).next_multiple_of(8),
             frame_pointers: matches!(frame.entry, Entry::Owner(_)),
         }

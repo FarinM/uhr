@@ -12,7 +12,9 @@ use std::thread::{self, JoinHandle};
 use aya::maps::{HashMap as BpfHashMap, MapData};
 use tracing::{debug, warn};
 use uhr_core::recording::Mapping;
-use uhr_core::runtimes::{self, Code, Interpreter, Memory, Process, WalkedFrame};
+use uhr_core::runtimes::{
+    self, Code, Interpreter, Memory, Process, States, Step, Thread, WalkedFrame,
+};
 use uhr_ebpf::{MAX_PATH, MAX_WALKED_BYTES, ONE_LIST, walk};
 
 use crate::launch::monotonic_ns;
@@ -198,11 +200,10 @@ fn find(receiver: Receiver<Walked>, mut maps: Maps) -> Interpreters {
                 };
                 if walked.status == walk::UNSEARCHED
                     && threads_ns.is_none_or(|ns| monotonic_ns() >= ns + THREADS_EVERY_NS)
+                    && let Thread::States(states) = interpreter.walk().thread
                 {
                     *threads_ns = Some(monotonic_ns());
-                    if let Err(error) =
-                        tell_threads(pid, &interpreter.walk(), memory, &mut maps.threads)
-                    {
+                    if let Err(error) = tell_threads(pid, &states, memory, &mut maps.threads) {
                         debug!(pid, %error, "telling uhr's eBPF programs where its threads' states are");
                     }
                 }
@@ -232,11 +233,11 @@ fn find(receiver: Receiver<Walked>, mut maps: Maps) -> Interpreters {
 /// search can't reach in a process with many.
 fn tell_threads(
     pid: u32,
-    walk: &runtimes::Walk,
+    states: &States,
     memory: &FileMemory,
     threads: &mut BpfHashMap<MapData, u32, u64>,
 ) -> Result<(), runtimes::Error> {
-    let states = walk.states(memory, MAX_STATES)?;
+    let states = states.search(memory, MAX_STATES)?;
     let hosts = host_thread_ids(pid);
     let mut best: HashMap<u64, runtimes::ThreadState> = HashMap::new();
     for state in states {
@@ -358,24 +359,26 @@ fn programs_walk(walk: &runtimes::Walk, pid_namespace: [u64; 2]) -> Option<uhr_e
         path.get_mut(..steps.len())?.copy_from_slice(steps);
         Some((path, steps.len() as u32))
     };
-    let (lists, lists_len) = path(&walk.lists)?;
-    let (frame, frame_len) = path(&walk.frame)?;
-    let (active, active_mask) = walk.active.unwrap_or((0, 0));
+    let Thread::States(states) = &walk.thread;
+    let Step::Pointer(next_frame) = walk.step;
+    let (lists, lists_len) = path(&states.lists)?;
+    let (frame, frame_len) = path(&states.frame)?;
+    let (active, active_mask) = states.active.unwrap_or((0, 0));
     // Each frame takes its address too.
-    (walk.frame_bytes as usize + 8 <= MAX_WALKED_BYTES && walk.next_frame + 8 <= walk.frame_bytes)
+    (walk.frame_bytes as usize + 8 <= MAX_WALKED_BYTES && next_frame + 8 <= walk.frame_bytes)
         .then_some(uhr_ebpf::Walk {
-            base: walk.base,
+            base: states.base,
             lists,
             lists_len,
-            next_list: walk.next_list.unwrap_or(ONE_LIST),
-            first_state: walk.first_state,
-            next_state: walk.next_state,
-            thread_id: walk.thread_id,
+            next_list: states.next_list.unwrap_or(ONE_LIST),
+            first_state: states.first_state,
+            next_state: states.next_state,
+            thread_id: states.thread_id,
             active,
             active_mask,
             frame,
             frame_len,
-            next_frame: walk.next_frame,
+            next_frame,
             frame_bytes: walk.frame_bytes,
             frame_pointers: u32::from(walk.frame_pointers),
             pad: 0,
