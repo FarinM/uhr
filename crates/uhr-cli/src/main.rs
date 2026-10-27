@@ -1,6 +1,7 @@
 #[cfg(target_os = "linux")]
 mod signals;
 
+use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -17,6 +18,7 @@ use uhr_core::coverage::{Coverage, SymbolCoverage};
 use uhr_core::doctor::Check;
 use uhr_core::doctor::{Report, Status};
 use uhr_core::filter::Filter;
+use uhr_core::flamegraph::{self, FlameGraph};
 use uhr_core::functions::Function;
 use uhr_core::metric::Metric;
 use uhr_core::overview::{self, CPUTime, Overview};
@@ -78,6 +80,29 @@ enum Command {
         /// Rows to print
         #[arg(long, default_value_t = 20)]
         top: usize,
+        #[arg(long)]
+        json: bool,
+        #[command(flatten)]
+        filter: FilterArgs,
+    },
+    /// Draw a flame graph of a recording's CPU or off-CPU time, as an SVG
+    /// to open in a browser
+    Flamegraph {
+        recording: PathBuf,
+        /// The file to write
+        #[arg(short, long)]
+        output: PathBuf,
+        /// The time to weigh stacks by
+        #[arg(long, value_enum, default_value_t = MetricArg::Cpu)]
+        metric: MetricArg,
+        /// Start the graph at a function, by id or by a name only one function
+        /// has. Stacks without it are left out
+        #[arg(long, value_name = "FUNCTION")]
+        root: Option<String>,
+        /// Write folded stacks, one per line, as other flame graph tools read
+        /// them, instead of an SVG
+        #[arg(long)]
+        folded: bool,
         #[arg(long)]
         json: bool,
         #[command(flatten)]
@@ -327,6 +352,23 @@ fn main() -> ExitCode {
             filter,
             json,
         } => run_query(&recording, group_by, metric.into(), top, filter, json),
+        Command::Flamegraph {
+            recording,
+            output,
+            metric,
+            root,
+            folded,
+            json,
+            filter,
+        } => run_flamegraph(
+            &recording,
+            &output,
+            metric.into(),
+            root,
+            filter,
+            folded,
+            json,
+        ),
         Command::CallPaths {
             recording,
             function,
@@ -672,6 +714,98 @@ fn run_call_paths(
         write_output(|out| write_call_paths(out, &result))?;
     }
     Ok(ExitCode::SUCCESS)
+}
+
+fn run_flamegraph(
+    recording: &Path,
+    output: &Path,
+    metric: Metric,
+    root: Option<String>,
+    filter: FilterArgs,
+    folded: bool,
+    json: bool,
+) -> Result<ExitCode> {
+    let query = flamegraph::Query {
+        metric,
+        filter: filter.into_filter()?,
+        root,
+    };
+    let graph = flamegraph::flame_graph(recording, &query)?;
+    if graph.stacks == 0 {
+        bail!("no stacks passed the filter, so there is nothing to draw");
+    }
+    let file =
+        fs::File::create(output).with_context(|| format!("creating {}", output.display()))?;
+    let mut file = io::BufWriter::new(file);
+    if folded {
+        graph.write_folded(&mut file)
+    } else {
+        let what = match graph.metric {
+            Metric::OnCPU => "CPU time",
+            Metric::OffCPU => "Off-CPU time",
+            Metric::Wall => "Thread time",
+        };
+        let title = match graph.command.is_empty() {
+            true => what.to_owned(),
+            false => format!("{what}: {}", graph.command.join(" ")),
+        };
+        let mut parts: Vec<String> = graph
+            .root
+            .iter()
+            .map(|root| format!("from {}", function_name(root)))
+            .collect();
+        if !graph.filter.is_empty() {
+            parts.push(describe_filter(&graph.filter));
+        }
+        let subtitle = (!parts.is_empty()).then(|| parts.join(", "));
+        graph.write_svg(&title, subtitle.as_deref(), &mut file)
+    }
+    .and_then(|()| file.flush())
+    .with_context(|| format!("writing {}", output.display()))?;
+    if json {
+        let text = serde_json::to_string_pretty(&graph)?;
+        write_output(|out| writeln!(out, "{text}"))?;
+    } else {
+        write_output(|out| write_flamegraph(out, &graph, output))?;
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn write_flamegraph(out: &mut impl Write, graph: &FlameGraph, output: &Path) -> io::Result<()> {
+    writeln!(
+        out,
+        "wrote {}: {}, {:.1}% of it in {} stacks",
+        output.display(),
+        describe_time(
+            graph.metric,
+            graph.samples,
+            graph.off_cpu_intervals,
+            graph.time_ns
+        ),
+        graph.graphed_share * 100.0,
+        graph.stacks
+    )?;
+    if let Some(root) = &graph.root {
+        writeln!(out, "from {}  {}", function_name(root), module_name(root))?;
+    }
+    if !graph.filter.is_empty() {
+        writeln!(out, "filter: {}", describe_filter(&graph.filter))?;
+    }
+    let coverage = &graph.coverage;
+    writeln!(out, "\ncoverage")?;
+    if let Some(share) = coverage.named_share {
+        writeln!(
+            out,
+            "  graphed time with every frame named: {:.1}%",
+            share * 100.0
+        )?;
+    }
+    for (origin, share) in &coverage.unnamed_by_origin {
+        writeln!(out, "  unnamed {}: {:.1}%", origin.as_str(), share * 100.0)?;
+    }
+    write_no_stack(out, coverage.no_stack_share)?;
+    write_symbol_coverage(out, &coverage.symbols)?;
+    write_coverage(out, &coverage.recording)
 }
 
 fn write_call_paths(out: &mut impl Write, result: &CallPaths) -> io::Result<()> {

@@ -40,6 +40,7 @@ behaviors.
 | `overview` | Time and memory level 0 plus coverage. The first call of any investigation |
 | `query` | Group and filter observations at any level: metric, group_by, filters, time range, top N |
 | `call_paths` | Callers and callees of a selected node |
+| `flamegraph` | Draw the stacks that pass a filter as a flame graph, for a person to open, from the start of each thread or from one function |
 | `annotate` | Per-line and per-instruction cost of one function, with hardware counters when captured |
 | `timeline` | Thread state intervals with reasons, for selected threads and a time range. Aggregated signals show one value per window |
 | `sql` | Later: direct SQL over a recording's Parquet files. See [storage](model.md#storage) |
@@ -51,6 +52,20 @@ has, and returns two trees from it outward: its callers and its callees. Both
 stop at a depth limit and keep the top children of each node, and they report
 the time of what they cut. Where a function recurses, each sample counts from
 its outermost call, so the callers show where the function is entered.
+
+`flamegraph` takes the metric and filters `query` takes, and a function to
+start at, picked as `call_paths` picks one, from its outermost call. It writes
+an interactive SVG, or the folded stacks other flame graph tools read, and
+returns how much of the time it shows, with coverage. Each function is a
+block as wide as its time, on top of its caller: red to yellow for native
+code, blue for the kernel, green for a runtime's code, aqua for inlined calls
+and grey for code without a name. Functions of one name say where they are
+from, by the first of their file and start, module, file or id that tells
+them apart, as `(anonymous) (app.js:12:7)`, and any label still shared after
+that gets the function's id, so no two functions share a block. A `;` or
+control character in a label is written as `\u` and four hex digits, as
+recordings write what is no character, so that it neither ends a frame of
+the folded stacks nor breaks the SVG.
 
 `query` groups by function, source line, module or syscall. A module is a
 binary or library, by build-id or by path without one, or the kernel or one

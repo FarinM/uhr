@@ -2,6 +2,7 @@ pub mod call_paths;
 pub mod coverage;
 pub mod doctor;
 pub mod filter;
+pub mod flamegraph;
 pub mod functions;
 pub mod metric;
 pub mod overview;

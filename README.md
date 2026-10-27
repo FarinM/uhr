@@ -56,6 +56,7 @@ uhr query rec --group-by function                  # top functions
 uhr query rec --group-by line --under parse_json   # hot lines under a function
 uhr query rec --group-by syscall --metric off-cpu  # syscalls threads waited in
 uhr call-paths rec --function memcpy               # callers and callees
+uhr flamegraph rec -o cpu.svg                      # a flame graph to open
 ```
 
 Add `--json` to any but `record` for output an agent can read. See

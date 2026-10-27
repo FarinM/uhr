@@ -177,6 +177,9 @@ pub(crate) struct Functions {
     interpreted: Vec<bool>,
     functions: Vec<Function>,
     roles: Vec<Role>,
+    /// The line, and column where known, each function starts or is
+    /// declared at, where its key says.
+    starts: Vec<Option<Start>>,
     lines: Vec<SourceLine>,
     symbolized: bool,
 }
@@ -205,6 +208,7 @@ impl Functions {
         let mut ids: HashMap<Key<'a>, u32> = HashMap::new();
         let mut functions = Vec::new();
         let mut roles = Vec::new();
+        let mut starts = Vec::new();
         let mut line_ids: HashMap<(&'a str, u32), u32> = HashMap::new();
         let mut lines = Vec::new();
         let mut line = |place: Option<(&'a str, u32)>| {
@@ -237,6 +241,13 @@ impl Functions {
                     *ids.entry((origin, module, code)).or_insert_with(|| {
                         let function = make();
                         roles.push(role(&function, code));
+                        starts.push(match code {
+                            Code::Jit(Jit::Function { start, .. }) => start,
+                            Code::Inlined { line, .. } => {
+                                line.map(|line| Start { line, column: None })
+                            }
+                            _ => None,
+                        });
                         functions.push(function);
                         functions.len() as u32 - 1
                     })
@@ -383,6 +394,7 @@ impl Functions {
                 .collect(),
             functions,
             roles,
+            starts,
             lines,
             symbolized: symbols.is_some(),
         }
@@ -447,6 +459,12 @@ impl Functions {
             }
         }
         leaf
+    }
+
+    /// Where a function starts or is declared in its file, as `line` or
+    /// `line:column`, where known.
+    pub(crate) fn start(&self, id: u32) -> Option<String> {
+        self.starts[id as usize].map(|start| start.to_string())
     }
 
     pub(crate) fn line(&self, id: u32) -> &SourceLine {
@@ -607,7 +625,7 @@ fn escape(name: &str) -> String {
 
 /// 64-bit FNV-1a over the parts, each ended by a zero byte. Part of the
 /// inline id format, so it must not change.
-fn fnv1a(parts: &[&str]) -> u64 {
+pub(crate) fn fnv1a(parts: &[&str]) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in parts.iter().flat_map(|part| part.bytes().chain([0])) {
         hash ^= u64::from(byte);
