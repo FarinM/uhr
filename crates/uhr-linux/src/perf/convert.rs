@@ -28,7 +28,7 @@ use uhr_core::recording::{
     OffCPUInterval, Origin, Platform, Recording, Sample, Sampling, Signal, StackCoverage, Stream,
     StreamCoverage, Target, Thread, ThreadName, ThreadState, Unwinding,
 };
-use uhr_core::runtimes::{Interpreter, WalkedFrame};
+use uhr_core::runtimes::{Frames, Interpreter, WalkedFrame};
 use uhr_ebpf::{MAX_FRAMES, SampleHeader, UserRegisters, mode, walk};
 
 pub(super) struct Input<'a> {
@@ -480,10 +480,11 @@ fn ebpf_coverage(state: &State, max_stack_depth: u32, stack_bytes: Option<u32>) 
     }
 }
 
-/// A native frame of a sample, as `place` sees it.
+/// A native frame of a sample, as `place` and `place_native` see it.
 struct Native {
     id: u32,
-    /// Whether it is the interpreter's eval loop.
+    /// Whether it runs the program's frames: the interpreter's eval loop,
+    /// or for frames on the native stack, code the runtime compiled too.
     eval: bool,
     /// Where it ends on the stack, if known.
     end: Option<u64>,
@@ -597,6 +598,26 @@ fn place(
     }
     merged.extend(at.flat_map(|(_, frames)| frames));
     (merged, unmatched)
+}
+
+/// Puts the frames of a runtime that keeps them on the native stack into
+/// it, leaf first. `walked` has them by their frame pointer, which is
+/// where the native frame that ran each ends, less 16. Each takes the
+/// place of that native frame where it runs the program's frames, and
+/// else goes just above it: a function that sets up no frame keeps its
+/// caller's frame pointer, so that the walk of frame pointers lost the
+/// caller, whose frame this is.
+fn place_native(native: &[Native], walked: &HashMap<u64, u32>) -> Vec<u32> {
+    let mut merged = Vec::with_capacity(native.len() + 1);
+    for frame in native {
+        let found = frame.end.and_then(|end| walked.get(&end.wrapping_sub(16)));
+        match found {
+            Some(&walked) if frame.eval => merged.push(walked),
+            Some(&walked) => merged.extend([frame.id, walked]),
+            None => merged.push(frame.id),
+        }
+    }
+    merged
 }
 
 /// The deepest stack uhr's eBPF programs take, kernel and user frames
@@ -1176,45 +1197,12 @@ impl State {
         if let (Some(interpreter), true) = (at, header.walked_frames > 0) {
             // Each frame after its address.
             let bytes = header.walked_bytes.max(9) as usize;
-            let mut groups = vec![Group::default()];
-            for record in walked.chunks_exact(bytes) {
+            let records = walked.chunks_exact(bytes).map(|record| {
                 let (address, frame) = record.split_at(8);
                 let address = u64::from_ne_bytes(address.try_into().unwrap());
-                let entry = match interpreter.frame(frame) {
-                    WalkedFrame::Code {
-                        code,
-                        instruction,
-                        entered,
-                    } => {
-                        let read = interpreters
-                            .code
-                            .get(&(program, code))
-                            .and_then(Option::as_ref);
-                        let line = read.and_then(|code| code.line(instruction));
-                        let row = self.code_row(program, interpreter, code, read);
-                        let frame = Frame {
-                            origin: Origin::Interpreted,
-                            address: instruction,
-                            mapping: None,
-                            file_offset: None,
-                            return_address: false,
-                            interpreted: Some(Interpreted { code: row, line }),
-                        };
-                        let id = intern(&mut self.frames, &mut self.frame_ids, frame);
-                        groups.last_mut().expect("never empty").frames.push(id);
-                        counts.frames += 1;
-                        counts.unread_frames += u64::from(read.is_none());
-                        entered.then_some(None)
-                    }
-                    WalkedFrame::Entry { native } => Some(native.then_some(address)),
-                };
-                if let Some(entry) = entry {
-                    groups.last_mut().expect("never empty").entry = entry;
-                    groups.push(Group::default());
-                }
-            }
-            let eval_loop = |id: &u32| {
-                let frame = &self.frames[*id as usize];
+                (address, interpreter.frame(frame))
+            });
+            let runs = |frame: &Frame| {
                 let address = frame
                     .address
                     .saturating_sub(u64::from(frame.return_address));
@@ -1225,31 +1213,99 @@ impl State {
                         .checked_sub(1)
                         .is_some_and(|i| ranges[i].contains(&address))
             };
-            let native: Vec<Native> = stack
-                .iter()
-                .zip(ends)
-                .map(|(id, end)| Native {
-                    id: *id,
-                    eval: eval_loop(id),
-                    end: *end,
-                })
-                .collect();
-            let user = stack
-                .iter()
-                .position(|id| self.frames[*id as usize].origin != Origin::Kernel)
-                .unwrap_or(stack.len());
-            // A frame-pointer walk that runs into code without frames ends at
-            // an address in no mapping.
-            let lost_outer = cut_short
-                || stack.last().is_some_and(|id| {
-                    let frame = &self.frames[*id as usize];
-                    frame.origin == Origin::Unresolved && frame.mapping.is_none()
-                });
-            let from_inner = lost_outer || header.walk == walk::CUT;
-            let frame_pointers = header.frame_ends != 0;
-            let (merged, unmatched) = place(&native, user, groups, from_inner, frame_pointers);
-            counts.unmatched = u64::from(unmatched);
-            *stack = merged;
+            if interpreter.walk().frames == Frames::Native {
+                let mut placed = HashMap::new();
+                for (address, frame) in records {
+                    let WalkedFrame::Code {
+                        code, instruction, ..
+                    } = frame
+                    else {
+                        continue;
+                    };
+                    let (id, read) = self.interpreted_frame(
+                        program,
+                        interpreter,
+                        interpreters,
+                        code,
+                        instruction,
+                    );
+                    counts.frames += 1;
+                    counts.unread_frames += u64::from(!read);
+                    // A frame whose code can't be read may be no frame of
+                    // the runtime's at all.
+                    if read {
+                        placed.insert(address, id);
+                    }
+                }
+                // Code the runtime compiled is in no file.
+                let native: Vec<Native> = stack
+                    .iter()
+                    .zip(ends)
+                    .map(|(id, end)| {
+                        let frame = &self.frames[*id as usize];
+                        Native {
+                            id: *id,
+                            eval: frame.origin == Origin::Unresolved || runs(frame),
+                            end: *end,
+                        }
+                    })
+                    .collect();
+                *stack = place_native(&native, &placed);
+            } else {
+                let mut groups = vec![Group::default()];
+                for (address, frame) in records {
+                    let entry = match frame {
+                        WalkedFrame::Code {
+                            code,
+                            instruction,
+                            entered,
+                        } => {
+                            let (id, read) = self.interpreted_frame(
+                                program,
+                                interpreter,
+                                interpreters,
+                                code,
+                                instruction,
+                            );
+                            groups.last_mut().expect("never empty").frames.push(id);
+                            counts.frames += 1;
+                            counts.unread_frames += u64::from(!read);
+                            entered.then_some(None)
+                        }
+                        WalkedFrame::Entry { native } => Some(native.then_some(address)),
+                        WalkedFrame::Native => None,
+                    };
+                    if let Some(entry) = entry {
+                        groups.last_mut().expect("never empty").entry = entry;
+                        groups.push(Group::default());
+                    }
+                }
+                let native: Vec<Native> = stack
+                    .iter()
+                    .zip(ends)
+                    .map(|(id, end)| Native {
+                        id: *id,
+                        eval: runs(&self.frames[*id as usize]),
+                        end: *end,
+                    })
+                    .collect();
+                let user = stack
+                    .iter()
+                    .position(|id| self.frames[*id as usize].origin != Origin::Kernel)
+                    .unwrap_or(stack.len());
+                // A frame-pointer walk that runs into code without frames ends
+                // at an address in no mapping.
+                let lost_outer = cut_short
+                    || stack.last().is_some_and(|id| {
+                        let frame = &self.frames[*id as usize];
+                        frame.origin == Origin::Unresolved && frame.mapping.is_none()
+                    });
+                let from_inner = lost_outer || header.walk == walk::CUT;
+                let frame_pointers = header.frame_ends != 0;
+                let (merged, unmatched) = place(&native, user, groups, from_inner, frame_pointers);
+                counts.unmatched = u64::from(unmatched);
+                *stack = merged;
+            }
         }
         let walks = self
             .interpreters
@@ -1265,6 +1321,36 @@ impl State {
         walks.frames += counts.frames;
         walks.unread_frames += counts.unread_frames;
         walks.unmatched += counts.unmatched;
+    }
+
+    /// The frame of the interpreted code at `code` in `program`, at
+    /// `instruction`, and whether the code was read.
+    fn interpreted_frame(
+        &mut self,
+        program: Program,
+        interpreter: &dyn Interpreter,
+        interpreters: &Interpreters,
+        code: u64,
+        instruction: u64,
+    ) -> (u32, bool) {
+        let read = interpreters
+            .code
+            .get(&(program, code))
+            .and_then(Option::as_ref);
+        let line = read.and_then(|code| code.line(instruction));
+        let row = self.code_row(program, interpreter, code, read);
+        let frame = Frame {
+            origin: Origin::Interpreted,
+            address: instruction,
+            mapping: None,
+            file_offset: None,
+            return_address: false,
+            interpreted: Some(Interpreted { code: row, line }),
+        };
+        (
+            intern(&mut self.frames, &mut self.frame_ids, frame),
+            read.is_some(),
+        )
     }
 
     /// The row of `interpreted_code` for the code at `address` in
@@ -1827,6 +1913,41 @@ mod tests {
         assert_eq!(
             place(&whole, 0, empty, false, false),
             (vec![eval0, c3, 101, eval1, main], false)
+        );
+    }
+
+    #[test]
+    fn puts_frames_on_the_native_stack_in_place_of_the_code_that_ran_them() {
+        // Native frames 0..10, each ending 0x100 apart, the runtime's
+        // frames 100 and up.
+        let frame = |id: u32, eval: bool| Native {
+            id,
+            eval,
+            end: Some(0x1000 + 0x100 * u64::from(id)),
+        };
+        let at = |id: u32| 0x1000 + 0x100 * u64::from(id) - 16;
+        let (jit, builtin, native, outer_jit, main) = (0, 1, 2, 3, 4);
+        let stack = [
+            frame(jit, true),
+            frame(builtin, false),
+            frame(native, false),
+            frame(outer_jit, true),
+            Native {
+                id: main,
+                eval: false,
+                end: None,
+            },
+        ];
+        // The builtin set up no frame, so the frame at its frame pointer is
+        // its caller's, which the walk lost.
+        let walked = HashMap::from([(at(jit), 100), (at(builtin), 101), (at(outer_jit), 102)]);
+        assert_eq!(
+            place_native(&stack, &walked),
+            vec![100, builtin, 101, native, 102, main]
+        );
+        assert_eq!(
+            place_native(&stack, &HashMap::new()),
+            vec![jit, builtin, native, outer_jit, main]
         );
     }
 

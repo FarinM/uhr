@@ -90,16 +90,16 @@ pub struct SampleHeader {
     pub mapped: u32,
 }
 
-/// The most interpreter frames a sample walks. Each frame's address and its
-/// copy take at most `MAX_WALKED_BYTES`, a power of two, and all of them
-/// less than `WALKED_BYTES`, another.
+/// The most interpreter frames a sample walks. Each frame's address, its
+/// copy and its reads take at most `MAX_WALKED_BYTES`, a power of two, and
+/// all of them less than `WALKED_BYTES`, another.
 pub const MAX_WALKED_FRAMES: usize = 127;
 pub const MAX_WALKED_BYTES: usize = 128;
 pub const WALKED_BYTES: usize = 1 << 14;
 const _: () = assert!(MAX_WALKED_FRAMES * MAX_WALKED_BYTES < WALKED_BYTES);
 
-/// The most pointers followed to a process's lists of thread states, or
-/// from a state to its innermost frame.
+/// The most pointers followed to a process's lists of thread states, from a
+/// state to its innermost frame, or for a read.
 pub const MAX_PATH: usize = 4;
 
 /// The most thread states searched for the sampled thread's, and lists of
@@ -109,18 +109,53 @@ pub const MAX_THREADS: usize = 256;
 /// `Walk::next_list` for a process with one list of thread states.
 pub const ONE_LIST: u32 = u32::MAX;
 
-/// How uhr's programs find and copy the frames of an interpreter that keeps
-/// them in its memory, as CPython does, in one process. uhr sets it for each
-/// process whose runtime it knows, and the programs know no runtime.
+/// The most words read for each frame, after its copy.
+pub const MAX_READS: usize = 2;
+
+/// Where a walk finds the frames, of `Walk::frames`.
+pub mod frames {
+    /// In the runtime's memory: from the sampled thread's state, which it
+    /// keeps in lists, to the innermost frame, then from frame to frame.
+    pub const STATES: u32 = 0;
+    /// On the native stack: each frame the sampler's walk of frame pointers
+    /// finds, at its frame pointer.
+    pub const NATIVE: u32 = 1;
+}
+
+/// A word read at the time of a sample by following pointers from a word
+/// of a frame's copy.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Read {
+    /// Where the copy holds the word to start from.
+    pub word: u32,
+    pub path_len: u32,
+    /// Each step reads the pointer at this offset from the one before.
+    pub path: [i32; MAX_PATH],
+}
+
+/// How uhr's programs find and copy a runtime's frames in one process. uhr
+/// sets it for each process whose runtime it knows, and the programs know
+/// no runtime.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Walk {
-    /// The thread states are in lists, one for each entry of an outer
-    /// list, as CPython keeps one for each interpreter. The first entry is
-    /// at the pointer `lists[0]` past `base`, then at the pointer each next
-    /// offset past the one before, and each next entry at the pointer
-    /// `next_list` past it.
+    /// Where the frames are, of `frames`.
+    pub frames: u32,
+    /// Whether to walk the user stack by its frame pointers, keeping where
+    /// each frame ends, which `frames::NATIVE` needs, and so that the
+    /// interpreter's frames can be placed by where it keeps some of them on
+    /// the native stack.
+    pub frame_pointers: u32,
+    /// For `frames::STATES`: the thread states are in lists, one for each
+    /// entry of an outer list, as CPython keeps one for each interpreter.
+    /// The first entry is at the pointer `lists[0]` past `base`, then at the
+    /// pointer each next offset past the one before, and each next entry at
+    /// the pointer `next_list` past it.
     pub base: u64,
+    /// The process's PID namespace, by the device and inode of its file,
+    /// which the thread ids in states are in.
+    pub pid_namespace: [u64; 2],
     pub lists: [u32; MAX_PATH],
     pub lists_len: u32,
     pub next_list: u32,
@@ -140,19 +175,18 @@ pub struct Walk {
     /// as for `lists`.
     pub frame: [u32; MAX_PATH],
     pub frame_len: u32,
-    /// Where a frame holds the next one outward, and how many of its first
-    /// bytes to copy.
+    /// Where a frame holds the next one outward.
     pub next_frame: u32,
+    /// Where each frame's copy starts, from its address, and its bytes.
+    pub copy_from: i32,
     pub frame_bytes: u32,
-    /// Whether to walk the user stack by its frame pointers, keeping where
-    /// each frame ends, so that the interpreter's frames can be placed by
-    /// where it keeps some of them on the native stack.
-    pub frame_pointers: u32,
-    pub pad: u32,
-    /// The process's PID namespace, by the device and inode of its file,
-    /// which the thread ids in states are in.
-    pub pid_namespace: [u64; 2],
+    /// The words to read for each frame, which follow its copy.
+    pub reads: [Read; MAX_READS],
+    pub reads_len: u32,
 }
+
+// No padding, which `Pod` needs.
+const _: () = assert!(core::mem::size_of::<Walk>() == 160);
 
 /// How a sample's walk of interpreter frames went.
 pub mod walk {
@@ -165,7 +199,8 @@ pub mod walk {
     pub const DONE: u32 = 2;
     /// Cut at `MAX_WALKED_FRAMES`.
     pub const CUT: u32 = 3;
-    /// A thread's state or frame could not be read.
+    /// A thread's state or frame could not be read, or the native stack's
+    /// frame pointers were not walked.
     pub const FAILED: u32 = 4;
     /// The thread's state was not among the first `MAX_THREADS` searched.
     pub const UNSEARCHED: u32 = 5;
@@ -189,4 +224,5 @@ mod user {
     unsafe impl aya::Pod for super::CallKey {}
     unsafe impl aya::Pod for super::Calls {}
     unsafe impl aya::Pod for super::Walk {}
+    unsafe impl aya::Pod for super::Read {}
 }

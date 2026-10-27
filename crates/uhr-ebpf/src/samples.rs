@@ -18,7 +18,7 @@ use aya_ebpf::maps::{Array, HashMap, PerCpuArray, ProgramArray, RingBuf};
 use aya_ebpf::programs::{PerfEventContext, TracePointContext};
 use aya_ebpf::{EbpfContext, Global};
 use uhr_ebpf::{
-    MAX_FRAMES, MAX_STACK_COPY, SampleHeader, UserRegisters, WALKED_BYTES, Walk, mode, walk,
+    MAX_FRAMES, MAX_STACK_COPY, SampleHeader, UserRegisters, WALKED_BYTES, Walk, frames, mode, walk,
 };
 
 use crate::mappings;
@@ -41,7 +41,7 @@ pub struct Sample {
 }
 
 /// Room for twice the frames, a power of two for the verifier.
-const FRAME_WORDS: usize = 256;
+pub(crate) const FRAME_WORDS: usize = 256;
 const _: () = assert!(FRAME_WORDS >= 2 * MAX_FRAMES);
 
 /// Where a sample is put together, as it is too big for the stack.
@@ -71,9 +71,9 @@ static COPIES: Array<Copy> = Array::with_max_entries(1, 0);
 #[unsafe(no_mangle)]
 static STACK_BYTES: Global<u32> = Global::new(0);
 
-/// `walk_frames`, which uhr puts at 0.
+/// `walk_frames`, which uhr puts at 0, and `walk_native` at 1.
 #[map]
-static PROGRAMS: ProgramArray = ProgramArray::with_max_entries(1, 0);
+static PROGRAMS: ProgramArray = ProgramArray::with_max_entries(2, 0);
 
 /// Where `walk_frames` walks a sample's interpreter frames before it copies
 /// them into the sample, so that the verifier checks the walk once, not for
@@ -194,8 +194,10 @@ pub fn sample(ctx: PerfEventContext) -> u32 {
         exec: exec(),
         mapped: mappings::count(tgid),
     };
-    if mode != mode::GUEST && process.is_some() {
-        walk_next(&ctx, &mut sample.header);
+    if mode != mode::GUEST
+        && let Some(process) = process
+    {
+        walk_next(&ctx, process, &mut sample.header);
     }
     let len = size_of::<SampleHeader>() + native_frames(&sample.header);
     if len <= size_of::<Sample>() {
@@ -204,11 +206,13 @@ pub fn sample(ctx: PerfEventContext) -> u32 {
     0
 }
 
-/// Has `walk_frames` walk the sampled thread's interpreter frames and write
-/// the sample, which keeps each program short enough for the verifier.
-/// Returns only where it can't, and says so in `header`.
-fn walk_next(ctx: &PerfEventContext, header: &mut SampleHeader) {
-    unsafe { PROGRAMS.tail_call(ctx, 0) };
+/// Has `walk_frames` or `walk_native` walk the sampled thread's interpreter
+/// frames, as `process` says, and write the sample, which keeps each
+/// program short enough for the verifier. Returns only where it can't, and
+/// says so in `header`.
+fn walk_next(ctx: &PerfEventContext, process: &Walk, header: &mut SampleHeader) {
+    let next = u32::from(process.frames == frames::NATIVE);
+    unsafe { PROGRAMS.tail_call(ctx, next) };
     header.walk = walk::FAILED;
 }
 
@@ -241,43 +245,93 @@ pub fn walk_frames(_ctx: PerfEventContext) -> u32 {
         return 0;
     };
     let walked = unsafe { (*walked).frames.as_mut_ptr() };
-    let (status, frames, each) = walker::walk(walker::of(tgid), tid, walked);
-    // Never more than there is room for, which the verifier needs to see.
-    let bytes = (frames as usize * each as usize) & (WALKED_BYTES - 1);
+    let found = walker::walk(walker::of(tgid), tid, walked);
+    finish(found, walked);
+    0
+}
+
+/// As `walk_frames`, for a runtime that keeps its frames on the native
+/// stack, which needs the frame pointers the sampler walked.
+#[perf_event]
+pub fn walk_native(_ctx: PerfEventContext) -> u32 {
+    let (tgid, _) = current();
+    let Some(walked) = WALKED.get_ptr_mut(0) else {
+        return 0;
+    };
+    let walked = unsafe { (*walked).frames.as_mut_ptr() };
+    let mut found = (walk::FAILED, 0, 0);
+    if STACK_BYTES.load() == 0
+        && let (Some(process), Some(sample)) = (walker::of(tgid), SCRATCH.get_ptr(0))
+    {
+        let sample = unsafe { &*sample };
+        let header = &sample.header;
+        if header.frame_ends != 0 {
+            found = walker::native(
+                process,
+                &sample.frames,
+                header.kernel_frames,
+                header.user_frames,
+                walked,
+            );
+        }
+    }
+    finish(found, walked);
+    0
+}
+
+/// Copies the frames a walk found, `frames` of `each` bytes at `walked`,
+/// into the sample `sample` put together, and writes it.
+#[inline(always)]
+fn finish((status, frames, each): (u32, u32, u32), walked: *mut u8) {
     let into = |header: &mut SampleHeader, to: *mut u8| {
         header.walk = status;
         header.walked_frames = frames;
         header.walked_bytes = each;
-        unsafe { bpf_probe_read_kernel_raw(to.cast(), bytes as u32, walked.cast()) }
+        // Never more than there is room for, which the verifier needs to
+        // see. Read back from the map, so that the compiler keeps the mask
+        // where it knows the walk wrote less.
+        let (frames, each) = unsafe {
+            (
+                core::ptr::read_volatile(&header.walked_frames),
+                core::ptr::read_volatile(&header.walked_bytes),
+            )
+        };
+        let bytes = (frames as usize * each as usize) & (WALKED_BYTES - 1);
+        let read = unsafe { bpf_probe_read_kernel_raw(to.cast(), bytes as u32, walked.cast()) };
+        if read == 0 {
+            return bytes;
+        }
+        // So that the sample says no more than it holds.
+        header.walked_frames = 0;
+        0
     };
     if STACK_BYTES.load() > 0 {
         let cpu = unsafe { bpf_get_smp_processor_id() };
         let Some(sample) = COPIES.get_ptr_mut(cpu) else {
-            return 0;
+            return;
         };
         let sample = unsafe { &mut *sample };
         let at = copied(&sample.header);
-        let copied = into(&mut sample.header, unsafe {
+        let bytes = into(&mut sample.header, unsafe {
             sample.data.as_mut_ptr().add(at)
         });
-        let len = size_of::<SampleHeader>() + at + if copied == 0 { bytes } else { 0 };
+        let len = size_of::<SampleHeader>() + at + bytes;
         if len <= size_of::<Copy>() {
             output((sample as *const Copy).cast(), len);
         }
     } else {
         let Some(sample) = SCRATCH.get_ptr_mut(0) else {
-            return 0;
+            return;
         };
         let sample = unsafe { &mut *sample };
         let at = native_frames(&sample.header);
         let frames = sample.frames.as_mut_ptr().cast::<u8>();
-        let copied = into(&mut sample.header, unsafe { frames.add(at) });
-        let len = size_of::<SampleHeader>() + at + if copied == 0 { bytes } else { 0 };
+        let bytes = into(&mut sample.header, unsafe { frames.add(at) });
+        let len = size_of::<SampleHeader>() + at + bytes;
         if len <= size_of::<Sample>() {
             output((sample as *const Sample).cast(), len);
         }
     }
-    0
 }
 
 /// Samples with the kernel's frames and a copy of the user stack, for uhr
@@ -337,8 +391,10 @@ fn sample_with_copy(
         exec: exec(),
         mapped: mappings::count(tgid),
     };
-    if mode != mode::GUEST && process.is_some() {
-        walk_next(ctx, &mut sample.header);
+    if mode != mode::GUEST
+        && let Some(process) = process
+    {
+        walk_next(ctx, process, &mut sample.header);
     }
     let len = size_of::<SampleHeader>() + len;
     if len <= size_of::<Copy>() {

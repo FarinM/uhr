@@ -283,21 +283,30 @@ can use it too.
 uhr's eBPF programs walk interpreters' frames at each CPU sample, and know
 no runtime. Each runtime uhr supports is a module of `uhr-core`. One whose
 frames uhr reads finds its interpreter in a process from the files it maps,
-and gives the programs a description in numbers: how to find the sampled
-thread's state, by searching lists that start at a global, as CPython keeps
-one for each interpreter, for the entries with the thread's id in the
-process's PID namespace, the pointers from there to its innermost frame,
-which offset of a frame holds the next one, and how many bytes of each to
-copy. A thread can have a state in several lists, and the one it runs in is
-marked so where the runtime marks it, or else is the first with frames.
-They search the first 256 states. uhr reads the rest from the process's
-memory, where samples say they did not find a thread's, and tells them.
-Other ways to find frames, such as a thread-local or a slot next to the
-frame pointer, are for the runtimes that need them. The offsets come from
-what the runtime publishes, such as CPython's `_Py_DebugOffsets` and V8's
-`v8dbg_` symbols, from debug info, or from tables by version. A runtime whose
-frames are on the native stack, as V8's are, needs only the copy of the
-stack.
+and gives the programs a description in numbers of where the frames are and
+what to copy of each. The programs implement each way to find frames once,
+and a runtime picks one and gives its offsets:
+
+- In the runtime's memory, from the sampled thread's state to its innermost
+  frame, then from each frame to the next by a pointer at an offset, as
+  CPython keeps them. The state is found by searching lists that start at a
+  global, as CPython keeps one for each interpreter, for the entries with
+  the thread's id in the process's PID namespace. A thread can have a state
+  in several lists, and the one it runs in is marked so where the runtime
+  marks it, or else is the first with frames. They search the first 256
+  states. uhr reads the rest from the process's memory, where samples say
+  they did not find a thread's, and tells them.
+- On the native stack: each frame the programs' walk of the frame pointers
+  finds, at its frame pointer. This needs that walk, which they take on
+  x86-64, and not `--unwind dwarf` yet.
+
+Of each frame they copy the bytes at an offset from it, and for objects a
+garbage collector can move before uhr reads them, a few words read at the
+time of the sample by following pointers from a word of the copy. Other ways
+to find frames, such as from a thread-local, or from frame to frame through
+an array, are for the runtimes that need them. The offsets come from what
+the runtime publishes, such as CPython's `_Py_DebugOffsets` and V8's
+`v8dbg_` symbols, from debug info, or from tables by version.
 
 uhr looks for a process's runtime at its first sample, and again each time
 the process maps more code, as a runtime's library can be mapped after the
@@ -324,8 +333,13 @@ ended early, as in code without frame pointers. On arm64 a function's frame
 record can be anywhere in its frame, so where it is says nothing of where
 the frame ends, and there, as for an interpreter that keeps no such frame,
 groups are matched to runs from the end of the stack that stayed whole.
-Coverage counts the samples where one had no run. Frames of a version uhr
-does not know stay the interpreter's own, and the recording says why.
+Coverage counts the samples where one had no run. A frame on the native
+stack takes the place of the native frame that ran it, where that runs the
+runtime's interpreter or code it compiled, which no file holds, and else
+goes just above it: a function that sets up no frame keeps its caller's
+frame pointer, so that the walk lost the caller, whose frame it is. One
+whose code could not be read stays the native frame. Frames of a version
+uhr does not know stay the interpreter's own, and the recording says why.
 
 ## Unwinding and symbols
 

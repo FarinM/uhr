@@ -37,30 +37,43 @@ pub trait Interpreter: Send {
     fn runtime(&self) -> &'static str;
     fn version(&self) -> &str;
     /// Where the sampled thread's frames are, in numbers.
-    fn walk(&self) -> Walk;
-    /// The native code that runs interpreter frames, sorted. A stack holds
-    /// one run of it each time native code called into the interpreter,
-    /// and the frames that call ran go just above the run.
+    fn walk(&self) -> &Walk;
+    /// The native code that runs the program's frames, sorted. For frames
+    /// in the runtime's memory, a stack holds one run of it each time
+    /// native code called into the interpreter, and the frames that call
+    /// ran go just above the run. For frames on the native stack, a frame
+    /// of the program takes the place of the native frame it is, if that
+    /// runs this code or code the runtime compiled, which no file holds.
     fn eval_loop(&self) -> &[Range<u64>];
-    /// What the bytes the sampler copied of a frame say.
+    /// What the bytes the sampler copied of a frame, then its reads, say.
     fn frame(&self, bytes: &[u8]) -> WalkedFrame;
     /// The code at `address`, read from the process's memory.
     fn code(&self, memory: &dyn Memory, address: u64) -> Result<Code, Error>;
 }
 
 /// How uhr's sampler finds and copies an interpreter's frames, in numbers:
-/// where the sampled thread's innermost frame is, how to get from each
-/// frame to the next outward, and what to copy of each. The sampler knows
-/// no runtime, only these.
+/// where they are, and what to copy of each. The sampler knows no runtime,
+/// only these.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Walk {
-    pub thread: Thread,
-    pub step: Step,
-    /// How many of each frame's first bytes to copy.
-    pub frame_bytes: u32,
+    pub frames: Frames,
+    pub copy: Copy,
     /// Whether the sampler should keep where each native frame is on the
-    /// stack, for an interpreter that keeps its entry frames there.
+    /// stack, for an interpreter that keeps its entry frames there. Frames
+    /// on the native stack need it anyway.
     pub frame_pointers: bool,
+}
+
+/// Where a runtime's frames are.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Frames {
+    /// In its memory, from the sampled thread's innermost frame outward.
+    Memory { thread: Thread, step: Step },
+    /// On the native stack, as V8 keeps them: each frame the sampler's
+    /// walk of the frame pointers finds, at its frame pointer. Where a
+    /// function sets up no frame, so that the walk loses it, the next
+    /// frame's pointer is that of its caller.
+    Native,
 }
 
 /// Where the sampled thread's innermost frame is.
@@ -76,6 +89,28 @@ pub enum Step {
     /// Follow the pointer the frame holds at this offset. A null one ends
     /// the walk.
     Pointer(u32),
+}
+
+/// What the sampler copies of each frame.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Copy {
+    /// Where the copy starts, from the frame's address, and how many bytes.
+    pub from: i32,
+    pub bytes: u32,
+    /// Words read for each frame at the time of the sample, after its
+    /// copy, for objects a garbage collector can move before uhr reads
+    /// them.
+    pub reads: Vec<Read>,
+}
+
+/// A word read by following pointers from a word of a frame's copy. It
+/// reads as 0 where a pointer is null or can't be read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Read {
+    /// Where the copy holds the word to start from.
+    pub word: u32,
+    /// Each step reads the pointer at this offset past the one before.
+    pub path: Vec<i32>,
 }
 
 /// Thread states in lists, one for each entry of an outer list, as CPython
@@ -177,6 +212,9 @@ pub enum WalkedFrame {
     /// ends the frames of that call. `native` if it keeps the frame in the
     /// native frame of that call, so that where it is says which one.
     Entry { native: bool },
+    /// A native frame of other code, on a native stack the runtime keeps
+    /// its frames on, which stays as it is.
+    Native,
 }
 
 /// A piece of the program's code, as its interpreter keeps it.

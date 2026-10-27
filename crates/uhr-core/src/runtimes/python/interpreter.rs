@@ -14,7 +14,8 @@ use std::ops::Range;
 use super::super::process::{bytes_at, symbols, u32_at, u64_at};
 use super::super::text;
 use super::super::{
-    Code, Error, Interpreter, Memory, Process, Runtime, States, Step, Thread, Walk, WalkedFrame,
+    Code, Copy, Error, Frames, Interpreter, Memory, Process, Runtime, States, Step, Thread, Walk,
+    WalkedFrame,
 };
 use crate::recording::Mapping;
 
@@ -291,8 +292,7 @@ fn debug_layout(memory: &dyn Memory, runtime: u64, minor: u8) -> Result<Layout, 
 struct CPython {
     version: String,
     layout: Layout,
-    /// Where `_PyRuntime` and `PyCode_Type` are.
-    runtime: u64,
+    walk: Walk,
     code_type: u64,
     eval_loop: Vec<Range<u64>>,
 }
@@ -367,8 +367,8 @@ impl CPython {
         eval_loop.sort_by_key(|range| range.start);
         Ok(Self {
             version,
+            walk: walk(&layout, runtime),
             layout,
-            runtime,
             code_type,
             eval_loop,
         })
@@ -411,32 +411,25 @@ impl CPython {
     }
 }
 
-impl Interpreter for CPython {
-    fn runtime(&self) -> &'static str {
-        "python"
-    }
-
-    fn version(&self) -> &str {
-        &self.version
-    }
-
-    fn walk(&self) -> Walk {
-        let layout = &self.layout;
-        let frame = &layout.frame;
-        let flag = match frame.entry {
-            Entry::Flag(at) => at + 1,
-            Entry::Owner(_) => 0,
-        };
-        let end = [
-            frame.code + 8,
-            frame.previous + 8,
-            frame.instruction + 8,
-            frame.owner + 1,
-            flag,
-        ];
-        Walk {
+/// How uhr's sampler walks the frames of a CPython of `layout`, whose
+/// `_PyRuntime` is at `runtime`.
+fn walk(layout: &Layout, runtime: u64) -> Walk {
+    let frame = &layout.frame;
+    let flag = match frame.entry {
+        Entry::Flag(at) => at + 1,
+        Entry::Owner(_) => 0,
+    };
+    let end = [
+        frame.code + 8,
+        frame.previous + 8,
+        frame.instruction + 8,
+        frame.owner + 1,
+        flag,
+    ];
+    Walk {
+        frames: Frames::Memory {
             thread: Thread::States(States {
-                base: self.runtime,
+                base: runtime,
                 lists: vec![layout.interpreters_head],
                 next_list: Some(layout.interpreter_next),
                 first_state: layout.threads_head,
@@ -446,9 +439,27 @@ impl Interpreter for CPython {
                 frame: layout.current_frame.clone(),
             }),
             step: Step::Pointer(frame.previous),
-            frame_bytes: end.into_iter().max().unwrap_or(0).next_multiple_of(8),
-            frame_pointers: matches!(frame.entry, Entry::Owner(_)),
-        }
+        },
+        copy: Copy {
+            from: 0,
+            bytes: end.into_iter().max().unwrap_or(0).next_multiple_of(8),
+            reads: Vec::new(),
+        },
+        frame_pointers: matches!(frame.entry, Entry::Owner(_)),
+    }
+}
+
+impl Interpreter for CPython {
+    fn runtime(&self) -> &'static str {
+        "python"
+    }
+
+    fn version(&self) -> &str {
+        &self.version
+    }
+
+    fn walk(&self) -> &Walk {
+        &self.walk
     }
 
     fn eval_loop(&self) -> &[Range<u64>] {
@@ -598,8 +609,8 @@ mod tests {
     fn keeps_names_with_no_characters_apart() {
         let python = CPython {
             version: "3.12.3".into(),
+            walk: walk(&python312(), 0),
             layout: python312(),
-            runtime: 0,
             code_type: 0,
             eval_loop: Vec::new(),
         };

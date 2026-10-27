@@ -13,9 +13,9 @@ use aya::maps::{HashMap as BpfHashMap, MapData};
 use tracing::{debug, warn};
 use uhr_core::recording::Mapping;
 use uhr_core::runtimes::{
-    self, Code, Interpreter, Memory, Process, States, Step, Thread, WalkedFrame,
+    self, Code, Frames, Interpreter, Memory, Process, States, Step, Thread, WalkedFrame,
 };
-use uhr_ebpf::{MAX_PATH, MAX_WALKED_BYTES, ONE_LIST, walk};
+use uhr_ebpf::{MAX_PATH, MAX_READS, MAX_WALKED_BYTES, ONE_LIST, walk};
 
 use crate::launch::monotonic_ns;
 
@@ -200,10 +200,13 @@ fn find(receiver: Receiver<Walked>, mut maps: Maps) -> Interpreters {
                 };
                 if walked.status == walk::UNSEARCHED
                     && threads_ns.is_none_or(|ns| monotonic_ns() >= ns + THREADS_EVERY_NS)
-                    && let Thread::States(states) = interpreter.walk().thread
+                    && let Frames::Memory {
+                        thread: Thread::States(states),
+                        ..
+                    } = &interpreter.walk().frames
                 {
                     *threads_ns = Some(monotonic_ns());
-                    if let Err(error) = tell_threads(pid, &states, memory, &mut maps.threads) {
+                    if let Err(error) = tell_threads(pid, states, memory, &mut maps.threads) {
                         debug!(pid, %error, "telling uhr's eBPF programs where its threads' states are");
                     }
                 }
@@ -319,7 +322,7 @@ fn look(
     let namespace = pid_namespace(pid)
         .filter(|namespace| Some(*namespace) != pid_namespace_of("self"))
         .map_or([0, 0], |(dev, ino)| [dev, ino]);
-    let walk = programs_walk(&interpreter.walk(), namespace).ok_or_else(|| {
+    let walk = programs_walk(interpreter.walk(), namespace).ok_or_else(|| {
         format!(
             "the frames of {} {} take more steps to walk than uhr's programs take",
             interpreter.runtime(),
@@ -354,36 +357,72 @@ fn look(
 /// The walk as uhr's programs take it, with the PID namespace of the
 /// process, `None` if it has more steps than they follow.
 fn programs_walk(walk: &runtimes::Walk, pid_namespace: [u64; 2]) -> Option<uhr_ebpf::Walk> {
-    let path = |steps: &[u32]| {
-        let mut path = [0; MAX_PATH];
+    fn path<T: std::marker::Copy + Default>(steps: &[T]) -> Option<([T; MAX_PATH], u32)> {
+        let mut path = [T::default(); MAX_PATH];
         path.get_mut(..steps.len())?.copy_from_slice(steps);
         Some((path, steps.len() as u32))
-    };
-    let Thread::States(states) = &walk.thread;
-    let Step::Pointer(next_frame) = walk.step;
-    let (lists, lists_len) = path(&states.lists)?;
-    let (frame, frame_len) = path(&states.frame)?;
-    let (active, active_mask) = states.active.unwrap_or((0, 0));
+    }
+    let copy = &walk.copy;
+    let mut reads = [uhr_ebpf::Read::default(); MAX_READS];
+    for (read, wanted) in reads.iter_mut().zip(&copy.reads) {
+        let (path, path_len) = path(&wanted.path)?;
+        if wanted.word + 8 > copy.bytes {
+            return None;
+        }
+        *read = uhr_ebpf::Read {
+            word: wanted.word,
+            path_len,
+            path,
+        };
+    }
     // Each frame takes its address too.
-    (walk.frame_bytes as usize + 8 <= MAX_WALKED_BYTES && next_frame + 8 <= walk.frame_bytes)
-        .then_some(uhr_ebpf::Walk {
-            base: states.base,
-            lists,
-            lists_len,
-            next_list: states.next_list.unwrap_or(ONE_LIST),
-            first_state: states.first_state,
-            next_state: states.next_state,
-            thread_id: states.thread_id,
-            active,
-            active_mask,
-            frame,
-            frame_len,
-            next_frame,
-            frame_bytes: walk.frame_bytes,
-            frame_pointers: u32::from(walk.frame_pointers),
-            pad: 0,
-            pid_namespace,
-        })
+    let each = 8 + copy.bytes as usize + 8 * copy.reads.len();
+    if each > MAX_WALKED_BYTES || copy.reads.len() > MAX_READS {
+        return None;
+    }
+    let mut programs = uhr_ebpf::Walk {
+        frame_pointers: u32::from(walk.frame_pointers),
+        pid_namespace,
+        copy_from: copy.from,
+        frame_bytes: copy.bytes,
+        reads,
+        reads_len: copy.reads.len() as u32,
+        ..uhr_ebpf::Walk::default()
+    };
+    match &walk.frames {
+        Frames::Memory {
+            thread: Thread::States(states),
+            step: Step::Pointer(next_frame),
+        } => {
+            let (lists, lists_len) = path(&states.lists)?;
+            let (frame, frame_len) = path(&states.frame)?;
+            let (active, active_mask) = states.active.unwrap_or((0, 0));
+            if next_frame + 8 > copy.bytes || copy.from != 0 {
+                return None;
+            }
+            programs = uhr_ebpf::Walk {
+                frames: uhr_ebpf::frames::STATES,
+                base: states.base,
+                lists,
+                lists_len,
+                next_list: states.next_list.unwrap_or(ONE_LIST),
+                first_state: states.first_state,
+                next_state: states.next_state,
+                thread_id: states.thread_id,
+                active,
+                active_mask,
+                frame,
+                frame_len,
+                next_frame: *next_frame,
+                ..programs
+            };
+        }
+        Frames::Native => {
+            programs.frames = uhr_ebpf::frames::NATIVE;
+            programs.frame_pointers = 1;
+        }
+    }
+    Some(programs)
 }
 
 /// A running process, read through `/proc`.

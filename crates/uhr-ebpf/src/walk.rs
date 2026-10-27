@@ -1,6 +1,7 @@
-//! Copies the frames of an interpreter that keeps them in its memory rather
-//! than on the stack, as CPython does. uhr says for each process where they
-//! are, in numbers; this knows no runtime.
+//! Copies the frames of a runtime: from its memory, where it keeps them
+//! rather than on the stack, as CPython does, or from the native stack,
+//! where V8 keeps them. uhr says for each process where they are, in
+//! numbers; this knows no runtime.
 
 use core::ffi::c_void;
 
@@ -8,7 +9,10 @@ use aya_ebpf::bindings::bpf_pidns_info;
 use aya_ebpf::helpers::generated::{bpf_get_ns_current_pid_tgid, bpf_probe_read_user};
 use aya_ebpf::macros::map;
 use aya_ebpf::maps::{HashMap, LruHashMap};
-use uhr_ebpf::{MAX_PATH, MAX_THREADS, MAX_WALKED_BYTES, MAX_WALKED_FRAMES, ONE_LIST, Walk, walk};
+use uhr_ebpf::{
+    MAX_FRAMES, MAX_PATH, MAX_READS, MAX_THREADS, MAX_WALKED_BYTES, MAX_WALKED_FRAMES, ONE_LIST,
+    Read, WALKED_BYTES, Walk, walk,
+};
 
 /// By tgid. uhr sets a process's walk once it knows its runtime.
 #[map]
@@ -198,8 +202,8 @@ pub(crate) fn walk(walk: Option<&Walk>, tid: u32, to: *mut u8) -> (u32, u32, u32
         }
         unsafe { address.cast::<u64>().write_unaligned(frame) };
         let into = unsafe { address.add(8) };
-        let read =
-            unsafe { bpf_probe_read_user(into.cast(), bytes as u32, frame as *const c_void) };
+        let from = frame.wrapping_add(walk.copy_from as i64 as u64);
+        let read = unsafe { bpf_probe_read_user(into.cast(), bytes as u32, from as *const c_void) };
         if read != 0 {
             return (walk::FAILED, copied as u32, each as u32);
         }
@@ -209,4 +213,80 @@ pub(crate) fn walk(walk: Option<&Walk>, tid: u32, to: *mut u8) -> (u32, u32, u32
     }
     let status = if frame == 0 { walk::DONE } else { walk::CUT };
     (status, copied as u32, each as u32)
+}
+
+/// The word at `address`, 0 where it can't be read, which the helper
+/// fills its copy with then, so that no branch doubles the states the
+/// verifier checks.
+#[inline(always)]
+fn word_at(address: u64) -> u64 {
+    let mut value = 0u64;
+    unsafe { bpf_probe_read_user((&mut value as *mut u64).cast(), 8, address as *const c_void) };
+    value
+}
+
+/// The word `wanted` gives for a frame whose copy is at `copy`, of `bytes`
+/// bytes: the pointer its path leads to from the word it starts from, 0
+/// where one is null or can't be read, as reading from a null one fails.
+#[inline(always)]
+fn read_word(wanted: &Read, copy: *const u8, bytes: usize) -> u64 {
+    let word = wanted.word as usize & (MAX_WALKED_BYTES - 1);
+    if word + 8 > bytes {
+        return 0;
+    }
+    let mut address = unsafe { copy.add(word).cast::<u64>().read_unaligned() };
+    for (i, &offset) in wanted.path.iter().enumerate() {
+        if (i as u32) < wanted.path_len {
+            address = word_at(address.wrapping_add(offset as i64 as u64));
+        }
+    }
+    address
+}
+
+/// Copies what `walk` says of each user frame of a sample whose frame
+/// pointers the sampler walked: `frames` holds `kernel` kernel frames, then
+/// `user` user frames, each with where it ends, its frame pointer and 16.
+/// Writes to `to` as `walk` does, the address of each frame its frame
+/// pointer, then its copy, then its reads. A frame whose copy could not be
+/// read is all zeros.
+#[inline(always)]
+pub(crate) fn native(
+    walk: &Walk,
+    frames: &[u64; crate::samples::FRAME_WORDS],
+    kernel: u32,
+    user: u32,
+    to: *mut u8,
+) -> (u32, u32, u32) {
+    let bytes = walk.frame_bytes as usize & (MAX_WALKED_BYTES - 1);
+    let reads = (walk.reads_len as usize).min(MAX_READS);
+    let each = 8 + bytes + 8 * reads;
+    if each > MAX_WALKED_BYTES {
+        return (walk::FAILED, 0, 0);
+    }
+    let kernel = kernel as usize & MAX_FRAMES;
+    let count = (user as usize & MAX_FRAMES).min(MAX_WALKED_FRAMES);
+    for i in 0..MAX_WALKED_FRAMES {
+        if i >= count {
+            break;
+        }
+        // 0 for the outermost frame, whose copy then fails.
+        let end = frames[(kernel + 2 * i + 1) & (crate::samples::FRAME_WORDS - 1)];
+        let fp = end.wrapping_sub(16);
+        // Masked for the verifier, which loses the bound on `each`. All
+        // frames take less, so it changes no value, and the compiler, which
+        // knows that, would drop the mask without the barrier.
+        let at = core::hint::black_box(i * each) & (WALKED_BYTES - 1);
+        let record = unsafe { to.add(at) };
+        unsafe { record.cast::<u64>().write_unaligned(fp) };
+        let into = unsafe { record.add(8) };
+        let from = fp.wrapping_add(walk.copy_from as i64 as u64);
+        unsafe { bpf_probe_read_user(into.cast(), bytes as u32, from as *const c_void) };
+        for (r, wanted) in walk.reads.iter().enumerate() {
+            if r < reads {
+                let value = read_word(wanted, into, bytes);
+                unsafe { into.add(bytes + 8 * r).cast::<u64>().write_unaligned(value) };
+            }
+        }
+    }
+    (walk::DONE, count as u32, each as u32)
 }

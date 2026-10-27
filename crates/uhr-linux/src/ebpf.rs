@@ -117,8 +117,9 @@ const SYSCALLS: [&str; 2] = ["sys_enter", "sys_exit"];
 
 const SAMPLER: &str = "sample";
 
-/// The program the sampler goes on in to walk interpreter frames.
-const WALKER: &str = "walk_frames";
+/// The programs the sampler goes on in to walk interpreter frames: in the
+/// runtime's memory, and on the native stack.
+const WALKERS: [&str; 2] = ["walk_frames", "walk_native"];
 
 /// The program that sees CPUs go offline and online, and the tracepoint it
 /// runs at.
@@ -321,13 +322,15 @@ impl Programs {
             .take_map("PROGRAMS")
             .ok_or(Error::Missing("PROGRAMS"))?;
         let mut next = ProgramArray::try_from(next).map_err(|e| Error::Map("PROGRAMS", e))?;
-        let walker = perf_event(&mut self.ebpf, WALKER)?;
-        walker
-            .load()
-            .map_err(|e| Error::Program(WALKER, e).or_not_permitted())?;
-        let walker = walker.fd().map_err(|e| Error::Program(WALKER, e))?;
-        next.set(0, walker, 0)
-            .map_err(|e| Error::Map("PROGRAMS", e))?;
+        for (index, name) in WALKERS.into_iter().enumerate() {
+            let walker = perf_event(&mut self.ebpf, name)?;
+            walker
+                .load()
+                .map_err(|e| Error::Program(name, e).or_not_permitted())?;
+            let walker = walker.fd().map_err(|e| Error::Program(name, e))?;
+            next.set(index as u32, walker, 0)
+                .map_err(|e| Error::Map("PROGRAMS", e))?;
+        }
         self.next = Some(next);
         self.period_ns = sampling.period_ns;
         // Before the CPUs' events, so no step of a CPU's goes unseen.
@@ -510,9 +513,11 @@ impl Programs {
             }
             let info = program.info().map_err(|e| Error::Program(SAMPLER, e))?;
             programs.push(format!("{:016x}", info.tag()));
-            let walker = perf_event(&mut ebpf, WALKER)?;
-            let info = walker.info().map_err(|e| Error::Program(WALKER, e))?;
-            programs.push(format!("{:016x}", info.tag()));
+            for name in WALKERS {
+                let walker = perf_event(&mut ebpf, name)?;
+                let info = walker.info().map_err(|e| Error::Program(name, e))?;
+                programs.push(format!("{:016x}", info.tag()));
+            }
         }
         for (program, link) in tracepoints {
             let tracepoint = tracepoint(&mut ebpf, program)?;
@@ -743,7 +748,7 @@ pub fn check() -> Result<(), Error> {
             .load()
             .map_err(|e| Error::Program(program, e).or_not_permitted())?;
     }
-    for program in [SAMPLER, WALKER] {
+    for program in [SAMPLER].into_iter().chain(WALKERS) {
         perf_event(&mut ebpf, program)?
             .load()
             .map_err(|e| Error::Program(program, e).or_not_permitted())?;
