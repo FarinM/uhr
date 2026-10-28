@@ -154,7 +154,7 @@ fn tree(nodes: &[Node]) -> Vec<String> {
     fn walk(nodes: &[Node], level: usize, out: &mut Vec<String>) {
         for node in nodes {
             let name = node.function.name.as_deref().unwrap_or("<unnamed>");
-            out.push(format!("{}{name} {}", "  ".repeat(level), node.time_ns));
+            out.push(format!("{}{name} {}", "  ".repeat(level), node.value));
             walk(&node.children, level + 1, out);
         }
     }
@@ -168,23 +168,17 @@ fn follows_the_paths_through_a_function() {
     let result = paths(&query("spin", 3, 5));
     assert_eq!(result.function.name.as_deref(), Some("spin"));
     assert_eq!(result.function.id.as_deref(), Some("/bin/app+0x40"));
-    assert_eq!(result.time_ns, 15);
-    assert_eq!((result.total_ns, result.self_ns), (12, 10));
+    assert_eq!(result.value, 15);
+    assert_eq!((result.total, result.self_), (12, 10));
     assert_eq!(result.total_share, 0.8);
-    assert_eq!(result.no_caller_ns, 1);
+    assert_eq!(result.no_caller, 1);
 
     assert_eq!(
         tree(&result.callers),
         ["a 9", "  main 9", "b 2", "  main 2"]
     );
-    assert!(result.callers.iter().all(|n| n.self_ns.is_none()));
-    assert_eq!(
-        result.callers_omitted,
-        Omitted {
-            nodes: 0,
-            time_ns: 0
-        }
-    );
+    assert!(result.callers.iter().all(|n| n.self_.is_none()));
+    assert_eq!(result.callers_omitted, Omitted { nodes: 0, value: 0 });
 }
 
 #[test]
@@ -201,10 +195,10 @@ fn counts_a_recursive_call_from_its_outermost_call() {
         .iter()
         .find(|n| n.function.name.as_deref() == Some("rec"))
         .unwrap();
-    assert_eq!((rec.time_ns, rec.self_ns), (1, Some(0)));
+    assert_eq!((rec.value, rec.self_), (1, Some(0)));
     let inner = &rec.children[0];
     assert_eq!(inner.function.name.as_deref(), Some("spin"));
-    assert_eq!(inner.self_ns, Some(1));
+    assert_eq!(inner.self_, Some(1));
 }
 
 #[test]
@@ -217,10 +211,10 @@ fn lists_callees_with_their_leaf_time() {
             .find(|n| n.function.name.as_deref() == name)
             .unwrap()
     };
-    assert_eq!(callee(Some("keep")).self_ns, Some(1));
+    assert_eq!(callee(Some("keep")).self_, Some(1));
     let kernel = callee(None);
     assert_eq!(kernel.function.origin, Origin::Kernel);
-    assert_eq!((kernel.time_ns, kernel.self_ns), (1, Some(1)));
+    assert_eq!((kernel.value, kernel.self_), (1, Some(1)));
     assert_eq!(result.callees.len(), 3);
 }
 
@@ -229,54 +223,30 @@ fn reports_what_the_depth_limit_cuts() {
     let result = paths(&query("spin", 1, 5));
     let a = &result.callers[0];
     assert!(a.children.is_empty());
-    assert_eq!(
-        a.omitted,
-        Omitted {
-            nodes: 1,
-            time_ns: 9
-        }
-    );
+    assert_eq!(a.omitted, Omitted { nodes: 1, value: 9 });
     let rec = result
         .callees
         .iter()
         .find(|n| n.function.name.as_deref() == Some("rec"))
         .unwrap();
-    assert_eq!(
-        rec.omitted,
-        Omitted {
-            nodes: 1,
-            time_ns: 1
-        }
-    );
-    assert_eq!(rec.self_ns, Some(0), "the leaf is below the limit");
+    assert_eq!(rec.omitted, Omitted { nodes: 1, value: 1 });
+    assert_eq!(rec.self_, Some(0), "the leaf is below the limit");
 }
 
 #[test]
 fn sums_the_children_cut_by_top() {
     let result = paths(&query("spin", 3, 1));
     assert_eq!(tree(&result.callers), ["a 9", "  main 9"]);
-    assert_eq!(
-        result.callers_omitted,
-        Omitted {
-            nodes: 1,
-            time_ns: 2
-        }
-    );
+    assert_eq!(result.callers_omitted, Omitted { nodes: 1, value: 2 });
     assert_eq!(result.callees.len(), 1);
-    assert_eq!(
-        result.callees_omitted,
-        Omitted {
-            nodes: 2,
-            time_ns: 2
-        }
-    );
+    assert_eq!(result.callees_omitted, Omitted { nodes: 2, value: 2 });
 }
 
 #[test]
 fn selects_by_id_or_unique_name() {
     let by_id = paths(&query("/bin/app+0x40", 3, 5));
     assert_eq!(by_id.function.name.as_deref(), Some("spin"));
-    assert_eq!(by_id.total_ns, 12);
+    assert_eq!(by_id.total, 12);
 
     let recording = recording();
     let error = |name: &str| run(&recording, Some(&symbols()), &query(name, 3, 5)).unwrap_err();
@@ -297,7 +267,7 @@ fn selects_by_id_or_unique_name() {
     ));
 
     let dup = paths(&query("/bin/app+0x80", 3, 5));
-    assert_eq!(dup.total_ns, 1);
+    assert_eq!(dup.total, 1);
 }
 
 #[test]
@@ -305,7 +275,7 @@ fn follows_only_the_samples_that_pass_the_filter() {
     let mut query = query("spin", 3, 5);
     query.filter.modes = vec![Mode::Kernel];
     let result = paths(&query);
-    assert_eq!((result.time_ns, result.total_ns, result.self_ns), (1, 1, 0));
+    assert_eq!((result.value, result.total, result.self_), (1, 1, 0));
     assert_eq!(tree(&result.callers), ["a 1", "  main 1"]);
     assert_eq!(result.total_share, 1.0);
 }
@@ -370,7 +340,7 @@ fn a_binary_that_ran_from_two_paths_is_one_function() {
 
     for function in ["abcd+0x40", "spin"] {
         let result = run(&recording, Some(&symbols), &query(function, 3, 5)).unwrap();
-        assert_eq!(result.total_ns, 17, "{function}: both copies count");
+        assert_eq!(result.total, 17, "{function}: both copies count");
         assert_eq!(tree(&result.callers)[..2], ["a 9", "  main 9"]);
         assert!(tree(&result.callers).contains(&"main 5".to_owned()));
     }
@@ -389,21 +359,21 @@ fn goes_through_inlined_calls() {
     symbols.inline[3] = vec![call("mixin"), call("spin")];
     let mixin = run(&recording(), Some(&symbols), &query("mixin", 3, 5)).unwrap();
     assert!(mixin.function.inlined);
-    assert_eq!((mixin.total_ns, mixin.self_ns), (12, 10));
+    assert_eq!((mixin.total, mixin.self_), (12, 10));
     assert_eq!(
         tree(&mixin.callers),
         ["spin 12", "  a 9", "    main 9", "  b 2", "    main 2"]
     );
 
     let spin = run(&recording(), Some(&symbols), &query("spin", 3, 5)).unwrap();
-    assert_eq!(spin.self_ns, 0, "the time is in the inlined code");
+    assert_eq!(spin.self_, 0, "the time is in the inlined code");
     let callee = spin
         .callees
         .iter()
         .find(|n| n.function.name.as_deref() == Some("mixin"))
         .unwrap();
     // The tenth is the recursive call, below the depth limit.
-    assert_eq!(callee.self_ns, Some(9));
+    assert_eq!(callee.self_, Some(9));
 }
 
 #[test]
@@ -463,13 +433,13 @@ fn follows_off_cpu_time_through_the_paths() {
     };
 
     let off = by(Metric::OffCPU);
-    assert_eq!((off.time_ns, off.total_ns, off.self_ns), (50, 30, 30));
+    assert_eq!((off.value, off.total, off.self_), (50, 30, 30));
     assert_eq!(off.off_cpu_intervals, 3);
     assert_eq!(tree(&off.callers), ["b 30", "  main 30"]);
     assert_eq!(off.coverage.no_stack_share, 0.2);
 
     let wall = by(Metric::Wall);
-    assert_eq!((wall.time_ns, wall.total_ns), (65, 42));
+    assert_eq!((wall.value, wall.total), (65, 42));
     assert_eq!(
         tree(&wall.callers),
         ["b 32", "  main 32", "a 9", "  main 9"]

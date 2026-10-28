@@ -155,14 +155,14 @@ fn filters_samples_by_thread_and_time() {
     let result = overview(&recording);
     let tid = thread(&result, "heavy")["tid"].to_string();
     let by_tid = query(&recording, &["--tid", &tid]);
-    assert!(by_tid["time_ns"].as_u64() >= heavy["time_ns"].as_u64());
+    assert!(by_tid["value"].as_u64() >= heavy["value"].as_u64());
 
     // A time range splits the samples without losing any or counting any
     // twice. Which thread finishes first depends on the scheduler, so the
     // split is checked by totals, not by which functions are left.
     let light_end = thread(&result, "light")["end_ns"].as_u64().unwrap();
     let split = format!("{}ns", light_end + 1);
-    let cpu_ns = |filter: &[&str]| query(&recording, filter)["time_ns"].as_u64().unwrap();
+    let cpu_ns = |filter: &[&str]| query(&recording, filter)["value"].as_u64().unwrap();
     assert_eq!(
         cpu_ns(&["--to", &split]) + cpu_ns(&["--from", &split]),
         cpu_ns(&[])

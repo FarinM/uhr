@@ -109,7 +109,7 @@ fn names_python_functions_and_counts_the_interpreter_for_them() {
         "work",
     ]);
     let all = json(&["query", &recording, "--group-by", "function"]);
-    let ratio = share(&under, "time_ns") / share(&all, "time_ns");
+    let ratio = share(&under, "value") / share(&all, "value");
     assert!(ratio > 0.9, "only {ratio} of the time is under work");
 }
 

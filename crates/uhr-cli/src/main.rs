@@ -829,11 +829,11 @@ fn write_flamegraph(out: &mut impl Write, graph: &FlameGraph, output: &Path) -> 
         out,
         "wrote {}: {}, {:.1}% of it in {} stacks",
         output.display(),
-        describe_time(
+        describe_amount(
             graph.metric,
             graph.samples,
             graph.off_cpu_intervals,
-            graph.time_ns
+            graph.value
         ),
         graph.graphed_share * 100.0,
         graph.stacks
@@ -862,11 +862,11 @@ fn write_flamegraph(out: &mut impl Write, graph: &FlameGraph, output: &Path) -> 
 }
 
 fn write_call_paths(out: &mut impl Write, result: &CallPaths) -> io::Result<()> {
-    let percent = |ns: u64| {
-        if result.time_ns == 0 {
+    let percent = |amount: u64| {
+        if result.value == 0 {
             0.0
         } else {
-            ns as f64 / result.time_ns as f64 * 100.0
+            amount as f64 / result.value as f64 * 100.0
         }
     };
     writeln!(
@@ -878,11 +878,11 @@ fn write_call_paths(out: &mut impl Write, result: &CallPaths) -> io::Result<()> 
     writeln!(
         out,
         "{}. On the stack for {:.1}% of it, its own for {:.1}%",
-        describe_time(
+        describe_amount(
             result.metric,
             result.samples,
             result.off_cpu_intervals,
-            result.time_ns
+            result.value
         ),
         result.total_share * 100.0,
         result.self_share * 100.0
@@ -893,11 +893,11 @@ fn write_call_paths(out: &mut impl Write, result: &CallPaths) -> io::Result<()> 
 
     writeln!(out, "\ncallers")?;
     write_nodes(out, &result.callers, &result.callers_omitted, 0, &percent)?;
-    if result.no_caller_ns > 0 {
+    if result.no_caller > 0 {
         writeln!(
             out,
             "{:>6.1}%  (no caller: where the thread started, or the stack was cut short)",
-            percent(result.no_caller_ns)
+            percent(result.no_caller)
         )?;
     }
     writeln!(out, "\ncallees")?;
@@ -933,14 +933,14 @@ fn write_nodes(
         writeln!(out, "  none")?;
     }
     for node in nodes {
-        let leaf = match node.self_ns {
-            Some(ns) if ns > 0 => format!("  (leaf {:.1}%)", percent(ns)),
+        let leaf = match node.self_ {
+            Some(amount) if amount > 0 => format!("  (leaf {:.1}%)", percent(amount)),
             _ => String::new(),
         };
         writeln!(
             out,
             "{:>6.1}%  {indent}{}  {}{leaf}",
-            percent(node.time_ns),
+            percent(node.value),
             function_name(&node.function),
             module_name(&node.function)
         )?;
@@ -950,7 +950,7 @@ fn write_nodes(
         writeln!(
             out,
             "{:>6.1}%  {indent}({} more)",
-            percent(omitted.time_ns),
+            percent(omitted.value),
             omitted.nodes
         )?;
     }
@@ -996,11 +996,11 @@ fn write_query(out: &mut impl Write, result: &QueryResult) -> io::Result<()> {
     writeln!(
         out,
         "{}, by {by}\n",
-        describe_time(
+        describe_amount(
             result.metric,
             result.samples,
             result.off_cpu_intervals,
-            result.time_ns
+            result.value
         )
     )?;
     if !result.filter.is_empty() {
@@ -1148,8 +1148,8 @@ fn duration(ns: u64) -> String {
     }
 }
 
-fn describe_time(metric: Metric, samples: u64, intervals: u64, time_ns: u64) -> String {
-    let seconds = time_ns as f64 / 1e9;
+fn describe_amount(metric: Metric, samples: u64, intervals: u64, value: u64) -> String {
+    let seconds = value as f64 / 1e9;
     match metric {
         Metric::OnCPU => format!("{samples} samples, {seconds:.2} s of CPU time"),
         Metric::OffCPU => format!("{intervals} off-CPU intervals, {seconds:.2} s off CPU"),

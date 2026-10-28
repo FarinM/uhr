@@ -137,7 +137,7 @@ fn query(top: usize) -> Query {
 #[test]
 fn shares_self_and_total_time() {
     let result = run(&recording(), Some(&symbols()), &query(10)).unwrap();
-    assert_eq!(result.time_ns, 10);
+    assert_eq!(result.value, 10);
     let row = |name: Option<&str>, origin: Origin| {
         function_rows(&result)
             .iter()
@@ -147,23 +147,23 @@ fn shares_self_and_total_time() {
 
     let leaf = row(Some("leaf"), Origin::Binary);
     assert_eq!(leaf.function.id.as_deref(), Some("/bin/app+0x10"));
-    assert_eq!((leaf.self_ns, leaf.total_ns), (8, 8));
+    assert_eq!((leaf.self_, leaf.total), (8, 8));
     assert_eq!(leaf.self_share, 0.8);
 
     let recurse = row(Some("recurse"), Origin::Binary);
     assert_eq!(
-        (recurse.self_ns, recurse.total_ns),
+        (recurse.self_, recurse.total),
         (0, 8),
         "recursion counts once"
     );
 
     let main = row(Some("main"), Origin::Binary);
-    assert_eq!((main.self_ns, main.total_ns), (0, 10));
+    assert_eq!((main.self_, main.total), (0, 10));
 
     let placeholder = row(None, Origin::Binary);
     assert_eq!(placeholder.function.placeholder.as_deref(), Some("fun_40"));
     assert_eq!(placeholder.function.module.as_deref(), Some("/bin/app"));
-    assert_eq!(placeholder.self_ns, 1);
+    assert_eq!(placeholder.self_, 1);
 
     assert_eq!(
         function_rows(&result)[0].function.name.as_deref(),
@@ -346,15 +346,15 @@ fn separates_distinct_functions_with_the_same_name() {
     );
     assert_eq!(
         (
-            function_rows(&result)[0].self_ns,
-            function_rows(&result)[0].total_ns
+            function_rows(&result)[0].self_,
+            function_rows(&result)[0].total
         ),
         (6, 6)
     );
     assert_eq!(
         (
-            function_rows(&result)[1].self_ns,
-            function_rows(&result)[1].total_ns
+            function_rows(&result)[1].self_,
+            function_rows(&result)[1].total
         ),
         (4, 10)
     );
@@ -410,7 +410,7 @@ fn keeps_kernel_code_outside_mappings_apart() {
                 f.name.as_deref(),
                 f.id.as_deref(),
                 f.module.as_deref(),
-                r.self_ns,
+                r.self_,
             )
         })
         .collect();
@@ -436,7 +436,7 @@ fn keeps_kernel_code_outside_mappings_apart() {
     assert_eq!(result.coverage.named_share, Some(27.0 / 31.0));
     for wanted in [INGRESS, "bpf+ee0e253c78993a24_sd_fw_ingress"] {
         let under = run(&recording, Some(&symbols), &under(&[wanted])).unwrap();
-        assert_eq!(under.time_ns, 2, "{wanted}");
+        assert_eq!(under.value, 2, "{wanted}");
     }
 }
 
@@ -533,14 +533,7 @@ fn gives_the_time_in_uhrs_own_programs_a_syscall_row() {
     };
     let rows: Vec<_> = rows
         .iter()
-        .map(|r| {
-            (
-                r.in_syscall,
-                r.syscall.as_deref(),
-                r.own_programs,
-                r.time_ns,
-            )
-        })
+        .map(|r| (r.in_syscall, r.syscall.as_deref(), r.own_programs, r.value))
         .collect();
     assert_eq!(
         rows,
@@ -576,7 +569,7 @@ fn merges_the_same_function_across_mappings_and_counts_recursion_once() {
     let result = run(&recording, Some(&symbols), &query(10)).unwrap();
     assert_eq!(function_rows(&result).len(), 1);
     let row = &function_rows(&result)[0];
-    assert_eq!((row.self_ns, row.total_ns), (10, 10));
+    assert_eq!((row.self_, row.total), (10, 10));
     assert_eq!(row.function.function_address, Some(0x10));
     assert_eq!(row.function.build_id.as_deref(), Some("abcd"));
     assert_eq!(row.function.id.as_deref(), Some("abcd+0x10"));
@@ -610,8 +603,8 @@ fn separates_builds_at_the_same_path_and_function_address() {
         function_rows(&result)[1].function.build_id.as_deref(),
         Some("ef01")
     );
-    assert_eq!(function_rows(&result)[0].self_ns, 6);
-    assert_eq!(function_rows(&result)[1].self_ns, 4);
+    assert_eq!(function_rows(&result)[0].self_, 6);
+    assert_eq!(function_rows(&result)[1].self_, 4);
     assert!(
         function_rows(&result)
             .iter()
@@ -644,7 +637,7 @@ fn combines_copies_of_one_binary_at_different_paths() {
     let row = &function_rows(&result)[0];
     assert_eq!(row.function.id.as_deref(), Some("abcd+0x10"));
     assert_eq!(row.function.module.as_deref(), Some("/bin/app"));
-    assert_eq!(row.self_ns, 10);
+    assert_eq!(row.self_, 10);
 }
 
 #[test]
@@ -686,7 +679,7 @@ fn keeps_only_samples_under_a_function() {
     let cpu_ns = |functions: &[&str]| {
         run(&recording(), Some(&symbols()), &under(functions))
             .unwrap()
-            .time_ns
+            .value
     };
     assert_eq!(cpu_ns(&["main"]), 10);
     assert_eq!(cpu_ns(&["recurse"]), 8);
@@ -763,11 +756,11 @@ fn credits_inlined_code_to_the_inlined_function() {
             .unwrap()
             .starts_with("/bin/app+inline:")
     );
-    assert_eq!((helper.self_ns, helper.total_ns), (8, 8));
+    assert_eq!((helper.self_, helper.total), (8, 8));
 
     let leaf = row(&result, "leaf");
     assert!(!leaf.function.inlined);
-    assert_eq!((leaf.self_ns, leaf.total_ns), (0, 8));
+    assert_eq!((leaf.self_, leaf.total), (0, 8));
     assert_eq!(leaf.function.file.as_deref(), Some("/src/app.c"));
     assert_eq!(result.coverage.named_share, Some(0.8));
     assert!(result.coverage.symbols.without_debug_info.is_empty());
@@ -791,7 +784,7 @@ fn an_inlined_function_is_one_function_per_declaration() {
         .filter(|r| r.function.name.as_deref() == Some("helper"))
         .collect();
     assert_eq!(helpers.len(), 1);
-    assert_eq!(helpers[0].self_ns, 9);
+    assert_eq!(helpers[0].self_, 9);
 
     // A function of the same name declared elsewhere is another function,
     // as is one whose name differs only by a leading underscore.
@@ -824,7 +817,7 @@ fn filters_by_an_inlined_function_on_the_stack() {
     let mut query = under(&["helper"]);
     query.top = 10;
     let result = run(&recording(), Some(&symbols_with_inlining()), &query).unwrap();
-    assert_eq!(result.time_ns, 8);
+    assert_eq!(result.value, 8);
 }
 
 #[test]
@@ -850,14 +843,14 @@ fn groups_by_source_line() {
     };
     let helper = at("helper", Some(5));
     assert_eq!(helper.line.as_ref().unwrap().file, "/src/app.c");
-    assert_eq!((helper.self_ns, helper.total_ns), (8, 8));
+    assert_eq!((helper.self_, helper.total), (8, 8));
     // The leaf frame's caller is at the line of the call.
-    assert_eq!(at("leaf", Some(20)).total_ns, 8);
-    assert_eq!(at("recurse", Some(30)).total_ns, 8);
+    assert_eq!(at("leaf", Some(20)).total, 8);
+    assert_eq!(at("recurse", Some(30)).total, 8);
     // Code without line info keeps its time in a row with no line.
-    assert_eq!(at("main", None).total_ns, 10);
-    let rows: u64 = function_rows(&result).iter().map(|r| r.self_ns).sum();
-    assert_eq!(rows, result.time_ns);
+    assert_eq!(at("main", None).total, 10);
+    let rows: u64 = function_rows(&result).iter().map(|r| r.self_).sum();
+    assert_eq!(rows, result.value);
 
     let by_function = run(
         &recording(),
@@ -904,7 +897,7 @@ fn times(result: &QueryResult, name: &str) -> (u64, u64) {
         .iter()
         .find(|r| r.function.name.as_deref() == Some(name))
         .unwrap_or_else(|| panic!("no row {name}"));
-    (row.self_ns, row.total_ns)
+    (row.self_, row.total)
 }
 
 #[test]
@@ -913,18 +906,12 @@ fn weighs_stacks_by_the_metric() {
     let run = |metric| run(&recording, Some(&symbols()), &by(metric)).unwrap();
 
     let cpu = run(Metric::OnCPU);
-    assert_eq!(
-        (cpu.samples, cpu.off_cpu_intervals, cpu.time_ns),
-        (4, 0, 10)
-    );
+    assert_eq!((cpu.samples, cpu.off_cpu_intervals, cpu.value), (4, 0, 10));
     assert_eq!(times(&cpu, "leaf"), (8, 8));
     assert_eq!(cpu.coverage.no_stack_share, 0.0);
 
     let off = run(Metric::OffCPU);
-    assert_eq!(
-        (off.samples, off.off_cpu_intervals, off.time_ns),
-        (0, 3, 40)
-    );
+    assert_eq!((off.samples, off.off_cpu_intervals, off.value), (0, 3, 40));
     assert_eq!(times(&off, "leaf"), (20, 20));
     assert_eq!(times(&off, "main"), (0, 25));
     assert_eq!(off.coverage.named_share, Some(0.5));
@@ -933,7 +920,7 @@ fn weighs_stacks_by_the_metric() {
 
     let wall = run(Metric::Wall);
     assert_eq!(
-        (wall.samples, wall.off_cpu_intervals, wall.time_ns),
+        (wall.samples, wall.off_cpu_intervals, wall.value),
         (4, 3, 50)
     );
     assert_eq!(times(&wall, "leaf"), (28, 28));
@@ -950,7 +937,7 @@ fn off_cpu_time_without_a_stack_is_under_no_function() {
         ..by(Metric::OffCPU)
     };
     let result = run(&with_off_cpu(recording()), Some(&symbols()), &query).unwrap();
-    assert_eq!(result.time_ns, 25);
+    assert_eq!(result.value, 25);
     assert_eq!(result.coverage.no_stack_share, 0.0);
 }
 
@@ -997,7 +984,7 @@ fn groups_by_module() {
     let result = run(&recording, None, &query).unwrap();
     let rows: Vec<_> = module_rows(&result)
         .iter()
-        .map(|r| (r.module.as_deref(), r.origin, r.self_ns, r.total_ns))
+        .map(|r| (r.module.as_deref(), r.origin, r.self_, r.total))
         .collect();
     assert_eq!(
         rows,
@@ -1067,7 +1054,7 @@ fn syscall_rows(result: &QueryResult) -> Vec<(Option<bool>, Option<&str>, u64)> 
         panic!("rows of another grouping: {:?}", result.rows)
     };
     rows.iter()
-        .map(|r: &SyscallRow| (r.in_syscall, r.syscall.as_deref(), r.time_ns))
+        .map(|r: &SyscallRow| (r.in_syscall, r.syscall.as_deref(), r.value))
         .collect()
 }
 
@@ -1272,7 +1259,7 @@ fn counted_rows(result: &QueryResult) -> Vec<(Option<&str>, u64, Option<Counted>
         panic!("rows of another grouping: {:?}", result.rows)
     };
     rows.iter()
-        .map(|r| (r.syscall.as_deref(), r.time_ns, r.calls.clone()))
+        .map(|r| (r.syscall.as_deref(), r.value, r.calls.clone()))
         .collect()
 }
 
@@ -1346,7 +1333,7 @@ fn filters_by_the_syscall_on_the_stack() {
     let time_ns = |syscalls: &[&str], under: &[&str]| {
         run(&recording, Some(&symbols), &in_syscalls(syscalls, under))
             .unwrap()
-            .time_ns
+            .value
     };
     assert_eq!(time_ns(&["read"], &[]), 20);
     assert_eq!(time_ns(&["read", "futex"], &[]), 24);
@@ -1386,7 +1373,7 @@ fn off_cpu_time_without_a_stack_is_in_no_syscall() {
         ..in_syscalls(&["read"], &[])
     };
     let result = run(&recording, Some(&symbols), &query).unwrap();
-    assert_eq!((result.off_cpu_intervals, result.time_ns), (1, 5));
+    assert_eq!((result.off_cpu_intervals, result.value), (1, 5));
 }
 
 /// Code runtimes compiled in two processes: `inner` in each, then one of
@@ -1452,7 +1439,7 @@ fn groups_code_runtimes_compiled_by_their_names() {
                 r.function.id.as_deref().unwrap(),
                 r.function.module.as_deref(),
                 r.function.file.as_deref(),
-                r.self_ns,
+                r.self_,
             )
         })
         .collect();
@@ -1545,15 +1532,15 @@ fn groups_interpreted_code_with_the_compiled_code_of_the_function() {
         row
     };
     let inner = row(Some("jit+python:inner:/app/spin.py"), Some("inner"));
-    assert_eq!((inner.self_ns, inner.total_ns), (3, 3));
+    assert_eq!((inner.self_, inner.total), (3, 3));
     assert_eq!(inner.function.module.as_deref(), Some("[python]"));
     let outer = row(Some("jit+python:outer:/app/spin.py"), Some("outer"));
-    assert_eq!((outer.self_ns, outer.total_ns), (0, 2));
+    assert_eq!((outer.self_, outer.total), (0, 2));
     assert_eq!(outer.function.origin, Origin::Interpreted);
     let unread: Vec<_> = function_rows(&result)
         .iter()
         .filter(|r| r.function.origin == Origin::Interpreted && r.function.name.is_none())
-        .map(|r| (r.function.id.as_deref(), r.self_ns))
+        .map(|r| (r.function.id.as_deref(), r.self_))
         .collect();
     assert_eq!(unread, [(None, 1)]);
 
@@ -1688,7 +1675,7 @@ fn counts_a_runtimes_own_code_for_the_function_it_runs() {
         module_rows(&result)
             .iter()
             .find(|r| r.module.as_deref() == Some(module))
-            .map(|r| r.self_ns)
+            .map(|r| r.self_)
     };
     assert_eq!(self_ns("[python]"), Some(5));
     assert_eq!(self_ns("/usr/bin/python3.12"), Some(1));
@@ -1707,5 +1694,5 @@ fn counts_a_runtimes_own_code_for_the_function_it_runs() {
         },
     )
     .unwrap();
-    assert_eq!((paths.self_ns, paths.total_ns), (5, 8));
+    assert_eq!((paths.self_, paths.total), (5, 8));
 }

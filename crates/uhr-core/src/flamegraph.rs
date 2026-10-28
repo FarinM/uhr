@@ -1,5 +1,6 @@
 //! Flame graphs of a recording's stacks, for a person to read: each
-//! function a block as wide as its time, on top of its caller.
+//! function a block as wide as its amount of the metric, on top of its
+//! caller.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{self, Write};
@@ -10,7 +11,7 @@ use serde::Serialize;
 use crate::coverage::{Coverage, SymbolCoverage};
 use crate::filter::{self, Filter};
 use crate::functions::{self, Function, Functions};
-use crate::metric::{self, Metric, stack_times};
+use crate::metric::{self, Metric, Unit, stack_amounts};
 use crate::recording::{self, Origin, Recording};
 use crate::symbols::Symbols;
 
@@ -45,6 +46,8 @@ pub struct FlameGraph {
     /// The target's command, as recorded.
     pub command: Vec<String>,
     pub metric: Metric,
+    /// What `value` and `graphed` count.
+    pub unit: Unit,
     pub filter: Filter,
     /// The function the graph starts at, if not the start of each thread.
     pub root: Option<Function>,
@@ -52,11 +55,11 @@ pub struct FlameGraph {
     pub samples: u64,
     /// Off-CPU intervals that passed the filter, if the metric counts them.
     pub off_cpu_intervals: u64,
-    /// Time of the metric that passed. Shares are of this.
-    pub time_ns: u64,
-    /// Of that, the time the graph shows: all with a stack, or with the
+    /// The metric's amount that passed. Shares are of this.
+    pub value: u64,
+    /// Of that, the amount the graph shows: all with a stack, or with the
     /// root anywhere on it.
-    pub graphed_ns: u64,
+    pub graphed: u64,
     pub graphed_share: f64,
     /// Distinct stacks in the graph.
     pub stacks: usize,
@@ -65,20 +68,20 @@ pub struct FlameGraph {
     #[serde(skip)]
     blocks: Vec<Block>,
     /// Each distinct stack, root first, as indexes into `blocks`, and its
-    /// time.
+    /// amount.
     #[serde(skip)]
     paths: Vec<(Vec<u32>, u64)>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct FlameGraphCoverage {
-    /// Share of the graphed time whose frames all have names. Placeholders
-    /// don't count. `None` without graphed time.
+    /// Share of the graphed amount whose frames all have names.
+    /// Placeholders don't count. `None` with nothing graphed.
     pub named_share: Option<f64>,
-    /// Share of the graphed time with an unnamed frame of each origin. A
+    /// Share of the graphed amount with an unnamed frame of each origin. A
     /// stack with unnamed frames of two origins counts for both.
     pub unnamed_by_origin: BTreeMap<Origin, f64>,
-    /// Share of all the time with no stack: off-CPU time whose stack was
+    /// Share of all the amount with no stack: off-CPU time whose stack was
     /// not recorded. It is not in the graph.
     pub no_stack_share: f64,
     #[serde(flatten)]
@@ -122,15 +125,15 @@ pub fn run(
         .as_deref()
         .map(|root| functions.select(root))
         .transpose()?;
-    let times = stack_times(recording, &functions, &query.filter, query.metric)?;
-    let time_ns = times.total_ns();
+    let amounts = stack_amounts(recording, &functions, &query.filter, query.metric)?;
+    let value = amounts.total();
 
     let mut folded: HashMap<Vec<u32>, u64> = HashMap::new();
-    let (mut graphed_ns, mut named_ns) = (0, 0);
-    let mut unnamed_ns: BTreeMap<Origin, u64> = BTreeMap::new();
+    let (mut graphed, mut named) = (0, 0);
+    let mut unnamed_amounts: BTreeMap<Origin, u64> = BTreeMap::new();
     let mut unnamed = BTreeSet::new();
     let mut path = Vec::new();
-    for (stack, &weight) in recording.stacks.iter().zip(&times.ns) {
+    for (stack, &weight) in recording.stacks.iter().zip(&amounts.by_stack) {
         if weight == 0 {
             continue;
         }
@@ -149,47 +152,48 @@ pub fn run(
         }
         path.truncate(end);
         path.reverse();
-        graphed_ns += weight;
+        graphed += weight;
         unnamed.clear();
         unnamed.extend(path.iter().filter_map(|&f| {
             let function = functions.get(f);
             function.name.is_none().then_some(function.origin)
         }));
         if unnamed.is_empty() {
-            named_ns += weight;
+            named += weight;
         }
         for &origin in &unnamed {
-            *unnamed_ns.entry(origin).or_insert(0) += weight;
+            *unnamed_amounts.entry(origin).or_insert(0) += weight;
         }
         *folded.entry(path.clone()).or_insert(0) += weight;
     }
 
     let (blocks, paths) = blocks(&functions, folded);
-    let share = |ns: u64| {
-        if time_ns == 0 {
+    let share = |amount: u64| {
+        if value == 0 {
             0.0
         } else {
-            ns as f64 / time_ns as f64
+            amount as f64 / value as f64
         }
     };
     Ok(FlameGraph {
         command: recording.manifest.target.command.clone(),
         metric: query.metric,
+        unit: query.metric.unit(),
         filter: query.filter.clone(),
         root: root.map(|root| functions.get(root).clone()),
-        samples: times.samples,
-        off_cpu_intervals: times.off_cpu_intervals,
-        time_ns,
-        graphed_ns,
-        graphed_share: share(graphed_ns),
+        samples: amounts.samples,
+        off_cpu_intervals: amounts.off_cpu_intervals,
+        value,
+        graphed,
+        graphed_share: share(graphed),
         stacks: paths.len(),
         coverage: FlameGraphCoverage {
-            named_share: (graphed_ns > 0).then(|| named_ns as f64 / graphed_ns as f64),
-            unnamed_by_origin: unnamed_ns
+            named_share: (graphed > 0).then(|| named as f64 / graphed as f64),
+            unnamed_by_origin: unnamed_amounts
                 .into_iter()
-                .map(|(origin, ns)| (origin, ns as f64 / graphed_ns as f64))
+                .map(|(origin, amount)| (origin, amount as f64 / graphed as f64))
                 .collect(),
-            no_stack_share: share(times.no_stack_ns),
+            no_stack_share: share(amounts.no_stack),
             symbols: SymbolCoverage::of(recording, symbols),
             recording: Coverage::of(recording),
         },
@@ -365,8 +369,8 @@ fn place(functions: &Functions, id: u32, tier: usize) -> Option<String> {
 
 impl FlameGraph {
     /// Writes the stacks as folded lines, as other flame graph tools read
-    /// them: the labels root first, each ended by `;`, then the time in
-    /// nanoseconds.
+    /// them: the labels root first, each ended by `;`, then the amount in
+    /// the graph's unit.
     pub fn write_folded(&self, out: &mut impl Write) -> io::Result<()> {
         for line in self.folded() {
             writeln!(out, "{line}")?;
@@ -383,18 +387,18 @@ impl FlameGraph {
         out: impl Write,
     ) -> io::Result<()> {
         let placed = svg::layout(&self.blocks, &self.paths);
-        svg::write(out, &self.blocks, &placed, title, subtitle)
+        svg::write(out, &self.blocks, &placed, self.unit, title, subtitle)
     }
 
     fn folded(&self) -> Vec<String> {
         self.paths
             .iter()
-            .map(|(path, ns)| {
+            .map(|(path, amount)| {
                 let labels: Vec<&str> = path
                     .iter()
                     .map(|&b| self.blocks[b as usize].label.as_str())
                     .collect();
-                format!("{} {ns}", labels.join(";"))
+                format!("{} {amount}", labels.join(";"))
             })
             .collect()
     }

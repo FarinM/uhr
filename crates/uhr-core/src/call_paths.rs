@@ -6,7 +6,7 @@ use serde::Serialize;
 use crate::coverage::{Coverage, SymbolCoverage};
 use crate::filter::{self, Filter};
 use crate::functions::{self, Function, Functions};
-use crate::metric::{self, Metric, stack_times};
+use crate::metric::{self, Metric, Unit, stack_amounts};
 use crate::recording::{self, Origin, Recording, Unwinding};
 use crate::symbols::Symbols;
 
@@ -42,24 +42,27 @@ pub enum Error {
 pub struct CallPaths {
     pub function: Function,
     pub metric: Metric,
+    /// What `value` and the other amounts count.
+    pub unit: Unit,
     pub filter: Filter,
     pub depth: usize,
     /// CPU samples that passed the filter, if the metric counts them.
     pub samples: u64,
     /// Off-CPU intervals that passed the filter, if the metric counts them.
     pub off_cpu_intervals: u64,
-    /// Time of the metric that passed. Shares are of this.
-    pub time_ns: u64,
-    /// Time with the function anywhere on the stack.
-    pub total_ns: u64,
+    /// The metric's amount that passed. Shares are of this.
+    pub value: u64,
+    /// The amount with the function anywhere on the stack.
+    pub total: u64,
     pub total_share: f64,
-    /// Time with the function as the leaf, or running the runtime's own
-    /// code for it. See `query`.
-    pub self_ns: u64,
+    /// The amount with the function as the leaf, or running the runtime's
+    /// own code for it. See `query`.
+    #[serde(rename = "self")]
+    pub self_: u64,
     pub self_share: f64,
-    /// Time where nothing called the function: it is where its thread
-    /// started, or the stack was cut short.
-    pub no_caller_ns: u64,
+    /// The amount where nothing called the function: it is where its
+    /// thread started, or the stack was cut short.
+    pub no_caller: u64,
     /// Its callers, each with their own callers as children.
     pub callers: Vec<Node>,
     pub callers_omitted: Omitted,
@@ -74,12 +77,13 @@ pub struct CallPaths {
 pub struct Node {
     #[serde(flatten)]
     pub function: Function,
-    /// Time of the function's stacks on the path to here.
-    pub time_ns: u64,
+    /// The amount of the function's stacks on the path to here.
+    pub value: u64,
     pub share: f64,
-    /// Among callees, time with this node as the leaf. `None` among
+    /// Among callees, the amount with this node as the leaf. `None` among
     /// callers.
-    pub self_ns: Option<u64>,
+    #[serde(rename = "self")]
+    pub self_: Option<u64>,
     pub children: Vec<Node>,
     /// Children cut by `top`, or all of them at the depth limit.
     pub omitted: Omitted,
@@ -88,20 +92,20 @@ pub struct Node {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct Omitted {
     pub nodes: usize,
-    pub time_ns: u64,
+    pub value: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct CallPathsCoverage {
-    /// Share of the function's time whose frames within the depth limit, on
-    /// both sides, all have names. Placeholders don't count. `None` without
-    /// time in the function.
+    /// Share of the function's amount whose frames within the depth limit,
+    /// on both sides, all have names. Placeholders don't count. `None`
+    /// without any in the function.
     pub named_share: Option<f64>,
-    /// Share of the function's time with an unnamed frame of each origin
+    /// Share of the function's amount with an unnamed frame of each origin
     /// within the depth limit. A path with unnamed frames of two origins
     /// counts for both.
     pub unnamed_by_origin: BTreeMap<Origin, f64>,
-    /// Share of all the time with no stack: off-CPU time whose stack was
+    /// Share of all the amount with no stack: off-CPU time whose stack was
     /// not recorded. It is on no path, so the function may have more.
     pub no_stack_share: f64,
     #[serde(flatten)]
@@ -124,19 +128,19 @@ pub fn run(
     query.metric.check(recording)?;
     let functions = Functions::new(recording, symbols);
     let target = functions.select(&query.function)?;
-    let times = stack_times(recording, &functions, &query.filter, query.metric)?;
-    let time_ns = times.total_ns();
+    let amounts = stack_amounts(recording, &functions, &query.filter, query.metric)?;
+    let value = amounts.total();
 
     // One level past the limit, to count what the limit cuts.
     let levels = query.depth.saturating_add(1);
     let mut callers = Tree::default();
     let mut callees = Tree::default();
-    let (mut total_ns, mut self_ns, mut no_caller_ns) = (0, 0, 0);
-    let mut named_ns = 0;
-    let mut unnamed_ns: BTreeMap<Origin, u64> = BTreeMap::new();
+    let (mut total, mut self_, mut no_caller) = (0, 0, 0);
+    let mut named = 0;
+    let mut unnamed_amounts: BTreeMap<Origin, u64> = BTreeMap::new();
     let mut unnamed = BTreeSet::new();
     let mut path = Vec::new();
-    for (stack, &weight) in recording.stacks.iter().zip(&times.ns) {
+    for (stack, &weight) in recording.stacks.iter().zip(&amounts.by_stack) {
         if weight == 0 {
             continue;
         }
@@ -146,12 +150,12 @@ pub fn run(
         let Some(outermost) = path.iter().rposition(|&f| f == target) else {
             continue;
         };
-        total_ns += weight;
+        total += weight;
         if functions.own(stack) == target {
-            self_ns += weight;
+            self_ += weight;
         }
         if outermost + 1 == path.len() {
-            no_caller_ns += weight;
+            no_caller += weight;
         }
         let shown = outermost.saturating_sub(query.depth)
             ..outermost
@@ -164,10 +168,10 @@ pub fn run(
             function.name.is_none().then_some(function.origin)
         }));
         if unnamed.is_empty() {
-            named_ns += weight;
+            named += weight;
         }
         for &origin in &unnamed {
-            *unnamed_ns.entry(origin).or_insert(0) += weight;
+            *unnamed_amounts.entry(origin).or_insert(0) += weight;
         }
 
         callers.add(path[outermost + 1..].iter().take(levels), weight, false);
@@ -175,11 +179,11 @@ pub fn run(
         callees.add(below.take(levels), weight, outermost <= levels);
     }
 
-    let share = |ns: u64| {
-        if time_ns == 0 {
+    let share = |amount: u64| {
+        if value == 0 {
             0.0
         } else {
-            ns as f64 / time_ns as f64
+            amount as f64 / value as f64
         }
     };
     let emit = |tree: &Tree, callees: bool| tree.emit(None, 0, query, &functions, &share, callees);
@@ -201,27 +205,28 @@ pub fn run(
     Ok(CallPaths {
         function: functions.get(target).clone(),
         metric: query.metric,
+        unit: query.metric.unit(),
         filter: query.filter.clone(),
         depth: query.depth,
-        samples: times.samples,
-        off_cpu_intervals: times.off_cpu_intervals,
-        time_ns,
-        total_ns,
-        total_share: share(total_ns),
-        self_ns,
-        self_share: share(self_ns),
-        no_caller_ns,
+        samples: amounts.samples,
+        off_cpu_intervals: amounts.off_cpu_intervals,
+        value,
+        total,
+        total_share: share(total),
+        self_,
+        self_share: share(self_),
+        no_caller,
         callers: callers_nodes,
         callers_omitted,
         callees: callees_nodes,
         callees_omitted,
         coverage: CallPathsCoverage {
-            named_share: ratio(named_ns, total_ns),
-            unnamed_by_origin: unnamed_ns
+            named_share: ratio(named, total),
+            unnamed_by_origin: unnamed_amounts
                 .into_iter()
-                .map(|(origin, ns)| (origin, ns as f64 / total_ns as f64))
+                .map(|(origin, amount)| (origin, amount as f64 / total as f64))
                 .collect(),
-            no_stack_share: share(times.no_stack_ns),
+            no_stack_share: share(amounts.no_stack),
             symbols: SymbolCoverage::of(recording, symbols),
             recording: recording_coverage,
         },
@@ -235,9 +240,9 @@ struct Tree {
 
 struct TreeNode {
     function: u32,
-    time_ns: u64,
-    /// Time of paths that end at this node.
-    end_ns: u64,
+    value: u64,
+    /// The amount of paths that end at this node.
+    ends: u64,
     children: HashMap<u32, usize>,
 }
 
@@ -246,8 +251,8 @@ impl Default for Tree {
         Self {
             nodes: vec![TreeNode {
                 function: u32::MAX,
-                time_ns: 0,
-                end_ns: 0,
+                value: 0,
+                ends: 0,
                 children: HashMap::new(),
             }],
         }
@@ -265,15 +270,15 @@ impl Tree {
             if at == next {
                 self.nodes.push(TreeNode {
                     function,
-                    time_ns: 0,
-                    end_ns: 0,
+                    value: 0,
+                    ends: 0,
                     children: HashMap::new(),
                 });
             }
-            self.nodes[at].time_ns += weight;
+            self.nodes[at].value += weight;
         }
         if ends && at != 0 {
-            self.nodes[at].end_ns += weight;
+            self.nodes[at].ends += weight;
         }
     }
 
@@ -293,7 +298,7 @@ impl Tree {
             .map(|&id| (id, &self.nodes[id]))
             .collect();
         children.sort_by(|(_, a), (_, b)| {
-            b.time_ns.cmp(&a.time_ns).then_with(|| {
+            b.value.cmp(&a.value).then_with(|| {
                 let (a, b) = (functions.get(a.function), functions.get(b.function));
                 (&a.name, &a.id).cmp(&(&b.name, &b.id))
             })
@@ -301,7 +306,7 @@ impl Tree {
         let keep = if level < query.depth { query.top } else { 0 };
         let omitted = Omitted {
             nodes: children.len().saturating_sub(keep),
-            time_ns: children.iter().skip(keep).map(|(_, n)| n.time_ns).sum(),
+            value: children.iter().skip(keep).map(|(_, n)| n.value).sum(),
         };
         let nodes = children
             .into_iter()
@@ -311,9 +316,9 @@ impl Tree {
                     self.emit(Some(id), level + 1, query, functions, share, callees);
                 Node {
                     function: functions.get(node.function).clone(),
-                    time_ns: node.time_ns,
-                    share: share(node.time_ns),
-                    self_ns: callees.then_some(node.end_ns),
+                    value: node.value,
+                    share: share(node.value),
+                    self_: callees.then_some(node.ends),
                     children,
                     omitted,
                 }

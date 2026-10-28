@@ -126,7 +126,7 @@ fn tells_computing_from_waiting_and_why() {
         .iter()
         .map(|t| number(&t["alive_ns"]))
         .sum();
-    let accounted = number(&wall["time_ns"]) / alive;
+    let accounted = number(&wall["value"]) / alive;
     assert!((0.85..=1.05).contains(&accounted), "{accounted}");
 
     if !signals.contains(&"off_cpu_stacks".into()) {
@@ -141,7 +141,7 @@ fn tells_computing_from_waiting_and_why() {
 
     // The lock is held for as long as holder lives.
     let locked = off_cpu(&recording, &["--under", "wait_for_lock"]);
-    let held = number(&locked["time_ns"]) / number(&holder["alive_ns"]);
+    let held = number(&locked["value"]) / number(&holder["alive_ns"]);
     assert!((0.9..=1.05).contains(&held), "{held}");
 
     if manifest["kernel_symbols"]["status"] != "saved" {
@@ -162,7 +162,7 @@ fn tells_computing_from_waiting_and_why() {
     let futex = find(&paths["callees"], "futex_wait_queue").expect("the lock waits in a futex");
     assert_eq!(futex["origin"], "kernel");
     assert!(
-        number(&futex["time_ns"]) > 0.95 * number(&paths["total_ns"]),
+        number(&futex["value"]) > 0.95 * number(&paths["total"]),
         "{futex}"
     );
 
@@ -192,7 +192,7 @@ fn tells_computing_from_waiting_and_why() {
         &recording,
         &["--under", "wait_for_lock", "--syscall", "futex"],
     );
-    let share = number(&in_futex["time_ns"]) / number(&locked["time_ns"]);
+    let share = number(&in_futex["value"]) / number(&locked["value"]);
     assert!(share > 0.95, "{share} of the lock wait is in futex");
 }
 

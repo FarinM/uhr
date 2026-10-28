@@ -4,7 +4,7 @@ use crate::filter::{self, Filter};
 use crate::functions::Functions;
 use crate::recording::{Mode, Recording, Signal};
 
-/// The time results weigh stacks by.
+/// What results weigh stacks by.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum Metric {
     /// CPU time, from CPU samples.
@@ -18,6 +18,14 @@ pub enum Metric {
     Wall,
 }
 
+/// What a metric's amounts count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Unit {
+    /// Nanoseconds.
+    Ns,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error(
@@ -28,6 +36,12 @@ pub enum Error {
 }
 
 impl Metric {
+    pub fn unit(self) -> Unit {
+        match self {
+            Metric::OnCPU | Metric::OffCPU | Metric::Wall => Unit::Ns,
+        }
+    }
+
     /// Fails if the recording lacks what the metric is made of.
     pub(crate) fn check(self, recording: &Recording) -> Result<(), Error> {
         let switches = recording
@@ -42,55 +56,55 @@ impl Metric {
     }
 }
 
-/// The time of what passed a filter, by stack.
-pub(crate) struct StackTimes {
+/// The metric's amount of what passed a filter, by stack.
+pub(crate) struct StackAmounts {
     /// By stack id.
-    pub ns: Vec<u64>,
-    /// Of `ns`, the time of CPU samples taken in user mode.
-    pub user_ns: Vec<u64>,
+    pub by_stack: Vec<u64>,
+    /// Of `by_stack`, the amount of samples taken in user mode.
+    pub user: Vec<u64>,
     /// Off-CPU time whose stack was not recorded.
-    pub no_stack_ns: u64,
+    pub no_stack: u64,
     pub samples: u64,
     pub off_cpu_intervals: u64,
 }
 
-impl StackTimes {
-    pub fn total_ns(&self) -> u64 {
-        self.ns.iter().sum::<u64>() + self.no_stack_ns
+impl StackAmounts {
+    pub fn total(&self) -> u64 {
+        self.by_stack.iter().sum::<u64>() + self.no_stack
     }
 }
 
 /// Fails if the filter does.
-pub(crate) fn stack_times(
+pub(crate) fn stack_amounts(
     recording: &Recording,
     functions: &Functions,
     filter: &Filter,
     metric: Metric,
-) -> Result<StackTimes, filter::Error> {
-    let mut times = StackTimes {
-        ns: vec![0; recording.stacks.len()],
-        user_ns: vec![0; recording.stacks.len()],
-        no_stack_ns: 0,
+) -> Result<StackAmounts, filter::Error> {
+    let mut amounts = StackAmounts {
+        by_stack: vec![0; recording.stacks.len()],
+        user: vec![0; recording.stacks.len()],
+        no_stack: 0,
         samples: 0,
         off_cpu_intervals: 0,
     };
     if metric != Metric::OffCPU {
         for sample in filter.samples(recording, functions)? {
-            times.ns[sample.stack as usize] += sample.cpu_ns;
+            amounts.by_stack[sample.stack as usize] += sample.cpu_ns;
             if sample.mode == Mode::User {
-                times.user_ns[sample.stack as usize] += sample.cpu_ns;
+                amounts.user[sample.stack as usize] += sample.cpu_ns;
             }
-            times.samples += 1;
+            amounts.samples += 1;
         }
     }
     if metric != Metric::OnCPU {
         for (interval, ns) in filter.off_cpu(recording, functions)? {
             match interval.stack {
-                Some(stack) => times.ns[stack as usize] += ns,
-                None => times.no_stack_ns += ns,
+                Some(stack) => amounts.by_stack[stack as usize] += ns,
+                None => amounts.no_stack += ns,
             }
-            times.off_cpu_intervals += 1;
+            amounts.off_cpu_intervals += 1;
         }
     }
-    Ok(times)
+    Ok(amounts)
 }

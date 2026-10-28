@@ -430,7 +430,7 @@ fn names_the_python_functions_that_wait() {
     ]);
     let rows = result["rows"].as_array().unwrap();
     let sleeping = rows.iter().find(|r| r["function"] == "sleeping");
-    let waited = sleeping.map_or(0, |r| r["total_ns"].as_u64().unwrap());
+    let waited = sleeping.map_or(0, |r| r["total"].as_u64().unwrap());
     assert!(waited > 700_000_000, "{result}");
 }
 

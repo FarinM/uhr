@@ -90,9 +90,9 @@ fn cpu_ns(recording: &Recording, filter: Filter) -> u64 {
     let Rows::Functions(rows) = &result.rows else {
         panic!("rows of another grouping: {:?}", result.rows)
     };
-    let self_ns: u64 = rows.iter().map(|r| r.self_ns).sum();
-    assert_eq!(self_ns, result.time_ns);
-    result.time_ns
+    let self_ns: u64 = rows.iter().map(|r| r.self_).sum();
+    assert_eq!(self_ns, result.value);
+    result.value
 }
 
 #[test]

@@ -135,7 +135,7 @@ fn the_time_is_in_the_kernel_on_behalf_of_read_zero() {
             .as_array()
             .unwrap()
             .iter()
-            .all(|r| r["origin"] == "kernel" || r["self_ns"] == 0),
+            .all(|r| r["origin"] == "kernel" || r["self"] == 0),
         "only kernel code runs in kernel mode"
     );
 
@@ -277,7 +277,7 @@ fn tells_its_own_programs_apart() {
     let ebpf = streams.iter().find(|s| s["id"] == "ebpf").unwrap();
     let overhead = ebpf["coverage"]["overhead_ns"].as_f64().unwrap();
     let share = result["coverage"]["own_programs_share"].as_f64().unwrap();
-    let time_ns = result["time_ns"].as_f64().unwrap();
+    let time_ns = result["value"].as_f64().unwrap();
     assert!(overhead > 0.0, "{ebpf}");
     assert!(
         (share * time_ns - overhead).abs() < 1.0,

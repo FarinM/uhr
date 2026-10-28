@@ -173,7 +173,7 @@ fn folded(graph: &FlameGraph) -> Vec<String> {
 #[test]
 fn folds_each_stack_from_where_its_thread_started() {
     let graph = graph(None);
-    assert_eq!((graph.time_ns, graph.graphed_ns, graph.stacks), (15, 15, 7));
+    assert_eq!((graph.value, graph.graphed, graph.stacks), (15, 15, 7));
     assert_eq!(
         folded(&graph),
         [
@@ -194,7 +194,7 @@ fn starts_at_the_outermost_call_of_a_function() {
     let graph = graph(Some("spin"));
     let root = graph.root.as_ref().unwrap();
     assert_eq!(root.name.as_deref(), Some("spin"));
-    assert_eq!((graph.graphed_ns, graph.graphed_share), (8, 8.0 / 15.0));
+    assert_eq!((graph.graphed, graph.graphed_share), (8, 8.0 / 15.0));
     assert_eq!(
         folded(&graph),
         ["spin 6", "spin;[kernel] 1", "spin;rec;spin 1"]

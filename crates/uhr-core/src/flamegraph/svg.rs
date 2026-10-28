@@ -7,6 +7,7 @@ use std::io::{self, Write};
 
 use super::{Block, Kind};
 use crate::functions::fnv1a;
+use crate::metric::Unit;
 
 /// Pixels: the image's width, its margin, a block's height and the gap
 /// between blocks, and where the blocks start below the titles.
@@ -31,14 +32,14 @@ const SCRIPT: &str = include_str!("flamegraph.js");
 
 /// A block where it goes: its function's block, `None` for the one under
 /// all others, the block it is on, by its index among the placed, how far
-/// up, and its start and width in nanoseconds.
+/// up, and its start and width in the graph's unit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Placed {
     pub(super) block: Option<u32>,
     pub(super) parent: Option<usize>,
     pub(super) depth: u32,
     pub(super) start: u64,
-    pub(super) ns: u64,
+    pub(super) width: u64,
 }
 
 /// Lays out the stacks, root first, each child after the ones before it
@@ -46,25 +47,25 @@ pub(super) struct Placed {
 pub(super) fn layout(blocks: &[Block], paths: &[(Vec<u32>, u64)]) -> Vec<Placed> {
     struct Node {
         block: Option<u32>,
-        ns: u64,
+        amount: u64,
         children: Vec<usize>,
     }
     let mut nodes = vec![Node {
         block: None,
-        ns: 0,
+        amount: 0,
         children: Vec::new(),
     }];
     let mut child: HashMap<(usize, u32), usize> = HashMap::new();
-    for (path, ns) in paths {
+    for (path, amount) in paths {
         let mut at = 0;
-        nodes[0].ns += ns;
+        nodes[0].amount += amount;
         for &block in path {
             at = match child.get(&(at, block)) {
                 Some(&next) => next,
                 None => {
                     nodes.push(Node {
                         block: Some(block),
-                        ns: 0,
+                        amount: 0,
                         children: Vec::new(),
                     });
                     let next = nodes.len() - 1;
@@ -73,10 +74,10 @@ pub(super) fn layout(blocks: &[Block], paths: &[(Vec<u32>, u64)]) -> Vec<Placed>
                     next
                 }
             };
-            nodes[at].ns += ns;
+            nodes[at].amount += amount;
         }
     }
-    let total = nodes[0].ns;
+    let total = nodes[0].amount;
     let narrowest = (total as f64 * MIN_WIDTH / (IMAGE_WIDTH - 2.0 * MARGIN)) as u64;
     let label = |node: &Node| node.block.map(|b| blocks[b as usize].label.as_str());
     // Each block after the one it is on.
@@ -84,7 +85,7 @@ pub(super) fn layout(blocks: &[Block], paths: &[(Vec<u32>, u64)]) -> Vec<Placed>
     let mut pending = vec![(0, None, 0, 0)];
     while let Some((at, parent, depth, start)) = pending.pop() {
         let node = &nodes[at];
-        if node.ns < narrowest.max(1) {
+        if node.amount < narrowest.max(1) {
             continue;
         }
         placed.push(Placed {
@@ -92,7 +93,7 @@ pub(super) fn layout(blocks: &[Block], paths: &[(Vec<u32>, u64)]) -> Vec<Placed>
             parent,
             depth,
             start,
-            ns: node.ns,
+            width: node.amount,
         });
         let index = Some(placed.len() - 1);
         let mut children = node.children.clone();
@@ -100,25 +101,27 @@ pub(super) fn layout(blocks: &[Block], paths: &[(Vec<u32>, u64)]) -> Vec<Placed>
         let mut x = start;
         for child in children {
             pending.push((child, index, depth + 1, x));
-            x += nodes[child].ns;
+            x += nodes[child].amount;
         }
     }
     placed
 }
 
-/// Writes the SVG of the placed blocks. `title` goes on top, then
-/// `subtitle`, and pointing at a block shows its time below.
+/// Writes the SVG of the placed blocks, whose widths count `unit`. `title`
+/// goes on top, then `subtitle`, and pointing at a block shows its amount
+/// below.
 pub(super) fn write(
     mut out: impl Write,
     blocks: &[Block],
     placed: &[Placed],
+    unit: Unit,
     title: &str,
     subtitle: Option<&str>,
 ) -> io::Result<()> {
     let total = placed
         .iter()
         .find(|p| p.block.is_none())
-        .map_or(0, |p| p.ns);
+        .map_or(0, |p| p.width);
     let depth = placed.iter().map(|p| p.depth).max().unwrap_or(0);
     let height = TOP + f64::from(depth + 1) * HEIGHT + BOTTOM;
     let width = IMAGE_WIDTH - 2.0 * MARGIN;
@@ -176,7 +179,7 @@ const CHAR_WIDTH = {CHAR_WIDTH};
             None => ("all", (200, 200, 205)),
         };
         let x = MARGIN + placed.start as f64 * scale;
-        let w = placed.ns as f64 * scale;
+        let w = placed.width as f64 * scale;
         let y = TOP + f64::from(depth - placed.depth) * HEIGHT;
         let name = escape(name);
         // The block under all others is no function's, and is on none.
@@ -188,9 +191,9 @@ const CHAR_WIDTH = {CHAR_WIDTH};
             line,
             r#"<g data-x="{}" data-w="{}"{parent} data-name="{name}"><title>{name}: {}, {:.2}%</title><rect x="{x:.2}" y="{y}" width="{:.2}" height="{}" rx="2" fill="rgb({}, {}, {})"/><text x="{:.2}" y="{:.1}">{}</text></g>"#,
             placed.start,
-            placed.ns,
-            duration(placed.ns),
-            100.0 * placed.ns as f64 / total.max(1) as f64,
+            placed.width,
+            amount(placed.width, unit),
+            100.0 * placed.width as f64 / total.max(1) as f64,
             (w - GAP).max(0.0),
             HEIGHT - GAP,
             fill.0,
@@ -220,13 +223,13 @@ fn fit(name: &str, width: f64) -> String {
 }
 
 /// A time as a person reads it, as in `1.25 s`, `12.50 ms` or `125 µs`.
-fn duration(ns: u64) -> String {
-    let at = ns as f64;
-    match ns {
-        1_000_000_000.. => format!("{:.2} s", at / 1e9),
-        1_000_000.. => format!("{:.2} ms", at / 1e6),
-        1_000.. => format!("{:.0} µs", at / 1e3),
-        _ => format!("{ns} ns"),
+fn amount(value: u64, unit: Unit) -> String {
+    let at = value as f64;
+    match (unit, value) {
+        (Unit::Ns, 1_000_000_000..) => format!("{:.2} s", at / 1e9),
+        (Unit::Ns, 1_000_000..) => format!("{:.2} ms", at / 1e6),
+        (Unit::Ns, 1_000..) => format!("{:.0} µs", at / 1e3),
+        (Unit::Ns, _) => format!("{value} ns"),
     }
 }
 
@@ -288,10 +291,10 @@ mod tests {
 
     #[test]
     fn says_times_in_their_unit() {
-        assert_eq!(duration(1_250_000_000), "1.25 s");
-        assert_eq!(duration(12_500_000), "12.50 ms");
-        assert_eq!(duration(125_000), "125 µs");
-        assert_eq!(duration(125), "125 ns");
+        assert_eq!(amount(1_250_000_000, Unit::Ns), "1.25 s");
+        assert_eq!(amount(12_500_000, Unit::Ns), "12.50 ms");
+        assert_eq!(amount(125_000, Unit::Ns), "125 µs");
+        assert_eq!(amount(125, Unit::Ns), "125 ns");
     }
 
     #[test]
@@ -315,7 +318,7 @@ mod tests {
         }
         let mut placed: Vec<_> = placed
             .into_iter()
-            .map(|p| (p.depth, p.start, p.ns, p.block))
+            .map(|p| (p.depth, p.start, p.width, p.block))
             .collect();
         placed.sort();
         assert_eq!(

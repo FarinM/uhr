@@ -78,7 +78,7 @@ fn folds_the_stacks_from_a_function() {
         assert!(line.starts_with("main"), "{line}");
         total += line.rsplit_once(' ').unwrap().1.parse::<u64>().unwrap();
     }
-    assert_eq!(total, graph["graphed_ns"].as_u64().unwrap());
+    assert_eq!(total, graph["graphed"].as_u64().unwrap());
     let share = a as f64 / (a + b) as f64;
     assert!((0.7..0.8).contains(&share), "from_a has {share}");
 }
