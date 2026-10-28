@@ -30,21 +30,23 @@ pub fn uhr_as_root(args: &[&str], recording: &Path) -> Option<()> {
 
 /// Runs `command` as root, as `uhr_as_root` runs uhr.
 pub fn as_root(command: &[&str], recording: &Path) -> Option<()> {
-    let sudo = |args: &[&str]| {
-        Command::new("sudo")
-            .arg("-n")
-            .args(args)
-            .output()
-            .is_ok_and(|output| output.status.success())
-    };
-    if !sudo(&["true"]) {
+    let sudo = |args: &[&str]| Command::new("sudo").arg("-n").args(args).output().unwrap();
+    if !sudo(&["true"]).status.success() {
         return None;
     }
-    assert!(sudo(command), "sudo {command:?} failed");
+    let ran = sudo(command);
+    // The directory it is in too, whatever happened, as a recording that did
+    // not finish leaves files beside it that a later run could not remove.
     let owner = format!("{}:{}", unsafe { libc::getuid() }, unsafe {
         libc::getgid()
     });
-    assert!(sudo(&["chown", "-R", &owner, recording.to_str().unwrap()]));
+    let dir = recording.parent().unwrap().to_str().unwrap();
+    assert!(sudo(&["chown", "-R", &owner, dir]).status.success());
+    assert!(
+        ran.status.success(),
+        "sudo {command:?} failed:\n{}",
+        String::from_utf8_lossy(&ran.stderr)
+    );
     Some(())
 }
 
