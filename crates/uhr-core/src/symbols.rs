@@ -1114,6 +1114,7 @@ mod tests {
             interpreted_code: Vec::new(),
             syscall_calls: Vec::new(),
             memory: Vec::new(),
+            regions: Vec::new(),
         }
     }
 

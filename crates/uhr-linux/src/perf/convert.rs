@@ -24,9 +24,10 @@ use crate::interpreters::{Interpreters, Program};
 use crate::kallsyms::{self, Kallsyms};
 use uhr_core::recording::{
     Clock, Collector, Exit, FORMAT_VERSION, FaultSample, FaultSampling, Frame, Interpreted,
-    InterpretedCode, InterpreterCoverage, KERNEL, KernelSymbols, Manifest, Mapping, MissingSignal,
-    Mode, OffCPUInterval, Origin, Platform, Recording, Sample, Sampling, Signal, StackCoverage,
-    Stream, StreamCoverage, Target, Thread, ThreadName, ThreadState, Unwinding,
+    InterpretedCode, InterpreterCoverage, KERNEL, KernelSymbols, Manifest, Mapping, MemoryRegion,
+    MissingSignal, Mode, OffCPUInterval, Origin, Platform, Recording, RegionKind, Sample, Sampling,
+    Signal, StackCoverage, Stream, StreamCoverage, Target, Thread, ThreadName, ThreadState,
+    Unwinding,
 };
 use uhr_core::runtimes::{Frames, Interpreter, WalkedFrame};
 use uhr_ebpf::{MAX_FRAMES, SampleHeader, UserRegisters, event, mode, walk};
@@ -198,6 +199,11 @@ pub(super) fn convert(input: Input) -> Result<(Recording, Option<EbpfStacks>)> {
         switch_stacks_excluded = attr.flags.contains(AttrFlags::EXCLUDE_KERNEL);
     }
 
+    // perf records the regions of memory that map no code too.
+    let regions_recorded = all
+        .iter()
+        .any(|a| a.attributes().flags.contains(AttrFlags::MMAP_DATA));
+
     let ours: HashSet<u64> = all
         .iter()
         .flat_map(|a| a.event_ids.iter().copied())
@@ -285,6 +291,7 @@ pub(super) fn convert(input: Input) -> Result<(Recording, Option<EbpfStacks>)> {
                 executable: m.is_executable,
                 path: lossy(&m.path.as_slice()),
                 build_id: None,
+                permissions: None,
                 time,
             })?,
             EventRecord::Mmap2(m) => state.mmap(Mmap {
@@ -299,6 +306,7 @@ pub(super) fn convert(input: Input) -> Result<(Recording, Option<EbpfStacks>)> {
                     Mmap2FileId::BuildId(id) => Some(hex(&id)),
                     Mmap2FileId::InodeAndVersion(_) => None,
                 },
+                permissions: Some(permissions(m.protection, m.flags)),
                 time,
             })?,
             EventRecord::Comm(c) => state.comm(
@@ -367,6 +375,9 @@ pub(super) fn convert(input: Input) -> Result<(Recording, Option<EbpfStacks>)> {
     if faults.is_some() {
         signals.push(Signal::PageFaults);
     }
+    if regions_recorded {
+        signals.push(Signal::MemoryRegions);
+    }
     if switches.is_some() {
         signals.push(Signal::OffCPUTime);
         if switch_stacks_excluded {
@@ -386,6 +397,13 @@ pub(super) fn convert(input: Input) -> Result<(Recording, Option<EbpfStacks>)> {
     let mut known_biases = Vec::new();
     if sampled {
         known_biases.push(TIMER_BIAS);
+    }
+    if regions_recorded {
+        known_biases.push(
+            "The regions of memory come from the kernel's reports of mapping it, which leave out \
+             a region moved or grown with mremap, as realloc does with large blocks, so a page \
+             fault there is in no region.",
+        );
     }
     if faults.is_some() {
         known_biases.push(FAULTS_BIAS);
@@ -494,6 +512,7 @@ pub(super) fn convert(input: Input) -> Result<(Recording, Option<EbpfStacks>)> {
         interpreted_code: state.interpreted_code,
         syscall_calls: Vec::new(),
         memory: Vec::new(),
+        regions: state.regions,
     };
     Ok((recording, ebpf_stacks))
 }
@@ -861,7 +880,76 @@ struct Mmap {
     executable: bool,
     path: String,
     build_id: Option<String>,
+    /// As `maps` lists them, as in `r-xp`, from an MMAP2 record.
+    permissions: Option<String>,
     time: Option<u64>,
+}
+
+const PROT_READ: u32 = 0x1;
+const PROT_WRITE: u32 = 0x2;
+const MAP_SHARED: u32 = 0x1;
+
+/// Permissions as `maps` lists them, as in `r-xp`.
+fn permissions(protection: u32, flags: u32) -> String {
+    let bit = |set: bool, c| if set { c } else { '-' };
+    [
+        bit(protection & PROT_READ != 0, 'r'),
+        bit(protection & PROT_WRITE != 0, 'w'),
+        bit(protection & PROT_EXEC != 0, 'x'),
+        if flags & MAP_SHARED != 0 { 's' } else { 'p' },
+    ]
+    .into_iter()
+    .collect()
+}
+
+/// What a region of memory is, from the permissions and name it was mapped
+/// with. The kernel names memory that maps no file `//anon` in its
+/// records, and shared memory as a deleted file.
+fn region_kind(permissions: &str, path: &str) -> RegionKind {
+    let shared = permissions.ends_with('s');
+    let code = permissions.as_bytes().get(2) == Some(&b'x');
+    match path {
+        "[heap]" => RegionKind::Heap,
+        "[stack]" => RegionKind::Stack,
+        "//anon" if shared => RegionKind::Shared,
+        "//anon" if code => RegionKind::AnonymousCode,
+        "//anon" => RegionKind::Anonymous,
+        _ if path.starts_with("[anon_shmem:") => RegionKind::Shared,
+        _ if path.starts_with("[anon:") && code => RegionKind::AnonymousCode,
+        _ if path.starts_with("[anon:") => RegionKind::Anonymous,
+        // The kernel's own, as [vdso], [vvar] and [vsyscall].
+        _ if path.starts_with('[') => RegionKind::Kernel,
+        // Memory in huge pages that maps no file, as MAP_HUGETLB gives.
+        _ if path.starts_with("/anon_hugepage") => region_kind(permissions, "//anon"),
+        _ if shared
+            && ["/dev/zero", "/SYSV", "/memfd:", "/dev/shm/"]
+                .iter()
+                .any(|prefix| path.starts_with(prefix)) =>
+        {
+            RegionKind::Shared
+        }
+        _ if code => RegionKind::Code,
+        _ => RegionKind::File,
+    }
+}
+
+/// The rows of the regions in a process's `space` that hold any of
+/// `start..end`.
+fn overlapping(
+    space: &BTreeMap<u64, usize>,
+    regions: &[MemoryRegion],
+    start: u64,
+    end: u64,
+) -> Vec<usize> {
+    let before = space
+        .range(..start)
+        .next_back()
+        .map(|(_, &row)| row)
+        .filter(|&row| regions[row].end > start);
+    before
+        .into_iter()
+        .chain(space.range(start..end).map(|(_, &row)| row))
+        .collect()
 }
 
 #[derive(Clone, Copy)]
@@ -896,6 +984,9 @@ struct State {
     stack_ids: HashMap<Vec<u32>, u32>,
     samples: Vec<Sample>,
     page_faults: Vec<FaultSample>,
+    regions: Vec<MemoryRegion>,
+    /// Each process's regions as mapped now, which don't overlap, by start.
+    spaces: HashMap<u32, BTreeMap<u64, usize>>,
     /// The stack perf took of a thread about to go off CPU, until its
     /// switch record comes.
     switch_stacks: HashMap<(u32, u32), u32>,
@@ -979,6 +1070,8 @@ impl State {
             switch_stacks: HashMap::new(),
             switched_out: HashMap::new(),
             page_faults: Vec::new(),
+            regions: Vec::new(),
+            spaces: HashMap::new(),
             off_cpu: Vec::new(),
             attached_ns: None,
             first_on_cpu: HashMap::new(),
@@ -1020,6 +1113,7 @@ impl State {
     fn comm(&mut self, pid: u32, tid: u32, name: String, exec: bool, time: Option<u64>) {
         if exec {
             self.processes.insert(pid, Vec::new());
+            self.exec_regions(pid, time);
             // Another thread's exec takes the ids of the main thread, whose
             // exit came first, and goes on as a new one.
             let ended = self
@@ -1045,6 +1139,7 @@ impl State {
         if let Some((ppid, _)) = parent.filter(|&(ppid, _)| ppid != pid) {
             let inherited = self.processes.get(&ppid).cloned();
             self.processes.insert(pid, inherited.unwrap_or_default());
+            self.fork_regions(pid, ppid, time);
         }
         // A thread id seen before means the kernel reused it.
         if let Some(earlier) = self.threads.remove(&(pid, tid)) {
@@ -1079,9 +1174,17 @@ impl State {
     }
 
     fn mmap(&mut self, m: Mmap) -> Result<()> {
+        if m.len == 0 {
+            return Ok(());
+        }
+        if !m.kernel
+            && let Some(permissions) = &m.permissions
+        {
+            self.region(id(m.pid)?, &m, permissions);
+        }
         // perf's own records for the kernel and its modules carry no
         // protection bits.
-        if m.len == 0 || !(m.kernel || m.executable) {
+        if !(m.kernel || m.executable) {
             return Ok(());
         }
         let pid = if m.kernel { None } else { Some(id(m.pid)?) };
@@ -1121,6 +1224,152 @@ impl State {
             Some(pid) => self.processes.entry(pid).or_default().push(mapping_id),
         }
         Ok(())
+    }
+
+    /// A region a process mapped. Each process's regions are kept as the
+    /// kernel reports them: one that grows in place is reported again, and
+    /// stays one, and what a region maps over was unmapped by then, so the
+    /// regions there end.
+    fn region(&mut self, pid: u32, m: &Mmap, permissions: &str) {
+        let (start, end) = (m.start, m.start.saturating_add(m.len));
+        // The kernel names memory that maps no file `//anon` here.
+        let path = (m.path != "//anon").then(|| m.path.clone());
+        if self.grow(pid, m, permissions, path.as_deref()) {
+            return;
+        }
+        self.unmap(pid, start, end, m.time, None);
+        let row = self.regions.len();
+        self.regions.push(MemoryRegion {
+            pid,
+            start,
+            end,
+            permissions: permissions.to_owned(),
+            file_offset: m.file_offset,
+            kind: region_kind(permissions, &m.path),
+            path,
+            time_ns: m.time,
+            unmapped_ns: None,
+        });
+        self.spaces.entry(pid).or_default().insert(start, row);
+    }
+
+    /// Grows the region of `pid` that the mapping `m` extends: up, as a
+    /// heap or an arena grows, or down, as a stack does. Returns whether one
+    /// grew. The kernel reports a heap's first `brk` unnamed, as it names
+    /// the heap only once it has grown, so a heap that grows from there
+    /// names it.
+    fn grow(&mut self, pid: u32, m: &Mmap, permissions: &str, path: Option<&str>) -> bool {
+        let (start, end, file_offset) = (m.start, m.start.saturating_add(m.len), m.file_offset);
+        let Some(space) = self.spaces.get(&pid) else {
+            return false;
+        };
+        let up = space.get(&start).copied();
+        let down = space
+            .range(..end)
+            .next_back()
+            .map(|(_, &row)| row)
+            .filter(|&row| self.regions[row].end == end && start < self.regions[row].start);
+        // A file's region grows only up, from where in the file it starts.
+        let anonymous = path.is_none_or(|path| path.starts_with('['));
+        let grows = |row: usize, up: bool| {
+            let region = &self.regions[row];
+            let named = region.path.as_deref() == path
+                || up && region.path.is_none() && path == Some("[heap]");
+            region.permissions == permissions
+                && named
+                && (anonymous || up && region.file_offset == file_offset)
+        };
+        let (row, extension) = match (up, down) {
+            (Some(row), _) if grows(row, true) && self.regions[row].end <= end => {
+                (row, self.regions[row].end..end)
+            }
+            (_, Some(row)) if grows(row, false) => (row, start..self.regions[row].start),
+            _ => return false,
+        };
+        // It keeps when it was mapped, so it grows only where nothing was
+        // mapped since: every address mapped is in a region until another
+        // maps over it, so where none is, none was. Or over memory that
+        // could not be touched, which a thread's arena grows over as it
+        // makes its reserved memory usable.
+        let over = overlapping(space, &self.regions, extension.start, extension.end);
+        if over
+            .into_iter()
+            .any(|row| !self.regions[row].permissions.starts_with("---"))
+        {
+            return false;
+        }
+        if !extension.is_empty() {
+            self.unmap(pid, extension.start, extension.end, m.time, Some(row));
+        }
+        let region = &mut self.regions[row];
+        if path == Some("[heap]") && region.path.is_none() {
+            region.path = Some("[heap]".into());
+            region.kind = RegionKind::Heap;
+        }
+        if start < region.start {
+            let space = self.spaces.entry(pid).or_default();
+            space.remove(&region.start);
+            space.insert(start, row);
+            region.file_offset = file_offset;
+            region.start = start;
+        }
+        region.end = region.end.max(end);
+        true
+    }
+
+    /// Ends the regions of `pid` in `start..end` at `time`, but `except`,
+    /// as a region mapped there took their place. The parts of them outside
+    /// it are still mapped, and become regions of their own.
+    fn unmap(&mut self, pid: u32, start: u64, end: u64, time: Option<u64>, except: Option<usize>) {
+        let Some(space) = self.spaces.get_mut(&pid) else {
+            return;
+        };
+        let over = overlapping(space, &self.regions, start, end);
+        for row in over.into_iter().filter(|&row| Some(row) != except) {
+            let region = self.regions[row].clone();
+            space.remove(&region.start);
+            let piece = |from: u64, to: u64| MemoryRegion {
+                start: from,
+                end: to,
+                file_offset: region.file_offset + (from - region.start),
+                ..region.clone()
+            };
+            for (from, to) in [(region.start, start), (end, region.end)] {
+                if from < to {
+                    space.insert(from, self.regions.len());
+                    self.regions.push(piece(from, to));
+                }
+            }
+            let (from, to) = (region.start.max(start), region.end.min(end));
+            self.regions[row] = MemoryRegion {
+                unmapped_ns: Some(time.unwrap_or(0)),
+                ..piece(from, to)
+            };
+        }
+    }
+
+    /// A process's exec gave it new memory, so its regions end.
+    fn exec_regions(&mut self, pid: u32, time: Option<u64>) {
+        for (_, row) in self.spaces.remove(&pid).unwrap_or_default() {
+            self.regions[row].unmapped_ns = Some(time.unwrap_or(0));
+        }
+    }
+
+    /// A forked process starts with its parent's memory, so with copies of
+    /// its regions.
+    fn fork_regions(&mut self, pid: u32, parent: u32, time: Option<u64>) {
+        let Some(regions) = self.spaces.get(&parent).cloned() else {
+            return;
+        };
+        let space = self.spaces.entry(pid).or_default();
+        for (start, row) in regions {
+            space.insert(start, self.regions.len());
+            self.regions.push(MemoryRegion {
+                pid,
+                time_ns: time,
+                ..self.regions[row].clone()
+            });
+        }
     }
 
     fn sample(&mut self, record: &RawEventRecord, sample: &SampleRecord) -> Result<()> {
@@ -1957,8 +2206,201 @@ mod tests {
             executable,
             path: path.into(),
             build_id: None,
+            permissions: None,
             time: None,
         }
+    }
+
+    #[test]
+    fn writes_permissions_as_maps_lists_them() {
+        assert_eq!(permissions(PROT_READ | PROT_EXEC, 0x2), "r-xp");
+        assert_eq!(permissions(PROT_READ | PROT_WRITE, MAP_SHARED), "rw-s");
+    }
+
+    #[test]
+    fn tells_what_each_region_is_from_how_it_was_mapped() {
+        let cases = [
+            ("rw-p", "[heap]", RegionKind::Heap),
+            ("rw-p", "[stack]", RegionKind::Stack),
+            ("rw-p", "//anon", RegionKind::Anonymous),
+            ("rwxp", "//anon", RegionKind::AnonymousCode),
+            ("rw-s", "/dev/zero (deleted)", RegionKind::Shared),
+            ("rw-s", "/memfd:wayland (deleted)", RegionKind::Shared),
+            ("rw-p", "/anon_hugepage (deleted)", RegionKind::Anonymous),
+            ("rw-s", "/anon_hugepage (deleted)", RegionKind::Shared),
+            ("rw-s", "/data/table.db", RegionKind::File),
+            ("r-xp", "/usr/lib/libc.so.6", RegionKind::Code),
+            ("r--p", "/usr/lib/libc.so.6", RegionKind::File),
+            ("r-xp", "[vdso]", RegionKind::Kernel),
+        ];
+        for (permissions, path, expected) in cases {
+            assert_eq!(
+                region_kind(permissions, path),
+                expected,
+                "{permissions} {path}"
+            );
+        }
+    }
+
+    /// A mapping by process `pid` of `start..end`, with these permissions,
+    /// at `time`.
+    fn mapped(
+        pid: i32,
+        (start, end): (u64, u64),
+        path: &str,
+        permissions: &str,
+        time: u64,
+    ) -> Mmap {
+        Mmap {
+            len: end - start,
+            file_offset: start,
+            permissions: Some(permissions.into()),
+            time: Some(time),
+            ..mmap(pid, start, path, false, permissions.contains('x'))
+        }
+    }
+
+    /// A region's pid, start, end and kind, and when it was mapped and
+    /// unmapped.
+    type Region = (u32, u64, u64, RegionKind, Option<u64>, Option<u64>);
+
+    fn regions(state: &State) -> Vec<Region> {
+        state
+            .regions
+            .iter()
+            .map(|r| (r.pid, r.start, r.end, r.kind, r.time_ns, r.unmapped_ns))
+            .collect()
+    }
+
+    #[test]
+    fn keeps_a_region_that_grows_in_place_as_one() {
+        let mut state = State::new(127);
+        // The kernel reports a heap's first brk unnamed.
+        for (end, path, time) in [(0x6000, "//anon", 10), (0x8000, "[heap]", 20)] {
+            state
+                .mmap(mapped(1, (0x5000, end), path, "rw-p", time))
+                .unwrap();
+        }
+        // A stack grows down.
+        for (start, time) in [(0xf000, 30), (0xd000, 40)] {
+            state
+                .mmap(mapped(1, (start, 0x10000), "[stack]", "rw-p", time))
+                .unwrap();
+        }
+        assert_eq!(
+            regions(&state),
+            [
+                (1, 0x5000, 0x8000, RegionKind::Heap, Some(10), None),
+                (1, 0xd000, 0x10000, RegionKind::Stack, Some(30), None),
+            ]
+        );
+        // Neither maps code.
+        assert!(state.mappings.is_empty());
+    }
+
+    #[test]
+    fn grows_no_region_over_one_below_it() {
+        let mut state = State::new(127);
+        state
+            .mmap(mapped(1, (0x1000, 0x3000), "//anon", "rw-p", 10))
+            .unwrap();
+        state
+            .mmap(mapped(1, (0x4000, 0x5000), "[stack]", "rw-p", 20))
+            .unwrap();
+        state
+            .mmap(mapped(1, (0x2000, 0x5000), "[stack]", "rw-p", 30))
+            .unwrap();
+        let mut current: Vec<_> = regions(&state)
+            .into_iter()
+            .filter(|&(_, _, _, _, _, unmapped)| unmapped.is_none())
+            .collect();
+        current.sort();
+        assert_eq!(
+            current,
+            [
+                (1, 0x1000, 0x2000, RegionKind::Anonymous, Some(10), None),
+                (1, 0x2000, 0x5000, RegionKind::Stack, Some(30), None),
+            ]
+        );
+    }
+
+    #[test]
+    fn grows_a_threads_arena_over_the_memory_it_reserved() {
+        let mut state = State::new(127);
+        state
+            .mmap(mapped(1, (0x100000, 0x500000), "//anon", "---p", 10))
+            .unwrap();
+        for (end, time) in [(0x101000, 20), (0x102000, 30), (0x103000, 40)] {
+            state
+                .mmap(mapped(1, (0x100000, end), "//anon", "rw-p", time))
+                .unwrap();
+        }
+        let mut usable: Vec<_> = regions(&state)
+            .into_iter()
+            .filter(|&(_, _, _, _, _, unmapped)| unmapped.is_none())
+            .collect();
+        usable.sort();
+        assert_eq!(
+            usable,
+            [
+                (1, 0x100000, 0x103000, RegionKind::Anonymous, Some(20), None),
+                (1, 0x103000, 0x500000, RegionKind::Anonymous, Some(10), None),
+            ]
+        );
+    }
+
+    #[test]
+    fn ends_the_regions_that_a_later_one_maps_over() {
+        let mut state = State::new(127);
+        let anonymous = |time| mapped(1, (0x10000, 0x50000), "//anon", "rw-p", time);
+        state.mmap(anonymous(10)).unwrap();
+        // Over the upper half, after the first was unmapped.
+        let file = Mmap {
+            file_offset: 0,
+            ..mapped(1, (0x30000, 0x50000), "/data.bin", "r--p", 20)
+        };
+        state.mmap(file).unwrap();
+        state.mmap(anonymous(30)).unwrap();
+        assert_eq!(
+            regions(&state),
+            [
+                (
+                    1,
+                    0x30000,
+                    0x50000,
+                    RegionKind::Anonymous,
+                    Some(10),
+                    Some(20)
+                ),
+                (
+                    1,
+                    0x10000,
+                    0x30000,
+                    RegionKind::Anonymous,
+                    Some(10),
+                    Some(30)
+                ),
+                (1, 0x30000, 0x50000, RegionKind::File, Some(20), Some(30)),
+                (1, 0x10000, 0x50000, RegionKind::Anonymous, Some(30), None),
+            ]
+        );
+    }
+
+    #[test]
+    fn gives_a_forked_process_its_parents_regions_until_it_execs() {
+        let mut state = State::new(127);
+        state
+            .mmap(mapped(1, (0x5000, 0x6000), "[heap]", "rw-p", 10))
+            .unwrap();
+        state.fork(2, 2, Some((1, 1)), Some(20));
+        state.comm(2, 2, "child".into(), true, Some(30));
+        assert_eq!(
+            regions(&state),
+            [
+                (1, 0x5000, 0x6000, RegionKind::Heap, Some(10), None),
+                (2, 0x5000, 0x6000, RegionKind::Heap, Some(20), Some(30)),
+            ]
+        );
     }
 
     #[test]
@@ -2348,6 +2790,7 @@ mod tests {
             executable: false,
             path: path.into(),
             build_id: None,
+            permissions: None,
             time: None,
         };
         let mut state = State::new(127);

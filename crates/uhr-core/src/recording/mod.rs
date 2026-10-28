@@ -26,6 +26,7 @@ const SYSCALL_CALLS: &str = "syscall_calls.parquet";
 const OFF_CPU: &str = "off_cpu.parquet";
 const MEMORY: &str = "memory.parquet";
 const PAGE_FAULTS: &str = "page_faults.parquet";
+const REGIONS: &str = "regions.parquet";
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -134,6 +135,7 @@ pub struct Recording {
     pub syscall_calls: Vec<SyscallCalls>,
     /// Sorted by time.
     pub memory: Vec<MemoryReading>,
+    pub regions: Vec<MemoryRegion>,
 }
 
 /// One lifetime of a thread. The kernel reuses ids, so `(pid, tid)` can
@@ -312,6 +314,85 @@ impl MemoryReading {
     }
 }
 
+/// A region of a process's memory, as the kernel reported mapping it. A
+/// region that grew in place, as a heap or a stack does, is one, as far as
+/// it reached. The kernel does not report unmapping one, so a region holds
+/// its addresses until a later one maps over them, or its process execs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryRegion {
+    pub pid: u32,
+    pub start: u64,
+    /// Exclusive.
+    pub end: u64,
+    /// As in `r-xp`: whether it can be read, written and run, and `p` for
+    /// private or `s` for shared.
+    pub permissions: String,
+    pub file_offset: u64,
+    /// The file mapped, or the kernel's name for the region, as `[heap]`.
+    /// `None` for memory that maps no file and has no name.
+    pub path: Option<String>,
+    pub kind: RegionKind,
+    /// When it was mapped. `None` if before the recording.
+    pub time_ns: Option<u64>,
+    /// When a later region took its place, or its process exec'd. `None`
+    /// if it held its addresses still, as far as the recording knows.
+    pub unmapped_ns: Option<u64>,
+}
+
+/// What a region of memory is, from how it was mapped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RegionKind {
+    /// The heap the program grows with `brk`, where malloc starts.
+    Heap,
+    /// The main thread's stack. Other threads' are anonymous memory.
+    Stack,
+    /// Memory of the process's own that maps no file, as what malloc maps
+    /// for large or per-thread allocations, a runtime's garbage-collected
+    /// heap, and threads' stacks.
+    Anonymous,
+    /// Anonymous memory that can run code, as what a JIT compiles into.
+    AnonymousCode,
+    /// Memory shared with other processes, as shared memory and files in
+    /// memory.
+    Shared,
+    /// A file's code.
+    Code,
+    /// The rest of a file mapped: its data, or a file mapped to be read.
+    File,
+    /// What the kernel maps into every process, as `[vdso]`.
+    Kernel,
+}
+
+impl RegionKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RegionKind::Heap => "heap",
+            RegionKind::Stack => "stack",
+            RegionKind::Anonymous => "anonymous",
+            RegionKind::AnonymousCode => "anonymous_code",
+            RegionKind::Shared => "shared",
+            RegionKind::Code => "code",
+            RegionKind::File => "file",
+            RegionKind::Kernel => "kernel",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, String> {
+        Ok(match value {
+            "heap" => RegionKind::Heap,
+            "stack" => RegionKind::Stack,
+            "anonymous" => RegionKind::Anonymous,
+            "anonymous_code" => RegionKind::AnonymousCode,
+            "shared" => RegionKind::Shared,
+            "code" => RegionKind::Code,
+            "file" => RegionKind::File,
+            "kernel" => RegionKind::Kernel,
+            _ => return Err(format!("unknown kind of memory region {value:?}")),
+        })
+    }
+}
+
 /// A kernel function or BPF program, as the kernel listed it while
 /// recording. Only the ones kernel frames fall in are kept: the kernel
 /// moves on every boot, so its symbols cannot be read again later.
@@ -465,6 +546,7 @@ impl Recording {
             interpreted_code: read_interpreted_code(dir)?,
             syscall_calls: read_syscall_calls(dir)?,
             memory: read_memory(dir)?,
+            regions: read_regions(dir)?,
         };
         recording
             .check_references()
@@ -759,6 +841,34 @@ impl Recording {
                     memory.iter().map(|m| m.peak_rss_bytes).collect(),
                 ),
             ],
+        )?;
+
+        let regions = &self.regions;
+        table::write(
+            &dir.join(REGIONS),
+            vec![
+                Column::u32("pid", regions.iter().map(|r| r.pid).collect()),
+                Column::u64("start", regions.iter().map(|r| r.start).collect()),
+                Column::u64("end", regions.iter().map(|r| r.end).collect()),
+                Column::string(
+                    "permissions",
+                    regions.iter().map(|r| r.permissions.as_str()).collect(),
+                ),
+                Column::u64(
+                    "file_offset",
+                    regions.iter().map(|r| r.file_offset).collect(),
+                ),
+                Column::optional_string(
+                    "path",
+                    regions.iter().map(|r| r.path.as_deref()).collect(),
+                ),
+                Column::string("kind", regions.iter().map(|r| r.kind.as_str()).collect()),
+                Column::optional_u64("time_ns", regions.iter().map(|r| r.time_ns).collect()),
+                Column::optional_u64(
+                    "unmapped_ns",
+                    regions.iter().map(|r| r.unmapped_ns).collect(),
+                ),
+            ],
         )
     }
 
@@ -844,6 +954,18 @@ impl Recording {
                     "syscall calls {index} has {} calls, but {} by latency",
                     calls.calls,
                     calls.latency.iter().sum::<u64>()
+                ));
+            }
+        }
+        for (index, region) in self.regions.iter().enumerate() {
+            if region.start >= region.end {
+                return Err(format!("memory region {index} has start >= end"));
+            }
+            if let Some(unmapped) = region.unmapped_ns
+                && unmapped < region.time_ns.unwrap_or(0)
+            {
+                return Err(format!(
+                    "memory region {index} was unmapped before it was mapped"
                 ));
             }
         }
@@ -1160,6 +1282,34 @@ fn read_memory(dir: &Path) -> Result<Vec<MemoryReading>> {
             peak_rss_bytes: peak_rss_bytes[i],
         })
         .collect())
+}
+
+fn read_regions(dir: &Path) -> Result<Vec<MemoryRegion>> {
+    let table = Table::read(&dir.join(REGIONS))?;
+    let pid = table.u32("pid")?;
+    let start = table.u64("start")?;
+    let end = table.u64("end")?;
+    let mut permissions = table.string("permissions")?;
+    let file_offset = table.u64("file_offset")?;
+    let mut path = table.optional_string("path")?;
+    let kind = table.string("kind")?;
+    let time_ns = table.optional_u64("time_ns")?;
+    let unmapped_ns = table.optional_u64("unmapped_ns")?;
+    (0..table.len())
+        .map(|i| {
+            Ok(MemoryRegion {
+                pid: pid[i],
+                start: start[i],
+                end: end[i],
+                permissions: std::mem::take(&mut permissions[i]),
+                file_offset: file_offset[i],
+                path: path[i].take(),
+                kind: RegionKind::parse(&kind[i]).map_err(|reason| table.invalid(reason))?,
+                time_ns: time_ns[i],
+                unmapped_ns: unmapped_ns[i],
+            })
+        })
+        .collect()
 }
 
 fn ids(len: usize) -> Vec<u32> {

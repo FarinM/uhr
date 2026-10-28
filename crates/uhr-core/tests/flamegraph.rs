@@ -129,6 +129,7 @@ fn recording() -> (Recording, Symbols) {
         interpreted_code,
         syscall_calls: Vec::new(),
         memory: Vec::new(),
+        regions: Vec::new(),
     };
     let mut names: Vec<_> = FUNCTIONS
         .iter()

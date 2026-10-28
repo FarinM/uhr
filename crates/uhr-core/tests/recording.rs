@@ -296,6 +296,30 @@ fn example() -> Recording {
                 peak_rss_bytes: (1 << 30) + 12_288,
             },
         ],
+        regions: vec![
+            MemoryRegion {
+                pid: 7,
+                start: 0x5555_0000_0000,
+                end: 0x5555_0002_1000,
+                permissions: "rw-p".into(),
+                file_offset: 0,
+                path: Some("[heap]".into()),
+                kind: RegionKind::Heap,
+                time_ns: None,
+                unmapped_ns: None,
+            },
+            MemoryRegion {
+                pid: 7,
+                start: 0x7f00_0000_0000,
+                end: 0x7f00_0010_0000,
+                permissions: "rw-p".into(),
+                file_offset: 0,
+                path: None,
+                kind: RegionKind::Anonymous,
+                time_ns: Some(2_000),
+                unmapped_ns: Some(3_000),
+            },
+        ],
     }
 }
 

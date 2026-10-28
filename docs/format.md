@@ -22,6 +22,7 @@ A recording is a directory:
 | `interpreted_code.parquet` | The code interpreted frames ran, read from the interpreters' memory while recording |
 | `syscall_calls.parquet` | How often each thread called each syscall, and how long the calls took |
 | `memory.parquet` | How much memory each process had, read at intervals |
+| `regions.parquet` | The regions of each process's memory, as it mapped them |
 | `symbols.parquet` | Function name per frame, after symbol resolution |
 | `symbol_sources.parquet` | Files the names came from, and why some frames have none |
 | `inline_frames.parquet` | Inlined calls and source lines per frame, from debug info |
@@ -62,7 +63,7 @@ Each stream has:
 | `collector` | `name` plus the collector's version and settings. For perf: `version`, `sampling`, `page_faults`, `context_switches` (whether perf recorded every context switch). uhr's eBPF programs are `ebpf`, with `programs`, their tags in hex, as in the kernel's names for their code: `bpf_prog_<tag>_<name>`, `sampling` and `page_faults`. uhr reading `/proc` is `procfs`, with `interval_ns`, how often it read |
 | `collector.page_faults` | How the collector sampled page faults: `event` and `period`, one fault in every that many, which each sample stands for. Null for one that did not |
 | `collector.sampling` | How the collector sampled CPU time: `event`, `frequency_hz` (what it sampled at), `requested_frequency_hz`. Null for one that did not |
-| `signals` | What was captured: `user_cpu_samples`, `kernel_cpu_samples`, `user_stacks`, `kernel_stacks`, `off_cpu_time` (when threads went off CPU and came back, and whether they were preempted), `off_cpu_stacks` (where they went off CPU), `syscall_calls` (how often threads called each syscall and how long the calls took), `resident_memory` (how much memory each process had resident and in swap, over time), `page_faults` (samples of the page faults threads took, with their stacks) |
+| `signals` | What was captured: `user_cpu_samples`, `kernel_cpu_samples`, `user_stacks`, `kernel_stacks`, `off_cpu_time` (when threads went off CPU and came back, and whether they were preempted), `off_cpu_stacks` (where they went off CPU), `syscall_calls` (how often threads called each syscall and how long the calls took), `resident_memory` (how much memory each process had resident and in swap, over time), `memory_regions` (the regions of each process's memory, as it mapped them), `page_faults` (samples of the page faults threads took, with their stacks) |
 | `missing_signals` | Signals requested but not captured, each with a `reason`. Without `kernel_cpu_samples`, CPU time spent in the kernel is not in the samples at all, not merely unnamed. Threads go off CPU in the kernel, so without kernel sampling `off_cpu_stacks` is missing too |
 | `coverage.lost_events` | Events the kernel dropped |
 | `coverage.stacks` | For a collector that takes stacks, the counts below. Null for one that takes none |
@@ -251,6 +252,40 @@ through a thread that still runs.
 | `rss_shmem_bytes` | uint64 | Resident shared memory. The three add up to its resident memory, which counts pages shared with other processes in each of them |
 | `swap_bytes` | uint64 | Its own memory the kernel moved out to swap |
 | `peak_rss_bytes` | uint64 | The most it had resident since it started, or last exec'd, as the kernel tracks it: between readings too |
+
+`regions`, one row per region of memory a process mapped, from perf's
+records of mapping memory, which it writes when page faults are sampled.
+A process's regions don't overlap at any one time. A region is mapped from
+`time_ns` until a region mapped over it, or its process's exec, ends it at
+`unmapped_ns`. The kernel reports no unmapping, so a region unmapped with
+nothing mapped in its place stays mapped here. A region mapped over part of
+another ends that part, and the rest stays mapped as rows of their own, with
+the same `time_ns`.
+
+A region that grows in place, keeping its permissions, file and offset, is
+one row, as far as it reached: up, as a heap or a thread's malloc arena
+grows, or down, as the main thread's stack does. It grows only where no
+region was mapped, or over memory reserved that can't be touched (`---p`),
+as an arena grows over. The kernel reports a heap's first `brk` without its
+name, so the heap is `heap` once it grows again, and `anonymous` if it never
+does. A forked process starts with copies of its parent's regions, mapped as
+it forked. The kernel reports no region moved or grown with `mremap`, as
+`realloc` does with large blocks.
+
+| Column | Type | Meaning |
+|---|---|---|
+| `pid` | uint32 | |
+| `start`, `end` | uint64 | Address range, end exclusive |
+| `permissions` | string | As `/proc/<pid>/maps` lists them, as in `r-xp`: whether it can be read, written and run, and `p` for private or `s` for shared |
+| `file_offset` | uint64 | Offset in the file of `start` |
+| `path` | string, nullable | The file mapped, or the kernel's name for the region, as `[heap]` or `[vdso]`. Null for memory that maps no file and has no name |
+| `kind` | string | `heap` (grown with `brk`, where malloc starts), `stack` (the main thread's: other threads' are `anonymous`), `anonymous` (the process's own memory that maps no file, as what malloc maps for large or per-thread allocations, or a runtime's garbage-collected heap), `anonymous_code` (anonymous memory that can run code, as what a JIT compiles into), `shared` (memory shared with other processes, as shared memory and files in memory), `code` (a file's code), `file` (the rest of a file mapped), `kernel` (what the kernel maps into every process, as `[vdso]`) |
+| `time_ns` | uint64, nullable | When it was mapped. Null if before the recording |
+| `unmapped_ns` | uint64, nullable | When a region mapped over it, or its process's exec, ended it. 0 if before the recording. Null if it was still mapped at the end, as far as the kernel's reports tell |
+
+A page fault was in the region of its process that held its address when it
+faulted, if one did: mapped at or before then, and not yet unmapped. In none
+if the region was moved or grown with `mremap`, or perf lost its record.
 
 ## Symbols
 

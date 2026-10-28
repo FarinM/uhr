@@ -101,6 +101,18 @@ Debian and Ubuntu its package must match the running kernel.
   takes the stack and the address of one fault in every period, which the
   sample stands for. The address needs `--data`, which has perf write a
   0 address with each CPU sample too.
+- With `--data`, perf also records each region of memory the target maps,
+  not only code, with when it did, as it does whichever sampler samples
+  the faults. The kernel reports a heap or a thread's arena growing too,
+  and a stack each time it grows by a page, but not a region's unmapping,
+  nor one moved or grown with `mremap`. uhr keeps a region that grows in
+  place as one row. Attached, perf lists the regions there already. From
+  these uhr keeps each process's regions as they were at each moment, a
+  region mapped over another ending it, so a fault was in the region that
+  held its address then. A process's `maps` read at intervals would miss
+  what it maps between two readings, which is most of a short program's
+  growth: a Python program that grew its heap in its last 100 ms had 97% of
+  its faults in no region.
   A fault is where a thread first touched memory, so they show the code that
   made the process grow, not what holds its memory: one fault can map many
   pages, as a huge page or a file's pages around the one touched, and

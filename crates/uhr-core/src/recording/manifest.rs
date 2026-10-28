@@ -173,6 +173,9 @@ pub enum Signal {
     /// How much memory each process had resident and in swap, over time.
     #[serde(rename = "resident_memory")]
     ResidentMemory,
+    /// The regions of each process's memory, as it mapped them.
+    #[serde(rename = "memory_regions")]
+    MemoryRegions,
 }
 
 impl Signal {
@@ -187,6 +190,7 @@ impl Signal {
             Signal::SyscallCalls => "syscall_calls",
             Signal::PageFaults => "page_faults",
             Signal::ResidentMemory => "resident_memory",
+            Signal::MemoryRegions => "memory_regions",
         }
     }
 }
