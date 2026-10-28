@@ -70,13 +70,13 @@ enum Command {
         #[command(flatten)]
         filter: FilterArgs,
     },
-    /// Group a recording's CPU or off-CPU time and print the top rows, with
-    /// coverage
+    /// Group a recording's CPU time, off-CPU time or page faults and print
+    /// the top rows, with coverage
     Query {
         recording: PathBuf,
         #[arg(long, value_enum)]
         group_by: GroupByArg,
-        /// The time to weigh stacks by
+        /// What to weigh stacks by
         #[arg(long, value_enum, default_value_t = MetricArg::Cpu)]
         metric: MetricArg,
         /// Rows to print
@@ -87,14 +87,14 @@ enum Command {
         #[command(flatten)]
         filter: FilterArgs,
     },
-    /// Draw a flame graph of a recording's CPU or off-CPU time, as an SVG
-    /// to open in a browser
+    /// Draw a flame graph of a recording's CPU time, off-CPU time or page
+    /// faults, as an SVG to open in a browser
     Flamegraph {
         recording: PathBuf,
         /// The file to write
         #[arg(short, long)]
         output: PathBuf,
-        /// The time to weigh stacks by
+        /// What to weigh stacks by
         #[arg(long, value_enum, default_value_t = MetricArg::Cpu)]
         metric: MetricArg,
         /// Start the graph at a function, by id or by a name only one function
@@ -110,15 +110,15 @@ enum Command {
         #[command(flatten)]
         filter: FilterArgs,
     },
-    /// Show who calls a function and what it calls, with their CPU or off-CPU
-    /// time
+    /// Show who calls a function and what it calls, with their CPU time,
+    /// off-CPU time or page faults
     CallPaths {
         recording: PathBuf,
         /// A function id from `uhr query --json`, or a name only one function
         /// has
         #[arg(long)]
         function: String,
-        /// The time to weigh stacks by
+        /// What to weigh stacks by
         #[arg(long, value_enum, default_value_t = MetricArg::Cpu)]
         metric: MetricArg,
         /// Levels of callers and of callees to show
