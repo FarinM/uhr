@@ -4,8 +4,10 @@
 
 mod common;
 
+use std::ffi::OsStr;
 use std::fs;
 use std::io::Write;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
@@ -448,6 +450,37 @@ fn attaching_records_for_the_duration_and_leaves_the_process_alone() {
         / 1e9;
     assert!((0.9..1.5).contains(&seconds), "captured {seconds} s");
     assert!(common::samples(&manifest) > 0, "{manifest}");
+}
+
+#[test]
+fn attaches_to_a_process_whose_name_is_not_utf8() {
+    let dir = common::scratch("attach_to_a_name_not_utf8");
+    // The kernel cuts a name at 15 bytes, here within its last character.
+    let name = OsStr::from_bytes(b"zz\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9");
+    let program = dir.join(name);
+    common::compile("cpu_bound", &program, "-O2");
+    let running = Bystander(
+        Command::new(&program)
+            .arg("100000")
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let recording = dir.join("rec");
+    let pid = running.0.id().to_string();
+    let output = Command::new(common::UHR)
+        .arg("record")
+        .arg("-o")
+        .arg(&recording)
+        .args(["--no-symbolize", "--pid", &pid, "--duration", "300ms"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(common::samples(&manifest(&recording)) > 0);
 }
 
 /// uhr attached to `pid`, once it records.

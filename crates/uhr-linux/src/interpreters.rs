@@ -18,6 +18,7 @@ use uhr_core::runtimes::{
 use uhr_ebpf::{MAX_PATH, MAX_READS, MAX_WALKED_BYTES, ONE_LIST, walk};
 
 use crate::launch::monotonic_ns;
+use crate::procfs;
 
 /// What a sample says of its process and interpreter frames.
 pub(crate) struct Walked {
@@ -272,11 +273,13 @@ fn host_thread_ids(pid: u32) -> Option<HashMap<u64, u32>> {
     }
     let tasks = fs::read_dir(format!("/proc/{pid}/task")).ok()?;
     let mut ids = HashMap::new();
+    let mut status = Vec::new();
     for task in tasks.flatten() {
-        let status = fs::read_to_string(task.path().join("status")).unwrap_or_default();
+        if procfs::read(task.path().join("status"), &mut status).is_err() {
+            continue;
+        }
         // The thread's id in each namespace it is in, the first one first.
-        let nested = status.lines().find_map(|line| line.strip_prefix("NSpid:"));
-        let nested: Vec<u64> = nested
+        let nested: Vec<u64> = procfs::status_field(&status, "NSpid")
             .map(|ids| {
                 ids.split_whitespace()
                     .filter_map(|id| id.parse().ok())
@@ -483,11 +486,11 @@ impl Memory for FileMemory {
 
 impl LiveProcess {
     fn open(pid: u32) -> io::Result<Self> {
-        let maps = fs::read_to_string(format!("/proc/{pid}/maps"))?;
+        let maps = fs::read(format!("/proc/{pid}/maps"))?;
         let memory = FileMemory(File::open(format!("/proc/{pid}/mem"))?);
         Ok(Self {
             pid,
-            mappings: maps.lines().filter_map(|line| mapping(pid, line)).collect(),
+            mappings: mappings(pid, &maps),
             memory,
         })
     }
@@ -522,6 +525,15 @@ impl Process for LiveProcess {
     fn memory(&self) -> &dyn Memory {
         &self.memory
     }
+}
+
+/// The files a process's `/proc/<pid>/maps` says it maps. A path that is
+/// not UTF-8 keeps a replacement for what is not, so its file is read
+/// through `map_files`, as it is anyway.
+fn mappings(pid: u32, maps: &[u8]) -> Vec<Mapping> {
+    maps.split(|&b| b == b'\n')
+        .filter_map(|line| mapping(pid, &String::from_utf8_lossy(line)))
+        .collect()
 }
 
 /// A line of `/proc/<pid>/maps` that maps a file: `start-end perms offset
@@ -565,5 +577,13 @@ mod tests {
         assert_eq!(mapping(7, spaced).unwrap().path, "/opt/my app/lib.so");
         assert!(mapping(7, "7ffd1000-7ffd2000 rw-p 00000000 00:00 0 [stack]").is_none());
         assert!(mapping(7, "7ffd1000-7ffd2000 rw-p 00000000 00:00 0").is_none());
+    }
+
+    #[test]
+    fn reads_every_file_a_process_maps_whatever_their_paths() {
+        let maps = b"1000-2000 r-xp 00000000 08:01 7 /opt/caf\xc3/lib.so\n\
+                     3000-4000 r-xp 00000000 08:01 8 /usr/lib/libc.so.6\n";
+        let paths: Vec<String> = mappings(7, maps).into_iter().map(|m| m.path).collect();
+        assert_eq!(paths, ["/opt/caf\u{fffd}/lib.so", "/usr/lib/libc.so.6"]);
     }
 }

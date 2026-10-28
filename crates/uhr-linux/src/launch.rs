@@ -14,6 +14,8 @@ use rustix::io::Errno;
 use rustix::pipe::{PipeFlags, pipe_with};
 use rustix::process::{Pid, PidfdFlags, Signal, pidfd_open};
 
+use crate::procfs;
+
 /// Why a target could not be started.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -173,16 +175,10 @@ impl Process {
 
     /// When the process with the pid `pid` started.
     pub(crate) fn started(pid: u32) -> io::Result<SystemTime> {
-        let stat = fs::read_to_string(format!("/proc/{pid}/stat"))?;
+        let mut stat = Vec::new();
+        procfs::read(format!("/proc/{pid}/stat"), &mut stat)?;
         let unreadable = || io::Error::new(ErrorKind::InvalidData, "unreadable /proc/<pid>/stat");
-        // Its name, in parentheses, can hold spaces. The start comes 20
-        // fields after it, in clock ticks since boot.
-        let (_, after_name) = stat.rsplit_once(')').ok_or_else(unreadable)?;
-        let ticks: u64 = after_name
-            .split_whitespace()
-            .nth(19)
-            .and_then(|t| t.parse().ok())
-            .ok_or_else(unreadable)?;
+        let ticks = procfs::stat(&stat).ok_or_else(unreadable)?.start_ticks;
         let boot: u64 = fs::read_to_string("/proc/stat")?
             .lines()
             .find_map(|line| line.strip_prefix("btime ")?.trim().parse().ok())
@@ -194,17 +190,11 @@ impl Process {
 
     /// The user that files the process with the pid `pid` creates belong to.
     pub(crate) fn file_owner(pid: u32) -> io::Result<u32> {
-        let status = fs::read_to_string(format!("/proc/{pid}/status"))?;
+        let mut status = Vec::new();
+        procfs::read(format!("/proc/{pid}/status"), &mut status)?;
         // Its real, effective, saved and filesystem user ids.
-        status
-            .lines()
-            .find_map(|line| {
-                line.strip_prefix("Uid:")?
-                    .split_whitespace()
-                    .nth(3)?
-                    .parse()
-                    .ok()
-            })
+        procfs::status_field(&status, "Uid")
+            .and_then(|ids| ids.split_whitespace().nth(3)?.parse().ok())
             .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "unreadable /proc/<pid>/status"))
     }
 

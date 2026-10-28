@@ -10,4 +10,5 @@ pub mod kallsyms;
 pub mod launch;
 pub mod perf;
 mod perf_map;
+mod procfs;
 mod runtimes;
