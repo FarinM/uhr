@@ -27,6 +27,7 @@ use crate::ebpf::{self, Programs};
 use crate::interpreters::Interpreters;
 use crate::kallsyms::Kallsyms;
 use crate::launch::{self, Held, Interrupts, Process, monotonic_ns};
+use crate::memory;
 use crate::perf_map;
 use crate::runtimes;
 use uhr_core::doctor::Status;
@@ -126,6 +127,8 @@ pub struct RecordOptions {
     /// Count and time the target's syscalls with uhr's eBPF programs, if
     /// this host lets uhr load them.
     pub syscalls: bool,
+    /// Read how much memory the target's processes have, at intervals.
+    pub memory: bool,
     /// What samples CPU time. `None` for uhr's eBPF programs where this host
     /// lets uhr load them, and perf elsewhere.
     pub sampler: Option<Sampler>,
@@ -282,6 +285,16 @@ pub fn record(options: &RecordOptions, interrupts: &Interrupts, out: &Path) -> R
         None => None,
     };
 
+    let memory_span = ended
+        .memory
+        .as_ref()
+        .and_then(|read| read.as_ref().ok())
+        .and_then(|read| {
+            Some((
+                read.readings.first()?.time_ns,
+                read.readings.last()?.time_ns,
+            ))
+        });
     let recording = convert::convert(convert::Input {
         perf_data: &perf_data,
         command: &command,
@@ -290,6 +303,7 @@ pub fn record(options: &RecordOptions, interrupts: &Interrupts, out: &Path) -> R
         exit: ended.exit,
         stopped_ns: ended.stopped_ns,
         attached_ns: ended.attached_ns,
+        memory_span,
         perf_version,
         requested_frequency_hz: options.frequency_hz,
         max_stack_depth,
@@ -353,6 +367,7 @@ pub fn record(options: &RecordOptions, interrupts: &Interrupts, out: &Path) -> R
         options.syscalls,
         matches!(ready, Ready::Attach { .. }),
     );
+    add_memory(&mut recording, ended.memory);
 
     // uhr made the runtimes it launched write them, so it cleans them up
     // once the recording holds the names.
@@ -389,6 +404,72 @@ pub fn record(options: &RecordOptions, interrupts: &Interrupts, out: &Path) -> R
     fs::rename(&staging, out).map_err(io_error("renaming into place", out))?;
     log_summary(&recording, out);
     Ok(recording)
+}
+
+/// Adds the memory readings as a stream of their own, or says why there
+/// are none.
+fn add_memory(recording: &mut Recording, read: Option<Result<memory::Read, memory::Error>>) {
+    let read = match read {
+        None => return,
+        Some(Err(error)) => {
+            recording.manifest.missing_signals.push(MissingSignal {
+                signal: recording::Signal::ResidentMemory,
+                reason: error.to_string(),
+            });
+            return;
+        }
+        Some(Ok(read)) => read,
+    };
+    let interval_ms = memory::INTERVAL.as_millis();
+    let mut known_biases = vec![
+        format!(
+            "Memory is read every {interval_ms} ms, so what comes and goes between readings is \
+             missed, except in the peak each reading has."
+        ),
+        "A process's resident memory counts the pages it shares with others, as processes \
+         forked from one another and those mapping one library do, so summing it over \
+         processes counts those pages more than once."
+            .to_owned(),
+        "The kernel's counts are approximate: it keeps them per CPU, or per thread before Linux \
+         6.2, and adds them up lazily."
+            .to_owned(),
+        format!(
+            "uhr finds the processes the target starts at each reading, by their parent, so one \
+             that ends within {interval_ms} ms of starting, or whose parent ends first, can be \
+             left out, as can one that the kernel takes longer than that to list after giving \
+             it its pid."
+        ),
+    ];
+    known_biases.extend(read.unreadable.iter().map(|(reason, processes)| {
+        format!("{processes} of the target's processes could not be read: {reason}.")
+    }));
+    known_biases.extend(read.unchecked.iter().map(|(reason, processes)| {
+        format!(
+            "{processes} processes started on the host could not be checked for being the \
+             target's, so any that were are left out: {reason}."
+        )
+    }));
+    known_biases.push(
+        "The overhead is uhr's own CPU time reading /proc, which the kernel spends on the \
+         target's memory counts but not in the target."
+            .to_owned(),
+    );
+    let manifest = &mut recording.manifest;
+    manifest.streams.push(recording::Stream {
+        id: "procfs".into(),
+        collector: Collector::Procfs {
+            interval_ns: memory::INTERVAL.as_nanos() as u64,
+        },
+        signals: vec![recording::Signal::ResidentMemory],
+        missing_signals: Vec::new(),
+        coverage: StreamCoverage {
+            lost_events: 0,
+            stacks: None,
+            overhead_ns: Some(read.cpu_ns),
+            known_biases,
+        },
+    });
+    recording.memory = read.readings;
 }
 
 /// Adds what uhr's eBPF programs found as a stream of their own, or says
@@ -623,7 +704,7 @@ fn log_summary(recording: &Recording, out: &Path) {
         {
             let sampler = match stream.collector {
                 Collector::Perf { .. } => "perf",
-                Collector::Ebpf { .. } => "uhr",
+                Collector::Ebpf { .. } | Collector::Procfs { .. } => "uhr",
             };
             warn!(
                 requested_hz = sampling.requested_frequency_hz,
@@ -738,6 +819,8 @@ struct Ended {
     ebpf: Option<Result<ebpf::Stopped, ebpf::Error>>,
     /// Whether perf sampled, rather than uhr's eBPF programs.
     perf_sampled: bool,
+    /// `None` when not asked for.
+    memory: Option<Result<memory::Read, memory::Error>>,
 }
 
 /// A target checked and ready to record.
@@ -772,15 +855,22 @@ fn run(
             let held = Held::spawn(command, &environment)?;
             let pid = held.pid();
             let mut ebpf = start_ebpf(pid, true, options, tick, samples)?;
+            let mut memory = options.memory.then(|| memory::Reader::start(pid));
             let perf_sampled = !samples_with(&ebpf);
             let mut sampling = sample(perf_data, options, pid, perf_sampled)?;
             begin(&mut ebpf);
             sampling.stop_if_interrupted(interrupts)?;
             let mut target = held.release()?;
+            // Released, it has exec'd, so its memory is no longer a copy of
+            // uhr's.
+            if let Some(Ok(memory)) = memory.as_mut() {
+                memory.begin();
+            }
             let program = Path::new(&command[0]);
             let mut capture = Capture {
                 perf: &mut sampling.perf,
                 ebpf: running(&mut ebpf),
+                memory: memory.as_mut().and_then(|m| m.as_mut().ok()),
             };
             let (target, perf) = supervise(program, &mut target.child, &mut capture, interrupts)?;
             sampling.finish_relay();
@@ -793,6 +883,7 @@ fn run(
                 attached_ns: None,
                 ebpf: ebpf.map(|e| e.and_then(Programs::stop)),
                 perf_sampled,
+                memory: memory.map(|m| m.map(memory::Reader::finish)),
             })
         }
         Ready::Attach {
@@ -802,10 +893,14 @@ fn run(
             ..
         } => {
             let mut ebpf = start_ebpf(*pid, false, options, tick, samples)?;
+            let mut memory = options.memory.then(|| memory::Reader::start(*pid));
             let perf_sampled = !samples_with(&ebpf);
             let mut sampling = sample(perf_data, options, *pid, perf_sampled)?;
             begin(&mut ebpf);
             let attached_ns = monotonic_ns();
+            if let Some(Ok(memory)) = memory.as_mut() {
+                memory.begin();
+            }
             sampling.stop_if_interrupted(interrupts)?;
             match duration {
                 Some(duration) => info!(
@@ -818,6 +913,7 @@ fn run(
             let mut capture = Capture {
                 perf: &mut sampling.perf,
                 ebpf: running(&mut ebpf),
+                memory: memory.as_mut().and_then(|m| m.as_mut().ok()),
             };
             let (perf, stopped_ns) = watch(&mut capture, interrupts, *duration)?;
             sampling.finish_relay();
@@ -841,6 +937,7 @@ fn run(
                 attached_ns: Some(attached_ns),
                 ebpf: ebpf.map(|e| e.and_then(Programs::stop)),
                 perf_sampled,
+                memory: memory.map(|m| m.map(memory::Reader::finish)),
             })
         }
     }
@@ -911,6 +1008,7 @@ fn begin(ebpf: &mut Option<Result<Programs, ebpf::Error>>) {
 struct Capture<'a> {
     perf: &'a mut Perf,
     ebpf: Option<&'a mut Programs>,
+    memory: Option<&'a mut memory::Reader>,
 }
 
 impl Capture<'_> {
@@ -930,6 +1028,9 @@ impl Capture<'_> {
     fn end(&mut self) {
         if let Some(ebpf) = self.ebpf.as_mut() {
             ebpf.end();
+        }
+        if let Some(memory) = self.memory.as_mut() {
+            memory.end();
         }
     }
 }

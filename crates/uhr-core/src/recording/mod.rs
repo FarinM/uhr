@@ -24,6 +24,7 @@ const JIT_SYMBOLS: &str = "jit_symbols.parquet";
 const INTERPRETED_CODE: &str = "interpreted_code.parquet";
 const SYSCALL_CALLS: &str = "syscall_calls.parquet";
 const OFF_CPU: &str = "off_cpu.parquet";
+const MEMORY: &str = "memory.parquet";
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -129,6 +130,8 @@ pub struct Recording {
     pub jit_symbols: Vec<JitSymbol>,
     pub interpreted_code: Vec<InterpretedCode>,
     pub syscall_calls: Vec<SyscallCalls>,
+    /// Sorted by time.
+    pub memory: Vec<MemoryReading>,
 }
 
 /// One lifetime of a thread. The kernel reuses ids, so `(pid, tid)` can
@@ -284,6 +287,29 @@ pub struct SyscallCalls {
     pub unfinished_ns: Option<u64>,
 }
 
+/// How much memory a process had when it was read, in the kernel's counts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryReading {
+    pub time_ns: u64,
+    pub pid: u32,
+    /// Resident in RAM: memory of the process's own, such as its heap and
+    /// stacks, pages of files it mapped, and shared memory.
+    pub rss_anon_bytes: u64,
+    pub rss_file_bytes: u64,
+    pub rss_shmem_bytes: u64,
+    /// Its own memory the kernel moved out to swap.
+    pub swap_bytes: u64,
+    /// The most it had resident since it started, or last exec'd, as the
+    /// kernel tracks it, between readings too.
+    pub peak_rss_bytes: u64,
+}
+
+impl MemoryReading {
+    pub fn rss_bytes(&self) -> u64 {
+        self.rss_anon_bytes + self.rss_file_bytes + self.rss_shmem_bytes
+    }
+}
+
 /// A kernel function or BPF program, as the kernel listed it while
 /// recording. Only the ones kernel frames fall in are kept: the kernel
 /// moves on every boot, so its symbols cannot be read again later.
@@ -418,6 +444,7 @@ impl Recording {
             jit_symbols: read_jit_symbols(dir)?,
             interpreted_code: read_interpreted_code(dir)?,
             syscall_calls: read_syscall_calls(dir)?,
+            memory: read_memory(dir)?,
         };
         recording
             .check_references()
@@ -449,7 +476,7 @@ impl Recording {
         let streams = &self.manifest.streams;
         let tags = streams.iter().find_map(|s| match &s.collector {
             Collector::Ebpf { programs, .. } => Some(programs),
-            Collector::Perf { .. } => None,
+            Collector::Perf { .. } | Collector::Procfs { .. } => None,
         })?;
         let sampled = streams
             .iter()
@@ -671,6 +698,32 @@ impl Recording {
                     calls.iter().map(|c| c.unfinished_ns).collect(),
                 ),
             ],
+        )?;
+
+        let memory = &self.memory;
+        table::write(
+            &dir.join(MEMORY),
+            vec![
+                Column::u64("time_ns", memory.iter().map(|m| m.time_ns).collect()),
+                Column::u32("pid", memory.iter().map(|m| m.pid).collect()),
+                Column::u64(
+                    "rss_anon_bytes",
+                    memory.iter().map(|m| m.rss_anon_bytes).collect(),
+                ),
+                Column::u64(
+                    "rss_file_bytes",
+                    memory.iter().map(|m| m.rss_file_bytes).collect(),
+                ),
+                Column::u64(
+                    "rss_shmem_bytes",
+                    memory.iter().map(|m| m.rss_shmem_bytes).collect(),
+                ),
+                Column::u64("swap_bytes", memory.iter().map(|m| m.swap_bytes).collect()),
+                Column::u64(
+                    "peak_rss_bytes",
+                    memory.iter().map(|m| m.peak_rss_bytes).collect(),
+                ),
+            ],
         )
     }
 
@@ -749,6 +802,16 @@ impl Recording {
                     calls.latency.iter().sum::<u64>()
                 ));
             }
+        }
+        if let Some(index) = self
+            .memory
+            .windows(2)
+            .position(|pair| pair[0].time_ns > pair[1].time_ns)
+        {
+            return Err(format!(
+                "memory reading {} comes before the one before it",
+                index + 1
+            ));
         }
         Ok(())
     }
@@ -1003,6 +1066,28 @@ fn read_syscall_calls(dir: &Path) -> Result<Vec<SyscallCalls>> {
             time_ns: time_ns[i],
             latency: std::mem::take(&mut latency[i]),
             unfinished_ns: unfinished_ns[i],
+        })
+        .collect())
+}
+
+fn read_memory(dir: &Path) -> Result<Vec<MemoryReading>> {
+    let table = Table::read(&dir.join(MEMORY))?;
+    let time_ns = table.u64("time_ns")?;
+    let pid = table.u32("pid")?;
+    let rss_anon_bytes = table.u64("rss_anon_bytes")?;
+    let rss_file_bytes = table.u64("rss_file_bytes")?;
+    let rss_shmem_bytes = table.u64("rss_shmem_bytes")?;
+    let swap_bytes = table.u64("swap_bytes")?;
+    let peak_rss_bytes = table.u64("peak_rss_bytes")?;
+    Ok((0..table.len())
+        .map(|i| MemoryReading {
+            time_ns: time_ns[i],
+            pid: pid[i],
+            rss_anon_bytes: rss_anon_bytes[i],
+            rss_file_bytes: rss_file_bytes[i],
+            rss_shmem_bytes: rss_shmem_bytes[i],
+            swap_bytes: swap_bytes[i],
+            peak_rss_bytes: peak_rss_bytes[i],
         })
         .collect())
 }

@@ -15,7 +15,8 @@ anywhere. The [docs](#docs) describe the whole design, which the code only
 partly covers.
 
 uhr records CPU samples with user and kernel stacks, and time off CPU, per
-process and thread, of a program it starts or one already running. It names
+process and thread, and how much memory each process has resident over
+time, of a program it starts or one already running. It names
 the code Python 3.12+ and Node compile from their perf maps. It samples with
 one of two samplers:
 
@@ -51,7 +52,7 @@ uhr record -o rec -- ./my-program args             # record a program
 uhr record -o rec --pid 4312 --duration 10s        # or attach to one
 sudo uhr record -o rec -- python3 app.py           # with the eBPF sampler
 
-uhr overview rec                                   # computing or waiting?
+uhr overview rec                                   # computing or waiting? how big?
 uhr query rec --group-by function                  # top functions
 uhr query rec --group-by line --under parse_json   # hot lines under a function
 uhr query rec --group-by syscall --metric off-cpu  # syscalls threads waited in

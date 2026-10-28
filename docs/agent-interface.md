@@ -47,6 +47,13 @@ behaviors.
 | `export` | Write Perfetto, Firefox Profiler or speedscope files for human review |
 | `doctor` | For a target on this host: what each collector would capture, what blocks the rest and how to fix it, and which ones `record` would use |
 
+`overview` gives each process's memory from its readings in the window: the
+first, the last and the one with the most resident, each with its split into
+the process's own memory, files and shared memory, its swap, and the most it
+had resident as the kernel tracked it, between readings too. Memory is read
+per process, so only filters by process and time apply to it, and a filter
+by thread, mode, stack or syscall leaves it out, as the result says.
+
 `call_paths` takes a function by its id, or by a name only one function
 has, and returns two trees from it outward: its callers and its callees. Both
 stop at a depth limit and keep the top children of each node, and they report

@@ -20,6 +20,7 @@ A recording is a directory:
 | `jit_symbols.parquet` | The code runtimes compiled that frames fall in, named in the runtimes' perf maps while recording |
 | `interpreted_code.parquet` | The code interpreted frames ran, read from the interpreters' memory while recording |
 | `syscall_calls.parquet` | How often each thread called each syscall, and how long the calls took |
+| `memory.parquet` | How much memory each process had, read at intervals |
 | `symbols.parquet` | Function name per frame, after symbol resolution |
 | `symbol_sources.parquet` | Files the names came from, and why some frames have none |
 | `inline_frames.parquet` | Inlined calls and source lines per frame, from debug info |
@@ -47,7 +48,7 @@ replaces them.
 | `target.runtime_support` | The runtimes whose perf maps were on in the target's environment, so that they named the code they compiled: `python`, `node`. Null for a process uhr attached to, whose environment it did not see |
 | `target.exit` | `{"code": n}`, `{"signal": n}`, `{"unknown": reason}` when uhr could not see the status, as for a process it attached to, or null if it was still running |
 | `clock` | `CLOCK_MONOTONIC` |
-| `start_ns`, `end_ns` | When the capture started and stopped: the first and last event, or when perf began sampling a process uhr attached to if that came earlier, and when uhr stopped the recording if that came later, at an interrupt or the end of `--duration`. Null if nothing was recorded |
+| `start_ns`, `end_ns` | When the capture started and stopped: the first and last event or memory reading, or when perf began sampling a process uhr attached to if that came earlier, and when uhr stopped the recording if that came later, at an interrupt or the end of `--duration`. Null if nothing was recorded |
 | `streams` | One per collector that ran |
 | `missing_signals` | The signals of collectors that could not run, each with a `reason`, as `syscall_calls` without the privileges to load eBPF |
 | `kernel_symbols` | `{"status": "saved"}` if the kernel's symbols were read while recording, or `{"status": "unavailable", "reason": ...}` if not, and then kernel frames have no names |
@@ -57,9 +58,9 @@ Each stream has:
 | Field | Meaning |
 |---|---|
 | `id` | Unique within the recording |
-| `collector` | `name` plus the collector's version and settings. For perf: `version`, `sampling`, `context_switches` (whether perf recorded every context switch). uhr's eBPF programs are `ebpf`, with `programs`, their tags in hex, as in the kernel's names for their code: `bpf_prog_<tag>_<name>`, and `sampling` |
+| `collector` | `name` plus the collector's version and settings. For perf: `version`, `sampling`, `context_switches` (whether perf recorded every context switch). uhr's eBPF programs are `ebpf`, with `programs`, their tags in hex, as in the kernel's names for their code: `bpf_prog_<tag>_<name>`, and `sampling`. uhr reading `/proc` is `procfs`, with `interval_ns`, how often it read |
 | `collector.sampling` | How the collector sampled CPU time: `event`, `frequency_hz` (what it sampled at), `requested_frequency_hz`. Null for one that did not |
-| `signals` | What was captured: `user_cpu_samples`, `kernel_cpu_samples`, `user_stacks`, `kernel_stacks`, `off_cpu_time` (when threads went off CPU and came back, and whether they were preempted), `off_cpu_stacks` (where they went off CPU), `syscall_calls` (how often threads called each syscall and how long the calls took) |
+| `signals` | What was captured: `user_cpu_samples`, `kernel_cpu_samples`, `user_stacks`, `kernel_stacks`, `off_cpu_time` (when threads went off CPU and came back, and whether they were preempted), `off_cpu_stacks` (where they went off CPU), `syscall_calls` (how often threads called each syscall and how long the calls took), `resident_memory` (how much memory each process had resident and in swap, over time) |
 | `missing_signals` | Signals requested but not captured, each with a `reason`. Without `kernel_cpu_samples`, CPU time spent in the kernel is not in the samples at all, not merely unnamed. Threads go off CPU in the kernel, so without kernel sampling `off_cpu_stacks` is missing too |
 | `coverage.lost_events` | Events the kernel dropped |
 | `coverage.stacks` | For a collector that takes stacks, the counts below. Null for one that takes none |
@@ -73,7 +74,7 @@ Each stream has:
 | `coverage.stacks.stacks_cut_at_stack_copy` | Stacks that went on past the end of their stack copy, so their outer callers are missing. A copy the kernel ended early, where it could read no further, does not count. Null without `dwarf` |
 | `coverage.stacks.interpreters` | For each runtime and version whose interpreter frames the collector read, over the samples of the processes that ran it: `runtime`, `version`, `processes`, `samples`, `before_found` (samples taken before uhr found the runtime, without its frames), `no_thread` (of threads it keeps no state for), `unsearched` (of threads whose state was past the 256 the collector searches), `failed` (whose frames could not be read), `cut` (whose frames went on past the 127 uhr reads), `frames`, `unread_frames` (whose code could not be read) and `unmatched`. For a runtime that keeps its frames in its memory, each call native code made into the interpreter ran a group of its frames, which goes just above that call's frames of the eval loop. An interpreter that keeps where each call starts on the native stack has each group go by where that is. For one that does not, groups are matched to the eval loop's frames in the stack, and `unmatched` counts the samples whose native stack lost some of those, so where a group went is a guess. For one that keeps them on the native stack, each takes the place of the native frame that ran it, and `unmatched` is 0. Empty for a collector that reads none |
 | `coverage.stacks.stacks_not_unwound` | Stacks of 32-bit code, which `dwarf` unwinding cannot walk. They keep only the instruction they were taken at. Null without `dwarf` |
-| `coverage.overhead_ns` | Profiler overhead. Null until it is measured. For `ebpf`, the target's CPU time in uhr's programs, from its samples, which leaves out the sampling program itself, as no sample lands in it. Null without kernel stacks, or their names, to find them by |
+| `coverage.overhead_ns` | Profiler overhead. Null until it is measured. For `ebpf`, the target's CPU time in uhr's programs, from its samples, which leaves out the sampling program itself, as no sample lands in it. Null without kernel stacks, or their names, to find them by. For `procfs`, uhr's own CPU time reading `/proc` |
 | `coverage.known_biases` | Biases of this collector, in words |
 
 ## Tables
@@ -214,6 +215,25 @@ syscall after the target's exec, and when attached from the attach on.
 | `time_ns` | uint64 | Their time from entry to exit, on CPU or not |
 | `latency` | list of uint64 | Those calls by time: entry `i` counts the ones of at least 2^i ns and less than 2^(i+1), and the last also every longer one. Sums to `calls` |
 | `unfinished_ns` | uint64, nullable | The time so far of a call the thread was still in when the capture ended. Null if it was in none |
+
+`memory`, one row per reading of a process, sorted by `time_ns`, from
+uhr reading `/proc/<pid>/status`. Each of the target's processes is read
+at every interval, from when the capture starts or the process does, until
+the capture ends or the process does. The counts are the kernel's, which
+it keeps per CPU, or per thread before Linux 6.2, and adds up lazily, so
+they are approximate. A process gets a row per reading while it has memory
+of its own, which a zombie does not. One whose main thread has ended is read
+through a thread that still runs.
+
+| Column | Type | Meaning |
+|---|---|---|
+| `time_ns` | uint64 | When it was read |
+| `pid` | uint32 | |
+| `rss_anon_bytes` | uint64 | Resident memory of the process's own, such as its heap and stacks |
+| `rss_file_bytes` | uint64 | Resident pages of files it mapped, such as its code |
+| `rss_shmem_bytes` | uint64 | Resident shared memory. The three add up to its resident memory, which counts pages shared with other processes in each of them |
+| `swap_bytes` | uint64 | Its own memory the kernel moved out to swap |
+| `peak_rss_bytes` | uint64 | The most it had resident since it started, or last exec'd, as the kernel tracks it: between readings too |
 
 ## Symbols
 

@@ -45,6 +45,9 @@ pub(super) struct Input<'a> {
     /// When perf started sampling a process uhr attached to, on
     /// CLOCK_MONOTONIC.
     pub attached_ns: Option<u64>,
+    /// When the first and last memory readings were taken, on
+    /// CLOCK_MONOTONIC.
+    pub memory_span: Option<(u64, u64)>,
     pub perf_version: String,
     pub requested_frequency_hz: u64,
     pub max_stack_depth: u32,
@@ -307,6 +310,12 @@ pub(super) fn convert(input: Input) -> Result<(Recording, Option<EbpfStacks>)> {
     if let Some(attached) = input.attached_ns {
         state.start_ns = Some(state.start_ns.map_or(attached, |start| start.min(attached)));
     }
+    // Before the threads' times off CPU are closed at the end, so they
+    // still add up to the threads' lives.
+    if let Some((first, last)) = input.memory_span {
+        state.start_ns = Some(state.start_ns.map_or(first, |start| start.min(first)));
+        state.end_ns = Some(state.end_ns.map_or(last, |end| end.max(last)));
+    }
     state.attached_ns = input.attached_ns;
     state.finish_off_cpu();
 
@@ -439,6 +448,7 @@ pub(super) fn convert(input: Input) -> Result<(Recording, Option<EbpfStacks>)> {
         jit_symbols: Vec::new(),
         interpreted_code: state.interpreted_code,
         syscall_calls: Vec::new(),
+        memory: Vec::new(),
     };
     Ok((recording, ebpf_stacks))
 }

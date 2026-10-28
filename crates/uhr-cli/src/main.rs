@@ -21,7 +21,7 @@ use uhr_core::filter::Filter;
 use uhr_core::flamegraph::{self, FlameGraph};
 use uhr_core::functions::Function;
 use uhr_core::metric::Metric;
-use uhr_core::overview::{self, CPUTime, Overview};
+use uhr_core::overview::{self, CPUTime, Memory, Overview};
 use uhr_core::query::{
     self, FunctionRow, GroupBy, Latency, ModuleRow, Query, QueryResult, Rows, SyscallRow,
 };
@@ -57,10 +57,12 @@ enum Command {
     /// Resolve function names in a recording against the files on this machine
     Symbolize { recording: PathBuf },
     /// Show CPU time by mode and time off CPU, by process and thread, against
-    /// time alive: is it computing or waiting?
+    /// time alive: is it computing or waiting? And how much memory each
+    /// process had
     Overview {
         recording: PathBuf,
-        /// Processes and threads to print
+        /// Processes and threads to print, by CPU time, and processes by
+        /// memory
         #[arg(long, default_value_t = 20)]
         top: usize,
         #[arg(long)]
@@ -172,6 +174,10 @@ struct RecordArgs {
     /// CAP_PERFMON
     #[arg(long)]
     no_syscalls: bool,
+    /// Don't read how much memory the target's processes have, which uhr
+    /// does from /proc every 100 ms
+    #[arg(long)]
+    no_memory: bool,
     /// What samples CPU time. By default uhr's eBPF programs do, when uhr
     /// may load them, and perf does otherwise
     #[arg(long, value_enum)]
@@ -496,6 +502,7 @@ fn run_record(args: RecordArgs) -> Result<ExitCode> {
         off_cpu: !args.no_off_cpu,
         runtime_support: !args.no_runtime_support,
         syscalls: !args.no_syscalls,
+        memory: !args.no_memory,
         sampler: args.sampler.map(|sampler| match sampler {
             SamplerArg::Perf => Sampler::Perf,
             SamplerArg::Ebpf => Sampler::Ebpf,
@@ -676,9 +683,55 @@ fn write_overview(out: &mut impl Write, result: &Overview) -> io::Result<()> {
             result.threads_omitted
         )?;
     }
+    if let Some(memory) = &result.memory {
+        write_memory(out, memory)?;
+    }
 
     writeln!(out, "\ncoverage")?;
     write_coverage(out, &result.coverage)
+}
+
+fn write_memory(out: &mut impl Write, memory: &Memory) -> io::Result<()> {
+    writeln!(
+        out,
+        "\nmemory, read every {} ms: resident at the last reading, its change since the first, \
+         the most of any reading, and the kernel's peak",
+        memory.interval_ns / 1_000_000
+    )?;
+    writeln!(
+        out,
+        "{:>10} {:>11} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>9}  name",
+        "rss", "change", "max", "peak", "anon", "file", "shmem", "swap", "pid"
+    )?;
+    for process in &memory.processes {
+        let (first, last) = (&process.first, &process.last);
+        let change = match last.rss_bytes.checked_sub(first.rss_bytes) {
+            Some(grown) => format!("+{}", bytes(grown)),
+            None => format!("-{}", bytes(first.rss_bytes - last.rss_bytes)),
+        };
+        writeln!(
+            out,
+            "{:>10} {:>11} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>9}  {}",
+            bytes(last.rss_bytes),
+            change,
+            bytes(process.max.rss_bytes),
+            bytes(last.peak_rss_bytes),
+            bytes(last.rss_anon_bytes),
+            bytes(last.rss_file_bytes),
+            bytes(last.rss_shmem_bytes),
+            bytes(last.swap_bytes),
+            process.pid,
+            process.name.as_deref().unwrap_or("<unnamed>"),
+        )?;
+    }
+    if memory.processes_omitted > 0 {
+        writeln!(
+            out,
+            "({} more processes, raise --top to see them)",
+            memory.processes_omitted
+        )?;
+    }
+    Ok(())
 }
 
 /// The share of a row's CPU time spent in the kernel.
@@ -1212,6 +1265,20 @@ fn describe_filter(filter: &Filter) -> String {
 
 fn seconds(ns: u64) -> String {
     format!("{:.3}s", ns as f64 / 1e9)
+}
+
+fn bytes(n: u64) -> String {
+    let units = ["KiB", "MiB", "GiB", "TiB"];
+    if n < 1024 {
+        return format!("{n} B");
+    }
+    let mut value = n as f64 / 1024.0;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < units.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    format!("{value:.1} {}", units[unit])
 }
 
 fn function_name(function: &Function) -> String {

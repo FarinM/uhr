@@ -8,6 +8,7 @@ pub mod ebpf;
 mod interpreters;
 pub mod kallsyms;
 pub mod launch;
+mod memory;
 pub mod perf;
 mod perf_map;
 mod procfs;

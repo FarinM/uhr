@@ -1,5 +1,7 @@
 use uhr_core::filter::Filter;
-use uhr_core::overview::{OffCPUTime, Overview, ThreadRow, Window, run};
+use uhr_core::overview::{
+    Memory, MemoryRow, MemoryUsage, OffCPUTime, Overview, ThreadRow, Window, run,
+};
 use uhr_core::recording::*;
 
 fn thread(tid: u32, start_ns: Option<u64>, end_ns: Option<u64>) -> Thread {
@@ -140,6 +142,7 @@ fn recording() -> Recording {
         jit_symbols: Vec::new(),
         interpreted_code: Vec::new(),
         syscall_calls: Vec::new(),
+        memory: Vec::new(),
     }
 }
 
@@ -613,4 +616,158 @@ fn reports_cut_rows() {
     assert_eq!(result.threads_omitted, 3);
     assert_eq!(result.processes.len(), 2);
     assert_eq!(result.processes_omitted, 0);
+}
+
+/// Adds memory read by procfs: process 1 growing to its most at 3000, then
+/// shrinking; process 7 small; and pid 9 used by two processes, one before
+/// 5000 and one after.
+fn with_memory(mut recording: Recording) -> Recording {
+    recording.manifest.streams.push(Stream {
+        id: "procfs".into(),
+        collector: Collector::Procfs { interval_ns: 1_000 },
+        signals: vec![Signal::ResidentMemory],
+        missing_signals: Vec::new(),
+        coverage: StreamCoverage {
+            lost_events: 0,
+            stacks: None,
+            overhead_ns: Some(10),
+            known_biases: Vec::new(),
+        },
+    });
+    for (start_ns, end_ns) in [(Some(2_000), Some(4_000)), (Some(6_000), None)] {
+        recording.threads.push(Thread {
+            pid: 9,
+            tid: 9,
+            parent_pid: Some(1),
+            parent_tid: Some(1),
+            start_ns,
+            end_ns,
+        });
+    }
+    let reading = |time_ns, pid, rss_anon_bytes, peak_rss_bytes| MemoryReading {
+        time_ns,
+        pid,
+        rss_anon_bytes,
+        rss_file_bytes: 10,
+        rss_shmem_bytes: 1,
+        swap_bytes: 0,
+        peak_rss_bytes,
+    };
+    recording.memory = vec![
+        reading(1_000, 1, 100, 111),
+        reading(3_000, 9, 20, 31),
+        reading(3_000, 1, 400, 411),
+        reading(6_000, 1, 300, 450),
+        reading(7_000, 9, 30, 41),
+        reading(10_000, 1, 250, 450),
+        reading(10_000, 7, 50, 61),
+    ];
+    recording
+}
+
+fn memory_of(memory: &Memory, pid: u32) -> Vec<&MemoryRow> {
+    memory.processes.iter().filter(|p| p.pid == pid).collect()
+}
+
+#[test]
+fn reads_each_process_memory_at_its_first_last_and_largest_reading() {
+    let result = overview(&with_memory(recording()), Filter::default());
+    let memory = result.memory.unwrap();
+    assert_eq!(memory.interval_ns, 1_000);
+    let order: Vec<u32> = memory.processes.iter().map(|p| p.pid).collect();
+    assert_eq!(order, [1, 7, 9, 9]);
+    let app = memory_of(&memory, 1)[0];
+    assert_eq!(app.name.as_deref(), Some("app"));
+    assert_eq!(app.readings, 4);
+    assert_eq!((app.first.time_ns, app.first.rss_bytes), (0, 111));
+    assert_eq!((app.max.time_ns, app.max.rss_bytes), (2_000, 411));
+    assert_eq!(
+        app.last,
+        MemoryUsage {
+            time_ns: 9_000,
+            rss_bytes: 261,
+            rss_anon_bytes: 250,
+            rss_file_bytes: 10,
+            rss_shmem_bytes: 1,
+            swap_bytes: 0,
+            peak_rss_bytes: 450,
+        }
+    );
+    assert!(
+        result
+            .coverage
+            .unknown
+            .iter()
+            .any(|u| u.starts_with("which code uses the memory")),
+        "{:?}",
+        result.coverage.unknown
+    );
+}
+
+#[test]
+fn gives_each_process_with_a_reused_pid_its_own_memory() {
+    let memory = overview(&with_memory(recording()), Filter::default())
+        .memory
+        .unwrap();
+    let reused: Vec<(u64, u64)> = memory_of(&memory, 9)
+        .iter()
+        .map(|p| (p.readings, p.last.rss_anon_bytes))
+        .collect();
+    assert_eq!(reused, [(1, 30), (1, 20)]);
+}
+
+#[test]
+fn keeps_the_memory_readings_of_the_processes_and_time_range() {
+    let filter = Filter {
+        pids: vec![1],
+        from_ns: Some(2_000),
+        to_ns: Some(9_000),
+        ..Filter::default()
+    };
+    let memory = overview(&with_memory(recording()), filter).memory.unwrap();
+    assert_eq!(memory.processes.len(), 1);
+    let app = &memory.processes[0];
+    assert_eq!(app.readings, 2);
+    assert_eq!((app.first.time_ns, app.last.time_ns), (2_000, 5_000));
+}
+
+#[test]
+fn cuts_memory_rows_at_top() {
+    let result = run(&with_memory(recording()), None, &Filter::default(), 2).unwrap();
+    let memory = result.memory.unwrap();
+    assert_eq!(memory.processes.len(), 2);
+    assert_eq!(memory.processes_omitted, 2);
+}
+
+#[test]
+fn leaves_memory_out_for_a_filter_by_thread() {
+    let filter = Filter {
+        tids: vec![2],
+        ..Filter::default()
+    };
+    let result = overview(&with_memory(recording()), filter);
+    assert!(result.memory.is_none());
+    assert!(
+        result
+            .coverage
+            .unknown
+            .iter()
+            .any(|u| u.contains("read per process")),
+        "{:?}",
+        result.coverage.unknown
+    );
+}
+
+#[test]
+fn says_when_memory_was_not_read() {
+    let result = overview(&recording(), Filter::default());
+    assert!(result.memory.is_none());
+    assert!(
+        result
+            .coverage
+            .unknown
+            .contains(&"memory use: it was not read".to_owned()),
+        "{:?}",
+        result.coverage.unknown
+    );
 }

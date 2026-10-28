@@ -75,6 +75,7 @@ fn recording() -> Recording {
         jit_symbols: Vec::new(),
         interpreted_code: Vec::new(),
         syscall_calls: Vec::new(),
+        memory: Vec::new(),
     }
 }
 

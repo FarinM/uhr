@@ -249,6 +249,7 @@ fn probe_recording(perf: &Path) -> Result<bool, String> {
         off_cpu: true,
         runtime_support: false,
         syscalls: false,
+        memory: false,
         sampler: Some(Sampler::Perf),
     };
     let held = Held::spawn(&["true".into()], &[]).map_err(|e| format!("starting `true`: {e}"))?;

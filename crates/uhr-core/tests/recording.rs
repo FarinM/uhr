@@ -26,47 +26,63 @@ fn example() -> Recording {
             clock: Clock::Monotonic,
             start_ns: Some(1_000),
             end_ns: Some(9_000),
-            streams: vec![Stream {
-                id: "perf".into(),
-                collector: Collector::Perf {
-                    version: "6.8.12".into(),
-                    sampling: Some(Sampling {
-                        event: "cpu-clock".into(),
-                        frequency_hz: 999,
-                        requested_frequency_hz: 999,
-                    }),
-                    context_switches: true,
+            streams: vec![
+                Stream {
+                    id: "perf".into(),
+                    collector: Collector::Perf {
+                        version: "6.8.12".into(),
+                        sampling: Some(Sampling {
+                            event: "cpu-clock".into(),
+                            frequency_hz: 999,
+                            requested_frequency_hz: 999,
+                        }),
+                        context_switches: true,
+                    },
+                    signals: vec![
+                        Signal::UserCPUSamples,
+                        Signal::UserStacks,
+                        Signal::OffCPUTime,
+                        Signal::OffCPUStacks,
+                    ],
+                    missing_signals: [Signal::KernelCPUSamples, Signal::KernelStacks]
+                        .map(|signal| MissingSignal {
+                            signal,
+                            reason: "perf_event_paranoid is 2".into(),
+                        })
+                        .to_vec(),
+                    coverage: StreamCoverage {
+                        lost_events: 0,
+                        stacks: Some(StackCoverage {
+                            unwinding: Unwinding::FramePointers,
+                            stack_copy_bytes: None,
+                            samples: 2,
+                            off_cpu_intervals: Some(2),
+                            throttle_events: Some(0),
+                            max_stack_depth: 127,
+                            stacks_at_stack_limit: 0,
+                            stacks_cut_at_stack_copy: None,
+                            stacks_not_unwound: None,
+                            interpreters: Vec::new(),
+                        }),
+                        overhead_ns: None,
+                        known_biases: vec!["example bias".into()],
+                    },
                 },
-                signals: vec![
-                    Signal::UserCPUSamples,
-                    Signal::UserStacks,
-                    Signal::OffCPUTime,
-                    Signal::OffCPUStacks,
-                ],
-                missing_signals: [Signal::KernelCPUSamples, Signal::KernelStacks]
-                    .map(|signal| MissingSignal {
-                        signal,
-                        reason: "perf_event_paranoid is 2".into(),
-                    })
-                    .to_vec(),
-                coverage: StreamCoverage {
-                    lost_events: 0,
-                    stacks: Some(StackCoverage {
-                        unwinding: Unwinding::FramePointers,
-                        stack_copy_bytes: None,
-                        samples: 2,
-                        off_cpu_intervals: Some(2),
-                        throttle_events: Some(0),
-                        max_stack_depth: 127,
-                        stacks_at_stack_limit: 0,
-                        stacks_cut_at_stack_copy: None,
-                        stacks_not_unwound: None,
-                        interpreters: Vec::new(),
-                    }),
-                    overhead_ns: None,
-                    known_biases: vec!["example bias".into()],
+                Stream {
+                    id: "procfs".into(),
+                    collector: Collector::Procfs {
+                        interval_ns: 100_000_000,
+                    },
+                    signals: vec![Signal::ResidentMemory],
+                    missing_signals: Vec::new(),
+                    coverage: StreamCoverage {
+                        lost_events: 0,
+                        stacks: None,
+                        overhead_ns: Some(250_000),
+                        known_biases: Vec::new(),
+                    },
                 },
-            }],
+            ],
             missing_signals: vec![MissingSignal {
                 signal: Signal::SyscallCalls,
                 reason: "loading eBPF needs root".into(),
@@ -244,6 +260,26 @@ fn example() -> Recording {
                 unfinished_ns: Some(7_000),
             },
         ],
+        memory: vec![
+            MemoryReading {
+                time_ns: 1_000,
+                pid: 7,
+                rss_anon_bytes: 4_096,
+                rss_file_bytes: 8_192,
+                rss_shmem_bytes: 0,
+                swap_bytes: 0,
+                peak_rss_bytes: 12_288,
+            },
+            MemoryReading {
+                time_ns: 2_000,
+                pid: 7,
+                rss_anon_bytes: 1 << 30,
+                rss_file_bytes: 8_192,
+                rss_shmem_bytes: 4_096,
+                swap_bytes: 1 << 20,
+                peak_rss_bytes: (1 << 30) + 12_288,
+            },
+        ],
     }
 }
 
@@ -366,6 +402,15 @@ fn rejects_overlapping_jit_symbols() {
         }
         error => panic!("{error}"),
     }
+}
+
+#[test]
+fn will_not_write_memory_readings_out_of_order() {
+    let dir = scratch("memory_out_of_order");
+    let mut recording = example();
+    recording.memory.swap(0, 1);
+    let error = recording.write(&dir).unwrap_err();
+    assert!(error.to_string().contains("memory reading 1"), "{error}");
 }
 
 #[test]

@@ -7,14 +7,16 @@ use crate::coverage::Coverage;
 use crate::filter::{self, Filter};
 use crate::functions::Functions;
 use crate::recording::{
-    self, Exit, Mode, OffCPUInterval, Recording, Sample, Signal, Thread, ThreadState,
+    self, Collector, Exit, MemoryReading, Mode, OffCPUInterval, Recording, Sample, Signal, Thread,
+    ThreadState,
 };
 use crate::symbols::Symbols;
 use crate::threads::ThreadNames;
 
 /// Time level 0: how much CPU time each process and thread used, in which
 /// mode, and how long it waited off CPU, against how long it was alive. It
-/// tells computing from waiting.
+/// tells computing from waiting. And memory level 0: how much memory each
+/// process had.
 #[derive(Debug, Clone, Serialize)]
 pub struct Overview {
     pub command: Vec<String>,
@@ -43,7 +45,52 @@ pub struct Overview {
     pub threads: Vec<ThreadRow>,
     /// Rows cut by `top`.
     pub threads_omitted: usize,
+    /// `None` if memory was not read, or for a filter it can't take: it is
+    /// read per process, so only filters by process and time apply.
+    pub memory: Option<Memory>,
     pub coverage: Coverage,
+}
+
+/// How much memory each process had, from its readings in the window.
+#[derive(Debug, Clone, Serialize)]
+pub struct Memory {
+    /// How often it was read.
+    pub interval_ns: u64,
+    /// Sorted by resident memory at the last reading.
+    pub processes: Vec<MemoryRow>,
+    /// Rows cut by `top`.
+    pub processes_omitted: usize,
+}
+
+/// The readings of one process lifetime in the window.
+#[derive(Debug, Clone, Serialize)]
+pub struct MemoryRow {
+    pub pid: u32,
+    /// Its main thread's name at the last reading.
+    pub name: Option<String>,
+    pub readings: u64,
+    pub first: MemoryUsage,
+    pub last: MemoryUsage,
+    /// The reading with the most resident.
+    pub max: MemoryUsage,
+}
+
+/// One reading of a process's memory.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MemoryUsage {
+    pub time_ns: u64,
+    /// Resident in RAM, made of the next three: memory of the process's
+    /// own, such as its heap and stacks, pages of files it mapped, and
+    /// shared memory.
+    pub rss_bytes: u64,
+    pub rss_anon_bytes: u64,
+    pub rss_file_bytes: u64,
+    pub rss_shmem_bytes: u64,
+    /// Its own memory the kernel moved out to swap.
+    pub swap_bytes: u64,
+    /// The most it had resident since it started, or last exec'd, as the
+    /// kernel tracked it: between readings too, and before the capture.
+    pub peak_rss_bytes: u64,
 }
 
 /// The end is exclusive when the time filter sets it, like the filter.
@@ -296,6 +343,7 @@ pub fn run(
     let threads_omitted = threads.len().saturating_sub(top);
     threads.truncate(top);
 
+    let memory = memory(recording, filter, &lifetimes, &names, base, top);
     let mut coverage = Coverage::of(recording);
     if !switches_recorded {
         coverage.unknown.push(
@@ -304,9 +352,21 @@ pub fn run(
                 .into(),
         );
     }
-    coverage
-        .unknown
-        .push("memory use: no memory signal was recorded".into());
+    let memory_read = manifest
+        .streams
+        .iter()
+        .any(|s| s.signals.contains(&Signal::ResidentMemory));
+    coverage.unknown.push(
+        match &memory {
+            Some(_) => "which code uses the memory: no allocations or page faults were recorded",
+            None if !memory_read => "memory use: it was not read",
+            None => {
+                "memory use: it is read per process, so a filter by thread, mode, stack or syscall \
+             leaves it out"
+            }
+        }
+        .into(),
+    );
     for stream in &manifest.streams {
         let Some(sampling) = stream.collector.sampling() else {
             continue;
@@ -334,7 +394,76 @@ pub fn run(
         processes_omitted,
         threads,
         threads_omitted,
+        memory,
         coverage,
+    })
+}
+
+/// The memory of each process lifetime, from the readings `filter` keeps.
+fn memory(
+    recording: &Recording,
+    filter: &Filter,
+    lifetimes: &Lifetimes,
+    names: &ThreadNames,
+    base: u64,
+    top: usize,
+) -> Option<Memory> {
+    let interval_ns = recording
+        .manifest
+        .streams
+        .iter()
+        .filter(|s| s.signals.contains(&Signal::ResidentMemory))
+        .find_map(|s| match s.collector {
+            Collector::Procfs { interval_ns } => Some(interval_ns),
+            _ => None,
+        })?;
+    let mut lives: HashMap<(u32, Option<usize>), Vec<&MemoryReading>> = HashMap::new();
+    for reading in filter.memory(recording)? {
+        let life = lifetimes.at(reading.pid, reading.pid, Some(reading.time_ns));
+        lives.entry((reading.pid, life)).or_default().push(reading);
+    }
+    let usage = |reading: &MemoryReading| MemoryUsage {
+        time_ns: reading.time_ns.saturating_sub(base),
+        rss_bytes: reading.rss_bytes(),
+        rss_anon_bytes: reading.rss_anon_bytes,
+        rss_file_bytes: reading.rss_file_bytes,
+        rss_shmem_bytes: reading.rss_shmem_bytes,
+        swap_bytes: reading.swap_bytes,
+        peak_rss_bytes: reading.peak_rss_bytes,
+    };
+    let mut processes: Vec<MemoryRow> = lives
+        .into_iter()
+        .map(|((pid, _), readings)| {
+            // In time order, as the recording keeps them.
+            let (first, last) = (readings[0], readings[readings.len() - 1]);
+            let max = readings
+                .iter()
+                .copied()
+                .rev()
+                .max_by_key(|r| r.rss_bytes())
+                .unwrap_or(last);
+            MemoryRow {
+                pid,
+                name: names.at(pid, pid, last.time_ns).map(str::to_owned),
+                readings: readings.len() as u64,
+                first: usage(first),
+                last: usage(last),
+                max: usage(max),
+            }
+        })
+        .collect();
+    processes.sort_by(|a, b| {
+        b.last
+            .rss_bytes
+            .cmp(&a.last.rss_bytes)
+            .then((a.pid, a.first.time_ns).cmp(&(b.pid, b.first.time_ns)))
+    });
+    let processes_omitted = processes.len().saturating_sub(top);
+    processes.truncate(top);
+    Some(Memory {
+        interval_ns,
+        processes,
+        processes_omitted,
     })
 }
 

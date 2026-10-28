@@ -65,7 +65,7 @@ asks otherwise. Deeper signals are added when the question needs them.
 | Signal | Answers | Linux candidates | macOS candidates | Windows candidates |
 |---|---|---|---|---|
 | Per-thread CPU time, user and kernel | time level 0, cheap | `/proc/<pid>/task/<tid>/stat` | thread info APIs | `GetThreadTimes` |
-| Resident memory by category | memory level 0 | `smaps_rollup`, `smaps` | `task_info`, `vmmap` | working set APIs |
+| Resident memory by category | memory level 0 | `status`, `smaps_rollup`, `smaps` | `task_info`, `vmmap` | working set APIs |
 | On-CPU stack sampling, user and kernel | time levels 2-5 | perf, eBPF | samply, xctrace Time Profiler | ETW, samply |
 | Off-CPU and thread state | time level 0, locks, I/O | perf context switches, eBPF on scheduler tracepoints and wakeups | xctrace System Trace | ETW context switches |
 | Syscalls | time level 1 | eBPF on `raw_syscalls` tracepoints, `perf trace` | xctrace System Trace | ETW syscall events |
@@ -233,6 +233,48 @@ from tracepoints, such as wakeups and syscall latency.
   second.
 - Building them needs nightly Rust with `rust-src`, and `bpf-linker`.
   Without those uhr builds without them.
+
+### Memory on Linux
+
+uhr reads each of the target's processes' `/proc/<pid>/status` every 100
+ms, unless `uhr record --no-memory`: how much it has resident, split into
+its own memory, pages of files and shared memory, how much it has in swap,
+and the most it has had resident, which the kernel tracks between readings
+too. These are counts the kernel keeps, so reading them walks no page
+tables and needs no privileges beyond reading the files, unlike `smaps`,
+which takes the process's memory lock and costs by its size.
+
+- Reading starts when the capture does: for a launched target once it has
+  exec'd, so the first reading is of its own program, not of uhr's copy
+  held before. A last reading is taken when the capture ends.
+- uhr knows a process by its pid and when it started, and checks the start
+  after each reading, so a pid given to a later process is not taken for
+  the earlier one. It holds no file open for a process, so however many
+  processes the host runs, they can't use up uhr's files.
+- The files are read as bytes: a process's name in them is any bytes, cut
+  at 15 even within a character.
+- A process whose main thread has ended, while others still run, is read
+  through one of those: its own file describes the main thread, which no
+  longer has memory.
+- It follows the processes the target starts from then on, as perf does,
+  by their parent. The kernel gives out pids in turn, and `/proc/loadavg`
+  says the last, so at each reading uhr probes the pids given out since
+  the one before, and lists `/proc` only when there are more than 128. The
+  kernel skips pids still in use, so once they wrap around, those given out
+  since can include older processes, which uhr leaves out by their start.
+  A forking process gets its pid before it shows in `/proc`, so a pid
+  without a process is probed again at the next reading, and a listing is
+  taken again too. Probing costs by the processes and threads the host
+  starts, listing by those it runs, and reading the children of each of
+  the target's threads by its threads. On a 2,000-thread process, on a
+  host running 415 processes, reading the children took 6% of a CPU,
+  listing 0.8% and probing 0.1%.
+- A process that ends between readings, or whose parent ends before uhr
+  finds it, is left out, and so is one whose fork takes longer than a
+  reading to show it in `/proc`. Whether a new process uhr can't read is
+  the target's is unknown, and the recording counts those.
+- The stream's overhead is uhr's own CPU time reading `/proc`, which the
+  kernel spends on the target's counts but not in the target.
 
 ## Cost control
 

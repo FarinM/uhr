@@ -94,6 +94,11 @@ pub enum Collector {
         programs: Vec<String>,
         sampling: Option<Sampling>,
     },
+    /// uhr reading the processes' files in `/proc`.
+    Procfs {
+        /// How often it read them.
+        interval_ns: u64,
+    },
 }
 
 impl Collector {
@@ -102,6 +107,7 @@ impl Collector {
             Collector::Perf { sampling, .. } | Collector::Ebpf { sampling, .. } => {
                 sampling.as_ref()
             }
+            Collector::Procfs { .. } => None,
         }
     }
 }
@@ -149,6 +155,9 @@ pub enum Signal {
     /// took.
     #[serde(rename = "syscall_calls")]
     SyscallCalls,
+    /// How much memory each process had resident and in swap, over time.
+    #[serde(rename = "resident_memory")]
+    ResidentMemory,
 }
 
 impl Signal {
@@ -161,6 +170,7 @@ impl Signal {
             Signal::OffCPUTime => "off_cpu_time",
             Signal::OffCPUStacks => "off_cpu_stacks",
             Signal::SyscallCalls => "syscall_calls",
+            Signal::ResidentMemory => "resident_memory",
         }
     }
 }

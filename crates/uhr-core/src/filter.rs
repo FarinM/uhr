@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use serde::Serialize;
 
 use crate::functions::{self, Functions};
-use crate::recording::{KernelSymbols, Mode, OffCPUInterval, Recording, Sample};
+use crate::recording::{KernelSymbols, MemoryReading, Mode, OffCPUInterval, Recording, Sample};
 use crate::syscalls::{self, InSyscall};
 use crate::threads::ThreadNames;
 
@@ -106,6 +106,26 @@ impl Filter {
                 });
             passes.then(|| (interval, end - start))
         }))
+    }
+
+    /// The memory readings that pass. `None` for a filter they can't take:
+    /// memory is read per process, not per thread, mode or stack.
+    pub(crate) fn memory<'a>(
+        &'a self,
+        recording: &'a Recording,
+    ) -> Option<impl Iterator<Item = &'a MemoryReading> + 'a> {
+        let per_process = self.tids.is_empty()
+            && self.thread_names.is_empty()
+            && self.modes.is_empty()
+            && self.under.is_empty()
+            && self.syscalls.is_empty();
+        let start_ns = recording.manifest.start_ns;
+        per_process.then(|| {
+            recording.memory.iter().filter(move |reading| {
+                (self.pids.is_empty() || self.pids.contains(&reading.pid))
+                    && self.in_time_range(reading.time_ns, start_ns)
+            })
+        })
     }
 
     /// Whether each stack passes `under` and `syscalls`. `None` without
