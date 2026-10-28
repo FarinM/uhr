@@ -210,3 +210,97 @@ fn samples_no_page_faults_when_told_not_to() {
     let stderr = String::from_utf8_lossy(&query.stderr);
     assert!(stderr.contains("--no-page-faults"), "{stderr}");
 }
+
+fn faults_by_region(recording: &str) -> Value {
+    json(&[
+        "query",
+        recording,
+        "--metric",
+        "page-faults",
+        "--group-by",
+        "region",
+    ])
+}
+
+/// The share of a recording's page faults in regions of `kind`.
+fn share_in(result: &Value, kind: &str) -> f64 {
+    let rows = result["rows"].as_array().unwrap();
+    rows.iter()
+        .filter(|row| row["kind"] == kind)
+        .map(|row| row["share"].as_f64().unwrap())
+        .sum()
+}
+
+#[test]
+fn tells_the_regions_a_program_grew_apart() {
+    let dir = scratch("page_faults_regions");
+    let program = dir.join("grow");
+    compile("grow", &program, "-O2");
+    let program = program.to_str().unwrap();
+    // Blocks of 8 MiB, which malloc maps on its own, and of 4 KiB, which
+    // it takes from the heap.
+    for (block, kind) in [("8192", "anonymous"), ("4", "heap")] {
+        let recording = dir.join(format!("rec-{block}"));
+        let rec = recording.to_str().unwrap();
+        uhr(&["record", "-o", rec, "--", program, "32", "0", "0", block]);
+        let result = faults_by_region(rec);
+        let share = share_in(&result, kind);
+        assert!(share > 0.9, "{}", result["rows"]);
+
+        let under = json(&[
+            "query",
+            rec,
+            "--metric",
+            "page-faults",
+            "--region",
+            kind,
+            "--group-by",
+            "function",
+        ]);
+        let kept = under["value"].as_f64().unwrap() / result["value"].as_f64().unwrap();
+        assert!((kept - share).abs() < 1e-9, "{kept} kept of {share}");
+        // malloc itself first touches each page of the heap it grows, as it
+        // writes where the next block starts.
+        if kind == "anonymous" {
+            let touch = row(&under, |row| {
+                let function = row["function"].as_str().unwrap_or_default();
+                function == "touch" || function.starts_with("touch.")
+            });
+            assert!(touch["self_share"].as_f64().unwrap() > 0.8, "{touch}");
+        }
+    }
+}
+
+#[test]
+fn says_only_page_faults_were_in_regions() {
+    let dir = scratch("page_faults_regions_of_time");
+    let program = dir.join("grow");
+    compile("grow", &program, "-O2");
+    let recording = dir.join("rec");
+    let rec = recording.to_str().unwrap();
+    let program = program.to_str().unwrap();
+    uhr(&[
+        "record",
+        "--no-symbolize",
+        "-o",
+        rec,
+        "--",
+        program,
+        "8",
+        "0",
+        "0",
+    ]);
+    for args in [
+        &["--group-by", "region"][..],
+        &["--group-by", "function", "--region", "heap"][..],
+    ] {
+        let query = Command::new(UHR)
+            .args(["query", rec])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(!query.status.success(), "{args:?}");
+        let stderr = String::from_utf8_lossy(&query.stderr);
+        assert!(stderr.contains("--metric page-faults"), "{stderr}");
+    }
+}

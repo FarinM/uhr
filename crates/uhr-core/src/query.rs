@@ -8,7 +8,8 @@ use crate::coverage::{Coverage, SymbolCoverage};
 use crate::filter::{self, Filter};
 use crate::functions::{Function, Functions, SourceLine};
 use crate::metric::{self, Metric, StackAmounts, Unit, stack_amounts};
-use crate::recording::{self, Origin, Recording};
+use crate::recording::{self, Origin, Recording, RegionKind, Signal};
+use crate::regions;
 use crate::symbols::Symbols;
 use crate::syscalls::{self, InSyscall};
 pub use crate::syscalls::{Counted, Latency};
@@ -24,6 +25,9 @@ pub enum GroupBy {
     /// The syscall the thread was in, from the kernel functions on its
     /// stack.
     Syscall,
+    /// The region of memory a page fault was in: its kind, and its file or
+    /// name.
+    Region,
 }
 
 #[derive(Debug, Clone)]
@@ -64,6 +68,8 @@ pub enum Rows {
     Modules(Vec<ModuleRow>),
     /// Sorted by amount.
     Syscalls(Vec<SyscallRow>),
+    /// Sorted by amount.
+    Regions(Vec<RegionRow>),
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -127,6 +133,20 @@ pub struct SyscallRow {
     pub calls: Option<Counted>,
 }
 
+/// The page faults in one kind of region, of one file or name.
+#[derive(Debug, Clone, Serialize)]
+pub struct RegionRow {
+    /// `None` for faults where no region recorded was then: one moved or
+    /// grown with mremap, which the kernel doesn't report, or one whose
+    /// report perf lost, or none at all.
+    pub kind: Option<RegionKind>,
+    /// The file mapped, or the region's name, as `[anon:name]`. `None` for
+    /// memory that maps no file and has no name, all of which is one row.
+    pub path: Option<String>,
+    pub value: u64,
+    pub share: f64,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct QueryCoverage {
     /// Share of the amount whose leaf frame has a name. Placeholders don't
@@ -154,6 +174,13 @@ pub enum Error {
     Filter(#[from] filter::Error),
     #[error(transparent)]
     Metric(#[from] metric::Error),
+    #[error("only page faults were in regions of memory: group them with --metric page-faults")]
+    RegionsOfPageFaults,
+    #[error(
+        "the recording has no regions of memory: perf records them when it samples page faults. \
+         Record without --no-page-faults"
+    )]
+    NoRegions,
 }
 
 pub fn query(dir: &Path, query: &Query) -> Result<QueryResult, Error> {
@@ -168,6 +195,18 @@ pub fn run(
     query: &Query,
 ) -> Result<QueryResult, Error> {
     query.metric.check(recording)?;
+    if query.group_by == GroupBy::Region {
+        if query.metric != Metric::PageFaults {
+            return Err(Error::RegionsOfPageFaults);
+        }
+        let read = recording.manifest.streams.iter();
+        if !read
+            .clone()
+            .any(|s| s.signals.contains(&Signal::MemoryRegions))
+        {
+            return Err(Error::NoRegions);
+        }
+    }
     let functions = Functions::new(recording, symbols);
     let amounts = stack_amounts(recording, &functions, &query.filter, query.metric)?;
     let value = amounts.total();
@@ -200,6 +239,9 @@ pub fn run(
             syscalls::counted(recording, &query.filter),
             &share,
         )),
+        GroupBy::Region => {
+            Rows::Regions(region_rows(recording, &functions, &query.filter, &share)?)
+        }
     };
     let rows_omitted = rows.truncate(query.top);
 
@@ -255,6 +297,7 @@ impl Rows {
             Rows::Functions(rows) => truncate(rows, top),
             Rows::Modules(rows) => truncate(rows, top),
             Rows::Syscalls(rows) => truncate(rows, top),
+            Rows::Regions(rows) => truncate(rows, top),
         }
     }
 }
@@ -446,6 +489,39 @@ fn syscall_rows(
             .then_with(|| a.own_programs.cmp(&b.own_programs))
     });
     rows
+}
+
+/// The page faults that pass `filter`, by the kind and file of the region
+/// each was in.
+fn region_rows(
+    recording: &Recording,
+    functions: &Functions,
+    filter: &Filter,
+    share: &impl Fn(u64) -> f64,
+) -> Result<Vec<RegionRow>, filter::Error> {
+    let in_regions = regions::of_faults(recording);
+    let mut faults: HashMap<(Option<RegionKind>, Option<&str>), u64> = HashMap::new();
+    for (at, sample) in filter.page_faults(recording, functions)? {
+        let region = in_regions[at].map(|row| &recording.regions[row as usize]);
+        let key = region.map_or((None, None), |r| (Some(r.kind), r.path.as_deref()));
+        *faults.entry(key).or_default() += sample.faults;
+    }
+    let mut rows: Vec<RegionRow> = faults
+        .into_iter()
+        .map(|((kind, path), value)| RegionRow {
+            kind,
+            path: path.map(str::to_owned),
+            value,
+            share: share(value),
+        })
+        .collect();
+    rows.sort_by(|a, b| {
+        b.value
+            .cmp(&a.value)
+            .then_with(|| a.kind.cmp(&b.kind))
+            .then_with(|| a.path.cmp(&b.path))
+    });
+    Ok(rows)
 }
 
 /// The self and total amount of each key. `keys` lists the keys of a

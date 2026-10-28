@@ -4,8 +4,9 @@ use serde::Serialize;
 
 use crate::functions::{self, Functions};
 use crate::recording::{
-    FaultSample, KernelSymbols, MemoryReading, Mode, OffCPUInterval, Recording, Sample,
+    FaultSample, KernelSymbols, MemoryReading, Mode, OffCPUInterval, Recording, RegionKind, Sample,
 };
+use crate::regions;
 use crate::syscalls::{self, InSyscall};
 use crate::threads::ThreadNames;
 
@@ -29,6 +30,10 @@ pub struct Filter {
     /// Syscalls by name, as `read`. A sample or off-CPU interval passes if
     /// its stack is in one of them.
     pub syscalls: Vec<String>,
+    /// Kinds of memory region. A page-fault sample passes if it was in one
+    /// of them. CPU samples and off-CPU time were in none, so any leaves
+    /// them out.
+    pub regions: Vec<RegionKind>,
     /// Offset from the recording start, inclusive. Off-CPU intervals are
     /// cut to the time range.
     pub from_ns: Option<u64>,
@@ -51,6 +56,11 @@ pub enum Error {
         if .known.is_empty() { "none".to_owned() } else { .known.join(", ") }
     )]
     NoSuchSyscall { name: String, known: Vec<String> },
+    #[error(
+        "only page faults were in regions of memory: filter by region in a query with --metric \
+         page-faults"
+    )]
+    RegionsOfPageFaults,
 }
 
 impl Filter {
@@ -66,42 +76,57 @@ impl Filter {
         recording: &'a Recording,
         functions: &Functions,
     ) -> Result<impl Iterator<Item = &'a Sample> + 'a, Error> {
-        self.taken(recording, functions, &recording.samples, |s| Taken {
+        // They were in no region of memory.
+        let samples = match self.regions.is_empty() {
+            true => &recording.samples[..],
+            false => &[],
+        };
+        let taken = self.taken(recording, functions, samples, |s| Taken {
             pid: s.pid,
             tid: s.tid,
             mode: s.mode,
             time_ns: s.time_ns,
             stack: s.stack,
-        })
+        })?;
+        Ok(taken.map(|(_, sample)| sample))
     }
 
-    /// The page-fault samples that pass. Fails as `samples` does.
+    /// The page-fault samples that pass, with their places in the
+    /// recording's. Fails as `samples` does.
     pub(crate) fn page_faults<'a>(
         &'a self,
         recording: &'a Recording,
         functions: &Functions,
-    ) -> Result<impl Iterator<Item = &'a FaultSample> + 'a, Error> {
-        self.taken(recording, functions, &recording.page_faults, |s| Taken {
+    ) -> Result<impl Iterator<Item = (usize, &'a FaultSample)> + 'a, Error> {
+        let in_regions = (!self.regions.is_empty()).then(|| regions::of_faults(recording));
+        let taken = self.taken(recording, functions, &recording.page_faults, |s| Taken {
             pid: s.pid,
             tid: s.tid,
             mode: s.mode,
             time_ns: s.time_ns,
             stack: s.stack,
-        })
+        })?;
+        Ok(taken.filter(move |&(at, _)| {
+            in_regions.as_ref().is_none_or(|in_regions| {
+                in_regions[at]
+                    .is_some_and(|row| self.regions.contains(&recording.regions[row as usize].kind))
+            })
+        }))
     }
 
-    /// What passes of `taken`, samples of threads on CPU, as `of` says.
+    /// What passes of `taken`, samples of threads on CPU, as `of` says, with
+    /// their places in it.
     fn taken<'a, T>(
         &'a self,
         recording: &'a Recording,
         functions: &Functions,
         taken: &'a [T],
         of: fn(&T) -> Taken,
-    ) -> Result<impl Iterator<Item = &'a T> + 'a, Error> {
+    ) -> Result<impl Iterator<Item = (usize, &'a T)> + 'a, Error> {
         let stacks = self.stacks(recording, functions)?;
         let mut names = (!self.thread_names.is_empty()).then(|| NameMatcher::new(recording));
         let start_ns = recording.manifest.start_ns;
-        Ok(taken.iter().filter(move |sample| {
+        Ok(taken.iter().enumerate().filter(move |(_, sample)| {
             let sample = of(sample);
             (self.pids.is_empty() || self.pids.contains(&sample.pid))
                 && (self.tids.is_empty() || self.tids.contains(&sample.tid))
@@ -130,6 +155,7 @@ impl Filter {
             let (start, end) =
                 range.map(|(from, to)| (interval.start_ns.max(from), interval.end_ns.min(to)))?;
             let passes = self.modes.is_empty()
+                && self.regions.is_empty()
                 && start < end
                 && (self.pids.is_empty() || self.pids.contains(&interval.pid))
                 && (self.tids.is_empty() || self.tids.contains(&interval.tid))
@@ -153,7 +179,8 @@ impl Filter {
             && self.thread_names.is_empty()
             && self.modes.is_empty()
             && self.under.is_empty()
-            && self.syscalls.is_empty();
+            && self.syscalls.is_empty()
+            && self.regions.is_empty();
         let start_ns = recording.manifest.start_ns;
         per_process.then(|| {
             recording.memory.iter().filter(move |reading| {

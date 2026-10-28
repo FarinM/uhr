@@ -3,8 +3,8 @@ use uhr_core::filter::{self, Filter};
 use uhr_core::functions;
 use uhr_core::metric::{self, Metric, Unit};
 use uhr_core::query::{
-    Counted, Error, FunctionRow, GroupBy, Latency, ModuleRow, Query, QueryResult, Rows, SyscallRow,
-    run,
+    Counted, Error, FunctionRow, GroupBy, Latency, ModuleRow, Query, QueryResult, RegionRow, Rows,
+    SyscallRow, run,
 };
 use uhr_core::recording::*;
 use uhr_core::symbols::{FrameName, InlineFrame, Source, SourceStatus, Symbols};
@@ -1789,4 +1789,117 @@ fn needs_page_faults_to_weigh_stacks_by_them() {
         Err(Error::Metric(metric::Error::NoPageFaults)) => {}
         other => panic!("{other:?}"),
     }
+}
+
+/// `with_page_faults`, with the regions perf recorded where they were: the
+/// heap from 2, and a file mapped over it at 3. So the first fault was in
+/// none, and each of the others in one.
+fn with_regions(mut recording: Recording) -> Recording {
+    let stream = recording.manifest.streams.last_mut().unwrap();
+    stream.signals.push(Signal::MemoryRegions);
+    let region = |kind, path: &str, time_ns, unmapped_ns| MemoryRegion {
+        pid: 1,
+        start: 0x5555_0000_0000,
+        end: 0x5555_0001_0000,
+        permissions: "rw-p".into(),
+        file_offset: 0,
+        path: Some(path.into()),
+        kind,
+        time_ns: Some(time_ns),
+        unmapped_ns,
+    };
+    recording.regions = vec![
+        region(RegionKind::Heap, "[heap]", 2, Some(3)),
+        region(RegionKind::File, "/data/table", 3, None),
+    ];
+    recording
+}
+
+fn by_region(filter: Filter) -> Query {
+    Query {
+        group_by: GroupBy::Region,
+        ..page_faults(filter)
+    }
+}
+
+fn region_rows(result: &QueryResult) -> Vec<(Option<RegionKind>, Option<&str>, u64)> {
+    let Rows::Regions(rows) = &result.rows else {
+        panic!("rows of another grouping: {:?}", result.rows)
+    };
+    rows.iter()
+        .map(|r: &RegionRow| (r.kind, r.path.as_deref(), r.value))
+        .collect()
+}
+
+#[test]
+fn groups_page_faults_by_the_region_they_were_in_then() {
+    let recording = with_regions(with_page_faults(recording()));
+    let result = run(&recording, Some(&symbols()), &by_region(Filter::default())).unwrap();
+    assert_eq!(
+        region_rows(&result),
+        [
+            (None, None, 64),
+            (Some(RegionKind::Heap), Some("[heap]"), 64),
+            (Some(RegionKind::File), Some("/data/table"), 64),
+        ]
+    );
+
+    let heap = Filter {
+        regions: vec![RegionKind::Heap],
+        ..Filter::default()
+    };
+    let result = run(&recording, Some(&symbols()), &page_faults(heap)).unwrap();
+    assert_eq!((result.samples, result.value), (1, 64));
+}
+
+#[test]
+fn finds_regions_only_of_page_faults() {
+    let recording = with_regions(with_page_faults(recording()));
+    let cpu = Query {
+        metric: Metric::OnCPU,
+        ..by_region(Filter::default())
+    };
+    match run(&recording, Some(&symbols()), &cpu) {
+        Err(Error::RegionsOfPageFaults) => {}
+        other => panic!("{other:?}"),
+    }
+    let in_heap = Query {
+        filter: Filter {
+            regions: vec![RegionKind::Heap],
+            ..Filter::default()
+        },
+        ..query(10)
+    };
+    match run(&recording, Some(&symbols()), &in_heap) {
+        Err(Error::Filter(filter::Error::RegionsOfPageFaults)) => {}
+        other => panic!("{other:?}"),
+    }
+
+    let unread = with_page_faults(self::recording());
+    match run(&unread, Some(&symbols()), &by_region(Filter::default())) {
+        Err(Error::NoRegions) => {}
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn leaves_out_the_counted_calls_for_a_region() {
+    let (recording, symbols) = with_counted_calls();
+    let recording = with_regions(with_page_faults(recording));
+    let by_syscall = |regions| Query {
+        group_by: GroupBy::Syscall,
+        ..page_faults(Filter {
+            regions,
+            ..Filter::default()
+        })
+    };
+    let result = run(&recording, Some(&symbols), &by_syscall(Vec::new())).unwrap();
+    assert!(counted_rows(&result).iter().any(|r| r.2.is_some()));
+    let result = run(
+        &recording,
+        Some(&symbols),
+        &by_syscall(vec![RegionKind::Heap]),
+    )
+    .unwrap();
+    assert!(counted_rows(&result).iter().all(|r| r.2.is_none()));
 }

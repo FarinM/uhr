@@ -106,7 +106,7 @@ pub(crate) fn stack_amounts(
         off_cpu_intervals: 0,
     };
     if metric == Metric::PageFaults {
-        for sample in filter.page_faults(recording, functions)? {
+        for (_, sample) in filter.page_faults(recording, functions)? {
             amounts.by_stack[sample.stack as usize] += sample.faults;
             if sample.mode == Mode::User {
                 amounts.user[sample.stack as usize] += sample.faults;
@@ -114,6 +114,9 @@ pub(crate) fn stack_amounts(
             amounts.samples += 1;
         }
         return Ok(amounts);
+    }
+    if !filter.regions.is_empty() {
+        return Err(filter::Error::RegionsOfPageFaults);
     }
     if metric != Metric::OffCPU {
         for sample in filter.samples(recording, functions)? {

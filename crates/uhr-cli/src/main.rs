@@ -23,9 +23,9 @@ use uhr_core::functions::Function;
 use uhr_core::metric::{Metric, Unit};
 use uhr_core::overview::{self, CPUTime, Memory, Overview};
 use uhr_core::query::{
-    self, FunctionRow, GroupBy, Latency, ModuleRow, Query, QueryResult, Rows, SyscallRow,
+    self, FunctionRow, GroupBy, Latency, ModuleRow, Query, QueryResult, RegionRow, Rows, SyscallRow,
 };
-use uhr_core::recording::{Exit, Mode};
+use uhr_core::recording::{Exit, Mode, RegionKind};
 use uhr_core::symbols;
 
 #[cfg(target_os = "linux")]
@@ -230,6 +230,9 @@ enum GroupByArg {
     Module,
     /// The syscall a thread was in, from the kernel functions on its stack
     Syscall,
+    /// The region of memory a page fault was in, as the heap or a file, with
+    /// --metric page-faults
+    Region,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -279,6 +282,10 @@ struct FilterArgs {
     /// Only samples in this syscall, by name, as in read
     #[arg(long = "syscall", value_name = "NAME")]
     syscalls: Vec<String>,
+    /// Only page faults in this kind of region of memory, with --metric
+    /// page-faults
+    #[arg(long = "region", value_name = "KIND", value_enum)]
+    regions: Vec<RegionArg>,
     /// Only samples from this offset into the recording on, such as 1.5s or
     /// 200ms
     #[arg(long, value_name = "OFFSET", value_parser = parse_offset)]
@@ -293,6 +300,42 @@ enum ModeArg {
     User,
     Kernel,
     Unknown,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum RegionArg {
+    /// Grown with brk, where malloc starts
+    Heap,
+    /// The main thread's
+    Stack,
+    /// The process's own memory that maps no file, as large allocations,
+    /// garbage-collected heaps and other threads' stacks
+    Anonymous,
+    /// Anonymous memory that runs code, as a JIT's
+    AnonymousCode,
+    /// Shared with other processes
+    Shared,
+    /// A file's code
+    Code,
+    /// The rest of a file mapped
+    File,
+    /// Mapped by the kernel into every process
+    Kernel,
+}
+
+impl From<RegionArg> for RegionKind {
+    fn from(region: RegionArg) -> Self {
+        match region {
+            RegionArg::Heap => RegionKind::Heap,
+            RegionArg::Stack => RegionKind::Stack,
+            RegionArg::Anonymous => RegionKind::Anonymous,
+            RegionArg::AnonymousCode => RegionKind::AnonymousCode,
+            RegionArg::Shared => RegionKind::Shared,
+            RegionArg::Code => RegionKind::Code,
+            RegionArg::File => RegionKind::File,
+            RegionArg::Kernel => RegionKind::Kernel,
+        }
+    }
 }
 
 impl FilterArgs {
@@ -317,6 +360,7 @@ impl FilterArgs {
                 .collect(),
             under: self.under,
             syscalls: self.syscalls,
+            regions: self.regions.into_iter().map(RegionKind::from).collect(),
             from_ns: self.from,
             to_ns: self.to,
         })
@@ -988,6 +1032,7 @@ fn run_query(
             GroupByArg::Line => GroupBy::Line,
             GroupByArg::Module => GroupBy::Module,
             GroupByArg::Syscall => GroupBy::Syscall,
+            GroupByArg::Region => GroupBy::Region,
         },
         metric,
         top,
@@ -1009,6 +1054,7 @@ fn write_query(out: &mut impl Write, result: &QueryResult) -> io::Result<()> {
         GroupBy::Line => "line",
         GroupBy::Module => "module",
         GroupBy::Syscall => "syscall",
+        GroupBy::Region => "region",
     };
     writeln!(
         out,
@@ -1027,6 +1073,7 @@ fn write_query(out: &mut impl Write, result: &QueryResult) -> io::Result<()> {
         Rows::Functions(rows) => write_function_rows(out, result.group_by == GroupBy::Line, rows)?,
         Rows::Modules(rows) => write_module_rows(out, rows)?,
         Rows::Syscalls(rows) => write_syscall_rows(out, rows, result.unit)?,
+        Rows::Regions(rows) => write_region_rows(out, rows)?,
     }
     if result.rows_omitted > 0 {
         writeln!(
@@ -1104,6 +1151,23 @@ fn write_module_rows(out: &mut impl Write, rows: &[ModuleRow]) -> io::Result<()>
             row.self_share * 100.0,
             row.total_share * 100.0,
             row.module.as_deref().unwrap_or(row.origin.as_str()),
+        )?;
+    }
+    Ok(())
+}
+
+fn write_region_rows(out: &mut impl Write, rows: &[RegionRow]) -> io::Result<()> {
+    writeln!(out, "{:>7}  region", "faults")?;
+    for row in rows {
+        let kind = row
+            .kind
+            .map_or("(unknown: no region recorded held it)", RegionKind::as_str);
+        let path = row.path.as_ref().map(|p| format!("  {p}"));
+        writeln!(
+            out,
+            "{:>6.1}%  {kind}{}",
+            row.share * 100.0,
+            path.unwrap_or_default()
         )?;
     }
     Ok(())
@@ -1294,6 +1358,12 @@ fn describe_filter(filter: &Filter) -> String {
             .syscalls
             .iter()
             .map(|syscall| format!("syscall {syscall}")),
+    );
+    parts.extend(
+        filter
+            .regions
+            .iter()
+            .map(|region| format!("region {}", region.as_str())),
     );
     if let Some(from) = filter.from_ns {
         parts.push(format!("from {}", seconds(from)));

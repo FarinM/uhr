@@ -9,6 +9,7 @@ pub mod overview;
 pub mod perf_map;
 pub mod query;
 pub mod recording;
+mod regions;
 pub mod runtimes;
 pub mod symbols;
 mod syscalls;

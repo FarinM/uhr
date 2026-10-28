@@ -52,7 +52,8 @@ first, the last and the one with the most resident, each with its split into
 the process's own memory, files and shared memory, its swap, and the most it
 had resident as the kernel tracked it, between readings too. Memory is read
 per process, so only filters by process and time apply to it, and a filter
-by thread, mode, stack or syscall leaves it out, as the result says.
+by thread, mode, stack or syscall leaves it out, as the result says. Only
+page faults have regions, so `overview` refuses a filter by region.
 
 `call_paths` takes a function by its id, or by a name only one function
 has, and returns two trees from it outward: its callers and its callees. Both
@@ -74,11 +75,16 @@ control character in a label is written as `\u` and four hex digits, as
 recordings write what is no character, so that it neither ends a frame of
 the folded stacks nor breaks the SVG.
 
-`query` groups by function, source line, module or syscall. A module is a
-binary or library, by build-id or by path without one, or the kernel or one
-of its modules. Its self time is time running its code, and its total time is
-time with it anywhere on the stack, which for the libc that starts most
-threads is nearly all of it.
+`query` groups by function, source line, module, syscall, or region of
+memory, which only page faults have: its kind, as the heap, anonymous
+memory, a file or code, and its file or name. A `region` filter keeps the
+page faults in a kind of region, so grouping them by function shows the
+code that grew the heap, say. Other metrics refuse it.
+
+A module is a binary or library, by build-id or by path without one, or the
+kernel or one of its modules. Its self time is time running its code, and
+its total time is time with it anywhere on the stack, which for the libc
+that starts most threads is nearly all of it.
 
 A stack's syscall is read from the kernel functions on it: the one the
 syscall entered, such as `__x64_sys_read` for `read`. That needs no tracing,
@@ -87,7 +93,7 @@ each call took. Where uhr's eBPF programs ran, each syscall's row also has
 its `calls`: how many returned, their time, the ranges the median and the
 99th percentile call fall in, and the calls still running at the end. They
 count whole threads over the whole capture, so a filter by time, mode,
-stack or thread name leaves them out. Where only the code every syscall
+stack, thread name or region leaves them out. Where only the code every syscall
 passes through is on the stack, as on the way back to user space, where
 threads are often preempted, the time is in a syscall, but which one is
 unknown. Time in uhr's own eBPF programs, which run as syscalls enter and

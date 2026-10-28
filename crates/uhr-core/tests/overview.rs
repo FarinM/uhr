@@ -1,6 +1,6 @@
-use uhr_core::filter::Filter;
+use uhr_core::filter::{self, Filter};
 use uhr_core::overview::{
-    Memory, MemoryRow, MemoryUsage, OffCPUTime, Overview, ThreadRow, Window, run,
+    Error, Memory, MemoryRow, MemoryUsage, OffCPUTime, Overview, ThreadRow, Window, run,
 };
 use uhr_core::recording::*;
 
@@ -774,4 +774,16 @@ fn says_when_memory_was_not_read() {
         "{:?}",
         result.coverage.unknown
     );
+}
+
+#[test]
+fn takes_no_filter_by_region() {
+    let filter = Filter {
+        regions: vec![RegionKind::Heap],
+        ..Filter::default()
+    };
+    match run(&with_memory(recording()), None, &filter, 10) {
+        Err(Error::Filter(filter::Error::RegionsOfPageFaults)) => {}
+        other => panic!("{other:?}"),
+    }
 }

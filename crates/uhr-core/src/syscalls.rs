@@ -197,7 +197,7 @@ fn table_name(function: &str) -> &str {
 /// What uhr's eBPF programs counted of each syscall, for the processes and
 /// threads `filter` keeps. `None` without them, or for a filter they can't
 /// take: they count each thread's calls over the whole capture, not by
-/// time, mode or stack.
+/// time, mode, stack or region of memory.
 pub(crate) fn counted(recording: &Recording, filter: &Filter) -> Option<BTreeMap<String, Counted>> {
     let streamed = recording
         .manifest
@@ -208,7 +208,8 @@ pub(crate) fn counted(recording: &Recording, filter: &Filter) -> Option<BTreeMap
         && filter.modes.is_empty()
         && filter.under.is_empty()
         && filter.from_ns.is_none()
-        && filter.to_ns.is_none();
+        && filter.to_ns.is_none()
+        && filter.regions.is_empty();
     if !streamed || !whole_threads {
         return None;
     }

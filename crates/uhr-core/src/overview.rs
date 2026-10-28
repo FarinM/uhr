@@ -207,6 +207,10 @@ pub fn run(
     filter: &Filter,
     top: usize,
 ) -> Result<Overview, Error> {
+    // It would show no time and no memory, as though none were.
+    if !filter.regions.is_empty() {
+        return Err(filter::Error::RegionsOfPageFaults.into());
+    }
     let manifest = &recording.manifest;
     let start = manifest.start_ns;
     let duration = start
