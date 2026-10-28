@@ -8,6 +8,8 @@ use std::fs::File;
 use std::io::{self, Read};
 use std::path::Path;
 
+use uhr_core::recording::RegionKind;
+
 /// Reads the file at `path` into `bytes`, which keeps its buffer across
 /// reads.
 pub(crate) fn read(path: impl AsRef<Path>, bytes: &mut Vec<u8>) -> io::Result<()> {
@@ -92,6 +94,82 @@ fn maps_line(line: &[u8]) -> Option<MapsLine> {
     })
 }
 
+/// What `smaps` says of a region: its line as `maps` has it, and how much
+/// of it is resident, and in swap, in bytes.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct SmapsRegion {
+    pub(crate) line: MapsLine,
+    pub(crate) rss: u64,
+    pub(crate) swap: u64,
+}
+
+/// The regions of a process's `smaps`: each line as in `maps`, followed by
+/// lines of its counts, as `Rss:  1234 kB`.
+pub(crate) fn smaps(smaps: &[u8]) -> Vec<SmapsRegion> {
+    let kb = |line: &[u8], name: &[u8]| {
+        let value = line.strip_prefix(name)?.strip_suffix(b" kB")?;
+        std::str::from_utf8(value).ok()?.trim().parse::<u64>().ok()
+    };
+    let mut regions: Vec<SmapsRegion> = Vec::new();
+    for line in smaps.split(|&b| b == b'\n') {
+        if let Some(region) = regions.last_mut() {
+            if let Some(rss) = kb(line, b"Rss:") {
+                region.rss = rss * 1024;
+                continue;
+            }
+            if let Some(swap) = kb(line, b"Swap:") {
+                region.swap = swap * 1024;
+                continue;
+            }
+        }
+        // A count is no line of `maps`, which starts with an address range.
+        if let Some(line) = maps_line(line) {
+            regions.push(SmapsRegion {
+                line,
+                rss: 0,
+                swap: 0,
+            });
+        }
+    }
+    regions
+}
+
+/// What a region of memory is, from its permissions and its path in
+/// `maps`, `None` for memory that maps no file and has no name.
+pub(crate) fn region_kind(permissions: &str, path: Option<&str>) -> RegionKind {
+    let shared = permissions.ends_with('s');
+    let code = permissions.as_bytes().get(2) == Some(&b'x');
+    let anonymous = || match (shared, code) {
+        (true, _) => RegionKind::Shared,
+        (false, true) => RegionKind::AnonymousCode,
+        (false, false) => RegionKind::Anonymous,
+    };
+    let Some(path) = path else {
+        return anonymous();
+    };
+    match path {
+        "[heap]" => RegionKind::Heap,
+        "[stack]" => RegionKind::Stack,
+        // As a process names it with PR_SET_VMA_ANON_NAME.
+        _ if path.starts_with("[anon:") => anonymous(),
+        _ if path.starts_with("[anon_shmem:") => RegionKind::Shared,
+        // The kernel's own, as [vdso], [vvar] and [vsyscall].
+        _ if path.starts_with('[') => RegionKind::Kernel,
+        // Memory in huge pages that maps no file, as MAP_HUGETLB gives.
+        _ if path.starts_with("/anon_hugepage") => anonymous(),
+        // Shared memory that is no file of the program's.
+        _ if shared
+            && ["/dev/zero", "/SYSV", "/memfd:", "/dev/shm/"]
+                .iter()
+                .any(|prefix| path.starts_with(prefix)) =>
+        {
+            RegionKind::Shared
+        }
+        _ if code => RegionKind::Code,
+        _ => RegionKind::File,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -148,5 +226,57 @@ mod tests {
         assert_eq!(lines[1].path.as_deref(), Some("[heap]"));
         assert_eq!(lines[2].path, None);
         assert_eq!(lines.len(), 3);
+    }
+
+    #[test]
+    fn reads_how_much_of_each_region_is_resident() {
+        let file = b"55d0e9a00000-55d0e9a21000 rw-p 00000000 00:00 0      [heap]\n\
+                     Size:                132 kB\n\
+                     Rss:                  84 kB\n\
+                     SwapPss:               4 kB\n\
+                     Swap:                  8 kB\n\
+                     VmFlags: rd wr mr mw me ac sd\n\
+                     7ffd1000-7ffd2000 rw-p 00000000 00:00 0 \n\
+                     Rss:                   4 kB\n";
+        let regions = smaps(file);
+        let counts: Vec<_> = regions
+            .iter()
+            .map(|r| (r.line.path.as_deref(), r.rss, r.swap))
+            .collect();
+        assert_eq!(
+            counts,
+            [(Some("[heap]"), 84 << 10, 8 << 10), (None, 4 << 10, 0)]
+        );
+    }
+
+    #[test]
+    fn tells_what_each_region_is_from_how_it_was_mapped() {
+        let cases = [
+            ("rw-p", Some("[heap]"), RegionKind::Heap),
+            ("rw-p", Some("[stack]"), RegionKind::Stack),
+            ("rw-p", None, RegionKind::Anonymous),
+            ("rw-p", Some("[anon:glibc malloc]"), RegionKind::Anonymous),
+            ("r-xp", None, RegionKind::AnonymousCode),
+            ("rw-s", None, RegionKind::Shared),
+            ("rw-s", Some("/dev/zero (deleted)"), RegionKind::Shared),
+            ("rw-s", Some("/memfd:wayland (deleted)"), RegionKind::Shared),
+            (
+                "rw-p",
+                Some("/anon_hugepage (deleted)"),
+                RegionKind::Anonymous,
+            ),
+            ("rw-s", Some("/anon_hugepage (deleted)"), RegionKind::Shared),
+            ("rw-s", Some("/data/table.db"), RegionKind::File),
+            ("r-xp", Some("/usr/lib/libc.so.6"), RegionKind::Code),
+            ("r--p", Some("/usr/lib/libc.so.6"), RegionKind::File),
+            ("r-xp", Some("[vdso]"), RegionKind::Kernel),
+        ];
+        for (permissions, path, expected) in cases {
+            assert_eq!(
+                region_kind(permissions, path),
+                expected,
+                "{permissions} {path:?}"
+            );
+        }
     }
 }

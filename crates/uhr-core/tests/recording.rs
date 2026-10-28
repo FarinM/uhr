@@ -320,6 +320,22 @@ fn example() -> Recording {
                 unmapped_ns: Some(3_000),
             },
         ],
+        region_memory: vec![
+            RegionMemory {
+                time_ns: 1_000,
+                pid: 7,
+                kind: RegionKind::Heap,
+                rss_bytes: 1 << 20,
+                swap_bytes: 0,
+            },
+            RegionMemory {
+                time_ns: 2_000,
+                pid: 7,
+                kind: RegionKind::Anonymous,
+                rss_bytes: 1 << 30,
+                swap_bytes: 4_096,
+            },
+        ],
     }
 }
 

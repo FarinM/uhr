@@ -50,7 +50,9 @@ behaviors.
 `overview` gives each process's memory from its readings in the window: the
 first, the last and the one with the most resident, each with its split into
 the process's own memory, files and shared memory, its swap, and the most it
-had resident as the kernel tracked it, between readings too. Memory is read
+had resident as the kernel tracked it, between readings too. With it comes
+the last reading of how much was resident in each kind of region, as the
+heap, anonymous memory, files and code, which is read less often. Memory is read
 per process, so only filters by process and time apply to it, and a filter
 by thread, mode, stack or syscall leaves it out, as the result says. Only
 page faults have regions, so `overview` refuses a filter by region.

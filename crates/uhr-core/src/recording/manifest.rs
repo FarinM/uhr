@@ -176,6 +176,10 @@ pub enum Signal {
     /// The regions of each process's memory, as it mapped them.
     #[serde(rename = "memory_regions")]
     MemoryRegions,
+    /// How much memory each process had resident and in swap in each kind
+    /// of region, over time.
+    #[serde(rename = "region_memory")]
+    RegionMemory,
 }
 
 impl Signal {
@@ -191,6 +195,7 @@ impl Signal {
             Signal::PageFaults => "page_faults",
             Signal::ResidentMemory => "resident_memory",
             Signal::MemoryRegions => "memory_regions",
+            Signal::RegionMemory => "region_memory",
         }
     }
 }

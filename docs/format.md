@@ -23,6 +23,7 @@ A recording is a directory:
 | `syscall_calls.parquet` | How often each thread called each syscall, and how long the calls took |
 | `memory.parquet` | How much memory each process had, read at intervals |
 | `regions.parquet` | The regions of each process's memory, as it mapped them |
+| `region_memory.parquet` | How much memory each process had resident in each kind of region, read at intervals |
 | `symbols.parquet` | Function name per frame, after symbol resolution |
 | `symbol_sources.parquet` | Files the names came from, and why some frames have none |
 | `inline_frames.parquet` | Inlined calls and source lines per frame, from debug info |
@@ -63,7 +64,7 @@ Each stream has:
 | `collector` | `name` plus the collector's version and settings. For perf: `version`, `sampling`, `page_faults`, `context_switches` (whether perf recorded every context switch). uhr's eBPF programs are `ebpf`, with `programs`, their tags in hex, as in the kernel's names for their code: `bpf_prog_<tag>_<name>`, `sampling` and `page_faults`. uhr reading `/proc` is `procfs`, with `interval_ns`, how often it read |
 | `collector.page_faults` | How the collector sampled page faults: `event` and `period`, one fault in every that many, which each sample stands for. Null for one that did not |
 | `collector.sampling` | How the collector sampled CPU time: `event`, `frequency_hz` (what it sampled at), `requested_frequency_hz`. Null for one that did not |
-| `signals` | What was captured: `user_cpu_samples`, `kernel_cpu_samples`, `user_stacks`, `kernel_stacks`, `off_cpu_time` (when threads went off CPU and came back, and whether they were preempted), `off_cpu_stacks` (where they went off CPU), `syscall_calls` (how often threads called each syscall and how long the calls took), `resident_memory` (how much memory each process had resident and in swap, over time), `memory_regions` (the regions of each process's memory, as it mapped them), `page_faults` (samples of the page faults threads took, with their stacks) |
+| `signals` | What was captured: `user_cpu_samples`, `kernel_cpu_samples`, `user_stacks`, `kernel_stacks`, `off_cpu_time` (when threads went off CPU and came back, and whether they were preempted), `off_cpu_stacks` (where they went off CPU), `syscall_calls` (how often threads called each syscall and how long the calls took), `resident_memory` (how much memory each process had resident and in swap, over time), `memory_regions` (the regions of each process's memory, as it mapped them), `region_memory` (how much each process had resident and in swap in each kind of region, over time), `page_faults` (samples of the page faults threads took, with their stacks) |
 | `missing_signals` | Signals requested but not captured, each with a `reason`. Without `kernel_cpu_samples`, CPU time spent in the kernel is not in the samples at all, not merely unnamed. Threads go off CPU in the kernel, so without kernel sampling `off_cpu_stacks` is missing too |
 | `coverage.lost_events` | Events the kernel dropped |
 | `coverage.stacks` | For a collector that takes stacks, the counts below. Null for one that takes none |
@@ -286,6 +287,20 @@ it forked. The kernel reports no region moved or grown with `mremap`, as
 A page fault was in the region of its process that held its address when it
 faulted, if one did: mapped at or before then, and not yet unmapped. In none
 if the region was moved or grown with `mremap`, or perf lost its record.
+
+`region_memory`, one row per reading of a process and kind of region with
+memory resident or in swap, sorted by `time_ns`, from uhr reading
+`/proc/<pid>/smaps`. It walks the process's page tables, so after a read
+that took a while uhr waits a hundred times as long, and at least as long
+as between readings of `memory`: a large process's is read less often.
+
+| Column | Type | Meaning |
+|---|---|---|
+| `time_ns` | uint64 | When it was read |
+| `pid` | uint32 | |
+| `kind` | string | As in `regions` |
+| `rss_bytes` | uint64 | Resident in the process's regions of that kind |
+| `swap_bytes` | uint64 | In swap, of those regions |
 
 ## Symbols
 

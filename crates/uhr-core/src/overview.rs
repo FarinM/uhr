@@ -7,8 +7,8 @@ use crate::coverage::Coverage;
 use crate::filter::{self, Filter};
 use crate::functions::Functions;
 use crate::recording::{
-    self, Collector, Exit, MemoryReading, Mode, OffCPUInterval, Recording, Sample, Signal, Thread,
-    ThreadState,
+    self, Collector, Exit, MemoryReading, Mode, OffCPUInterval, Recording, RegionKind, Sample,
+    Signal, Thread, ThreadState,
 };
 use crate::symbols::Symbols;
 use crate::threads::ThreadNames;
@@ -73,6 +73,24 @@ pub struct MemoryRow {
     pub last: MemoryUsage,
     /// The reading with the most resident.
     pub max: MemoryUsage,
+    /// The last reading in the window of how much was resident in each
+    /// kind of region, which is read less often. `None` without one.
+    pub regions: Option<RegionsUsage>,
+}
+
+/// How much of a process's memory was in each kind of region when read.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RegionsUsage {
+    pub time_ns: u64,
+    /// Sorted by resident memory.
+    pub kinds: Vec<KindUsage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct KindUsage {
+    pub kind: RegionKind,
+    pub rss_bytes: u64,
+    pub swap_bytes: u64,
 }
 
 /// One reading of a process's memory.
@@ -434,6 +452,32 @@ fn memory(
         let life = lifetimes.at(reading.pid, reading.pid, Some(reading.time_ns));
         lives.entry((reading.pid, life)).or_default().push(reading);
     }
+    // The last reading by kind of region of each process lifetime.
+    let mut regions: HashMap<(u32, Option<usize>), RegionsUsage> = HashMap::new();
+    for reading in filter.region_memory(recording)? {
+        let life = lifetimes.at(reading.pid, reading.pid, Some(reading.time_ns));
+        let time_ns = reading.time_ns.saturating_sub(base);
+        let usage = regions.entry((reading.pid, life)).or_insert(RegionsUsage {
+            time_ns,
+            kinds: Vec::new(),
+        });
+        if usage.time_ns != time_ns {
+            *usage = RegionsUsage {
+                time_ns,
+                kinds: Vec::new(),
+            };
+        }
+        usage.kinds.push(KindUsage {
+            kind: reading.kind,
+            rss_bytes: reading.rss_bytes,
+            swap_bytes: reading.swap_bytes,
+        });
+    }
+    for usage in regions.values_mut() {
+        usage
+            .kinds
+            .sort_by(|a, b| b.rss_bytes.cmp(&a.rss_bytes).then(a.kind.cmp(&b.kind)));
+    }
     let usage = |reading: &MemoryReading| MemoryUsage {
         time_ns: reading.time_ns.saturating_sub(base),
         rss_bytes: reading.rss_bytes(),
@@ -445,7 +489,7 @@ fn memory(
     };
     let mut processes: Vec<MemoryRow> = lives
         .into_iter()
-        .map(|((pid, _), readings)| {
+        .map(|((pid, life), readings)| {
             // In time order, as the recording keeps them.
             let (first, last) = (readings[0], readings[readings.len() - 1]);
             let max = readings
@@ -461,6 +505,7 @@ fn memory(
                 first: usage(first),
                 last: usage(last),
                 max: usage(max),
+                regions: regions.remove(&(pid, life)),
             }
         })
         .collect();

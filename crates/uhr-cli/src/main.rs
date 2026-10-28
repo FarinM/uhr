@@ -785,6 +785,33 @@ fn write_memory(out: &mut impl Write, memory: &Memory) -> io::Result<()> {
             memory.processes_omitted
         )?;
     }
+    let by_kind: Vec<_> = memory
+        .processes
+        .iter()
+        .filter_map(|process| Some((process, process.regions.as_ref()?)))
+        .collect();
+    if !by_kind.is_empty() {
+        writeln!(
+            out,
+            "\nresident by kind of region, as read last, less often for large processes"
+        )?;
+    }
+    for (process, regions) in by_kind {
+        let kinds: Vec<String> = regions
+            .kinds
+            .iter()
+            .filter(|k| k.rss_bytes > 0)
+            .map(|k| format!("{} {}", k.kind.as_str(), bytes(k.rss_bytes)))
+            .collect();
+        writeln!(
+            out,
+            "{:>9}  {} at {}: {}",
+            process.pid,
+            process.name.as_deref().unwrap_or("<unnamed>"),
+            seconds(regions.time_ns),
+            kinds.join(", ")
+        )?;
+    }
     Ok(())
 }
 

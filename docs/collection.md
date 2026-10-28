@@ -312,6 +312,16 @@ which takes the process's memory lock and costs by its size.
   finds it, is left out, and so is one whose fork takes longer than a
   reading to show it in `/proc`. Whether a new process uhr can't read is
   the target's is unknown, and the recording counts those.
+- How much of each kind of region, as the heap, anonymous memory, files and
+  code, each process has resident comes from its `/proc/<pid>/smaps`, which
+  walks its page tables and so costs by its size. After a read that took a
+  while, uhr waits a hundred times as long, and at least 100 ms, so it
+  spends at most about 1% of a CPU on each process: one with 4 GiB
+  resident took 58 ms to read, and was read again 5.8 s later. Only root
+  can read the `smaps` of a process that can't be dumped, as one running a
+  setuid program. Once reading a process's `smaps` fails other than by the
+  process ending, uhr stops reading it, and the recording counts those
+  processes.
 - The stream's overhead is uhr's own CPU time reading `/proc`, which the
   kernel spends on the target's counts but not in the target.
 

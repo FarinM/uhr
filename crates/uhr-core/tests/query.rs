@@ -88,6 +88,7 @@ fn recording() -> Recording {
         syscall_calls: Vec::new(),
         memory: Vec::new(),
         regions: Vec::new(),
+        region_memory: Vec::new(),
     }
 }
 

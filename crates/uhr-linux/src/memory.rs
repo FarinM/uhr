@@ -4,6 +4,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io::{self, ErrorKind};
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -11,7 +12,7 @@ use std::time::{Duration, Instant};
 use rustix::io::Errno;
 use rustix::time::{ClockId, clock_gettime};
 
-use uhr_core::recording::MemoryReading;
+use uhr_core::recording::{MemoryReading, RegionKind, RegionMemory};
 
 use crate::launch::monotonic_ns;
 use crate::procfs;
@@ -19,6 +20,11 @@ use crate::procfs;
 /// Often enough to show how memory grows, and cheap: the kernel keeps the
 /// counts read, so reading them walks no page tables.
 pub(crate) const INTERVAL: Duration = Duration::from_millis(100);
+
+/// The most of its time uhr spends reading each process's `smaps`, which
+/// walks its page tables, and so costs by how much memory it has: after a
+/// read that took this much, uhr waits at least this many times as long.
+const SMAPS_BACKOFF: u64 = 100;
 
 /// The most pids probed for new processes at one reading. Past that,
 /// listing `/proc` costs less.
@@ -38,10 +44,14 @@ pub(crate) struct Error {
 /// What the reader found.
 pub(crate) struct Read {
     pub(crate) readings: Vec<MemoryReading>,
+    /// Sorted by time.
+    pub(crate) region_memory: Vec<RegionMemory>,
     /// uhr's own CPU time reading `/proc`.
     pub(crate) cpu_ns: u64,
     /// The target's processes that could not be read, by why.
     pub(crate) unreadable: BTreeMap<String, u64>,
+    /// The target's processes whose `smaps` could not be read, by why.
+    pub(crate) no_regions: BTreeMap<String, u64>,
     /// New processes on the host that could not be checked for being the
     /// target's, by why.
     pub(crate) unchecked: BTreeMap<String, u64>,
@@ -70,7 +80,8 @@ impl Reader {
         counts(&bytes).map_err(error(&status))?;
         let start = start_of(pid, &mut bytes).map_err(error(&main_thread_stat(pid)))?;
         let processes = Processes {
-            tracked: BTreeMap::from([(pid, start)]),
+            tracked: BTreeMap::from([(pid, Tracked::new(start))]),
+            region_memory: Vec::new(),
             last_pid: last_pid().map_err(error(LOADAVG))?,
             pid_max: fs::read_to_string(PID_MAX)
                 .and_then(|max| max.trim().parse().map_err(io::Error::other))
@@ -80,6 +91,7 @@ impl Reader {
             relist: false,
             bytes,
             unreadable: BTreeMap::new(),
+            no_regions: BTreeMap::new(),
             unchecked: BTreeMap::new(),
         };
         Ok(Self {
@@ -116,8 +128,10 @@ impl Reader {
             let cpu = clock_gettime(ClockId::ThreadCPUTime);
             Read {
                 readings,
+                region_memory: processes.region_memory,
                 cpu_ns: cpu.tv_sec as u64 * 1_000_000_000 + cpu.tv_nsec as u64,
                 unreadable: processes.unreadable,
+                no_regions: processes.no_regions,
                 unchecked: processes.unchecked,
             }
         }));
@@ -136,8 +150,10 @@ impl Reader {
                 .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
             None => Read {
                 readings: Vec::new(),
+                region_memory: Vec::new(),
                 cpu_ns: 0,
                 unreadable: BTreeMap::new(),
+                no_regions: BTreeMap::new(),
                 unchecked: BTreeMap::new(),
             },
         }
@@ -145,10 +161,11 @@ impl Reader {
 }
 
 struct Processes {
-    /// Each process's start, in clock ticks since boot, by its pid. The two
-    /// tell it from a later process given its pid, and it holds nothing
-    /// open, so the processes on the host can't use up uhr's files.
-    tracked: BTreeMap<u32, u64>,
+    /// By pid. A process's pid and start tell it from a later process given
+    /// its pid, and it holds nothing open, so the processes on the host
+    /// can't use up uhr's files.
+    tracked: BTreeMap<u32, Tracked>,
+    region_memory: Vec<RegionMemory>,
     /// The pid the kernel last gave out when new processes were looked for.
     last_pid: u32,
     /// Pids are below it.
@@ -164,6 +181,7 @@ struct Processes {
     /// For the files read, so each read needs no new buffer.
     bytes: Vec<u8>,
     unreadable: BTreeMap<String, u64>,
+    no_regions: BTreeMap<String, u64>,
     unchecked: BTreeMap<String, u64>,
 }
 
@@ -172,13 +190,15 @@ impl Processes {
         if let Ok(last) = last_pid() {
             self.find_new(last);
         }
-        for (pid, start) in std::mem::take(&mut self.tracked) {
-            match self.counts_of(pid, start) {
+        for (pid, mut tracked) in std::mem::take(&mut self.tracked) {
+            match self.counts_of(pid, tracked.start) {
                 Ok(counts) => {
-                    if let Some(counts) = counts {
-                        readings.push(counts.at(monotonic_ns(), pid));
+                    if let Some((counts, dir)) = counts {
+                        let now = monotonic_ns();
+                        readings.push(counts.at(now, pid));
+                        self.read_regions(pid, &mut tracked, &dir, now);
                     }
-                    self.tracked.insert(pid, start);
+                    self.tracked.insert(pid, tracked);
                 }
                 Err(error) if gone(&error) => {}
                 Err(error) => *self.unreadable.entry(error.to_string()).or_default() += 1,
@@ -186,12 +206,63 @@ impl Processes {
         }
     }
 
+    /// Reads how much of each kind of region of the process `pid` is
+    /// resident, at `now`, from the `smaps` in its directory `dir`, if due.
+    fn read_regions(&mut self, pid: u32, tracked: &mut Tracked, dir: &Path, now: u64) {
+        if now < tracked.smaps_due_ns {
+            return;
+        }
+        match self.read_smaps(pid, dir, now) {
+            Ok(due) => tracked.smaps_due_ns = due,
+            // It, or the thread whose directory it was, ended since: the
+            // next reading drops it or reads another thread's.
+            Err(error) if gone(&error) => {}
+            // As for a process that can't be dumped, which only root may
+            // read: trying again each interval would cost and fail the same.
+            Err(error) => {
+                *self.no_regions.entry(error.to_string()).or_default() += 1;
+                tracked.smaps_due_ns = u64::MAX;
+            }
+        }
+    }
+
+    /// Reads the `smaps` in `dir`, of the process `pid`, at `now`, and
+    /// returns when to read it next.
+    fn read_smaps(&mut self, pid: u32, dir: &Path, now: u64) -> io::Result<u64> {
+        let interval = INTERVAL.as_nanos() as u64;
+        procfs::read(dir.join("smaps"), &mut self.bytes)?;
+        let mut kinds: BTreeMap<RegionKind, (u64, u64)> = BTreeMap::new();
+        for region in procfs::smaps(&self.bytes) {
+            let line = &region.line;
+            let kind = procfs::region_kind(&line.permissions, line.path.as_deref());
+            let (rss, swap) = kinds.entry(kind).or_default();
+            *rss += region.rss;
+            *swap += region.swap;
+        }
+        self.region_memory.extend(
+            kinds
+                .into_iter()
+                .filter(|&(_, (rss, swap))| rss > 0 || swap > 0)
+                .map(|(kind, (rss_bytes, swap_bytes))| RegionMemory {
+                    time_ns: now,
+                    pid,
+                    kind,
+                    rss_bytes,
+                    swap_bytes,
+                }),
+        );
+        let took = monotonic_ns().saturating_sub(now);
+        Ok(now + interval.max(took * SMAPS_BACKOFF))
+    }
+
     /// The counts of the process with the pid `pid` that started at
-    /// `start`. `None` while it has no memory of its own: a zombie, until
-    /// it is reaped. Fails as gone once the pid is another process's.
-    fn counts_of(&mut self, pid: u32, start: u64) -> io::Result<Option<Counts>> {
-        procfs::read(format!("/proc/{pid}/status"), &mut self.bytes)?;
-        let mut found = counts(&self.bytes)?;
+    /// `start`, and the directory in `/proc` they were read from. `None`
+    /// while it has no memory of its own: a zombie, until it is reaped.
+    /// Fails as gone once the pid is another process's.
+    fn counts_of(&mut self, pid: u32, start: u64) -> io::Result<Option<(Counts, PathBuf)>> {
+        let dir = PathBuf::from(format!("/proc/{pid}"));
+        procfs::read(dir.join("status"), &mut self.bytes)?;
+        let mut found = counts(&self.bytes)?.map(|counts| (counts, dir));
         if found.is_none() {
             found = self.thread_counts(pid);
         }
@@ -204,15 +275,16 @@ impl Processes {
     }
 
     /// The counts of a process whose main thread has exited, from one of its
-    /// threads that still runs, which share them: its own file describes the
-    /// main thread. `None` if none runs.
-    fn thread_counts(&mut self, pid: u32) -> Option<Counts> {
+    /// threads that still runs, which share them, and that thread's
+    /// directory: the process's own describes the main thread. `None` if
+    /// none runs.
+    fn thread_counts(&mut self, pid: u32) -> Option<(Counts, PathBuf)> {
         for task in fs::read_dir(format!("/proc/{pid}/task")).ok()? {
-            let status = task.ok()?.path().join("status");
-            if procfs::read(status, &mut self.bytes).is_ok()
+            let dir = task.ok()?.path();
+            if procfs::read(dir.join("status"), &mut self.bytes).is_ok()
                 && let Ok(Some(counts)) = counts(&self.bytes)
             {
-                return Some(counts);
+                return Some((counts, dir));
             }
         }
         None
@@ -274,7 +346,7 @@ impl Processes {
             // they wrap around, those given since can be of processes from
             // before the target was followed, as a listing has. perf and
             // uhr's eBPF programs don't follow those either.
-            let tracked = self.tracked.get(&pid) == Some(&stat.start_ticks);
+            let tracked = self.tracked.get(&pid).map(|t| t.start) == Some(stat.start_ticks);
             if !tracked && stat.start_ticks >= self.started {
                 new.push((pid, stat));
             }
@@ -296,7 +368,7 @@ impl Processes {
                         == Some(pid);
                 if process {
                     // In place of a process reaped since that had its pid.
-                    self.tracked.insert(pid, stat.start_ticks);
+                    self.tracked.insert(pid, Tracked::new(stat.start_ticks));
                 }
             }
         }
@@ -353,6 +425,23 @@ fn start_of(pid: u32, bytes: &mut Vec<u8>) -> io::Result<u64> {
 /// thread keeps.
 fn main_thread_stat(tid: u32) -> String {
     format!("/proc/{tid}/task/{tid}/stat")
+}
+
+/// What uhr knows of a process it follows.
+struct Tracked {
+    /// When it started, in clock ticks since boot.
+    start: u64,
+    /// When its `smaps` is next to be read.
+    smaps_due_ns: u64,
+}
+
+impl Tracked {
+    fn new(start: u64) -> Self {
+        Self {
+            start,
+            smaps_due_ns: 0,
+        }
+    }
 }
 
 /// Counts of a process's memory, in bytes.
@@ -536,9 +625,11 @@ mod tests {
         let processes = reader.processes.as_mut().unwrap();
         let start = start_of(child.id(), &mut processes.bytes).unwrap();
         // As if a process that started before had had the child's pid.
-        processes.tracked.insert(child.id(), start - 1);
+        processes
+            .tracked
+            .insert(child.id(), Tracked::new(start - 1));
         processes.find_new(last_pid().unwrap());
-        let followed = processes.tracked.get(&child.id()).copied();
+        let followed = processes.tracked.get(&child.id()).map(|t| t.start);
         end(child);
         assert_eq!(followed, Some(start));
     }
@@ -572,5 +663,46 @@ mod tests {
         assert!(processes.relist);
         processes.find_new(pid_max - 1);
         assert!(!processes.relist);
+    }
+
+    #[test]
+    fn reads_how_much_of_each_kind_of_region_is_resident() {
+        let pid = std::process::id();
+        let mut reader = Reader::start(pid).unwrap();
+        let processes = reader.processes.as_mut().unwrap();
+        // Far past the size malloc maps on its own, and touched.
+        let mapped = vec![1u8; 64 << 20];
+        let now = monotonic_ns();
+        let due = processes
+            .read_smaps(pid, Path::new(&format!("/proc/{pid}")), now)
+            .unwrap();
+        drop(mapped);
+        assert!(due >= now + INTERVAL.as_nanos() as u64);
+        let read = &processes.region_memory;
+        let anonymous = read
+            .iter()
+            .find(|r| r.kind == RegionKind::Anonymous)
+            .map(|r| r.rss_bytes);
+        assert!(anonymous >= Some(64 << 20), "{read:?}");
+        assert!(read.iter().any(|r| r.kind == RegionKind::Code), "{read:?}");
+        assert!(read.iter().all(|r| (r.pid, r.time_ns) == (pid, now)));
+    }
+
+    #[test]
+    fn stops_reading_the_regions_of_a_process_it_can_not_read() {
+        let pid = std::process::id();
+        let mut reader = Reader::start(pid).unwrap();
+        let processes = reader.processes.as_mut().unwrap();
+        let mut tracked = Tracked::new(0);
+        // A directory with no entry for its smaps, as of a process gone.
+        processes.read_regions(pid, &mut tracked, Path::new("/proc/0"), monotonic_ns());
+        assert_eq!(tracked.smaps_due_ns, 0);
+        // One that can't hold any.
+        let file = Path::new("/proc/self/status");
+        for _ in 0..2 {
+            processes.read_regions(pid, &mut tracked, file, monotonic_ns());
+        }
+        assert_eq!(tracked.smaps_due_ns, u64::MAX);
+        assert_eq!(processes.no_regions.values().sum::<u64>(), 1);
     }
 }

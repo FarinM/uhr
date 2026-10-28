@@ -299,3 +299,37 @@ fn keeps_reading_a_process_after_another_thread_execs() {
         .max();
     assert!(grown >= Some(64 * MIB), "{}", overview["memory"]);
 }
+
+#[test]
+fn says_how_much_of_each_kind_of_region_is_resident() {
+    let dir = scratch("memory_by_kind");
+    let program = dir.join("grow");
+    compile("grow", &program, "-O2");
+    let program = program.to_str().unwrap();
+    // Blocks of 8 MiB, which malloc maps on its own, and of 4 KiB, which
+    // it takes from the heap, kept a while.
+    for (block, kind) in [("8192", "anonymous"), ("4", "heap")] {
+        let recording = dir.join(format!("rec-{block}"));
+        let rec = recording.to_str().unwrap();
+        uhr(&[
+            "record",
+            "--no-symbolize",
+            "-o",
+            rec,
+            "--",
+            program,
+            "64",
+            "0",
+            "1000",
+            block,
+        ]);
+        let overview = overview(rec);
+        let process = &rows(&overview)[0];
+        let kinds = process["regions"]["kinds"].as_array().unwrap();
+        let resident = kinds
+            .iter()
+            .find(|k| k["kind"] == kind)
+            .map_or(0, |k| number(&k["rss_bytes"]));
+        assert!(resident >= 60 * MIB, "{}", process["regions"]);
+    }
+}

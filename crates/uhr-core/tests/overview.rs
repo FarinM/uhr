@@ -147,6 +147,7 @@ fn recording() -> Recording {
         syscall_calls: Vec::new(),
         memory: Vec::new(),
         regions: Vec::new(),
+        region_memory: Vec::new(),
     }
 }
 
@@ -774,6 +775,50 @@ fn says_when_memory_was_not_read() {
         "{:?}",
         result.coverage.unknown
     );
+}
+
+/// Adds readings of process 1's memory by kind of region, at 2000 and 9000.
+fn with_region_memory(mut recording: Recording) -> Recording {
+    let reading = |time_ns, kind, rss_bytes| RegionMemory {
+        time_ns,
+        pid: 1,
+        kind,
+        rss_bytes,
+        swap_bytes: 0,
+    };
+    recording.region_memory = vec![
+        reading(2_000, RegionKind::Heap, 50),
+        reading(2_000, RegionKind::Code, 20),
+        reading(9_000, RegionKind::Anonymous, 80),
+        reading(9_000, RegionKind::Heap, 150),
+    ];
+    recording
+}
+
+#[test]
+fn gives_the_last_reading_of_memory_by_kind_of_region() {
+    let recording = with_region_memory(with_memory(recording()));
+    let memory = overview(&recording, Filter::default()).memory.unwrap();
+    let regions = memory_of(&memory, 1)[0].regions.clone().unwrap();
+    assert_eq!(regions.time_ns, 8_000);
+    let kinds: Vec<(RegionKind, u64)> = regions
+        .kinds
+        .iter()
+        .map(|k| (k.kind, k.rss_bytes))
+        .collect();
+    assert_eq!(
+        kinds,
+        [(RegionKind::Heap, 150), (RegionKind::Anonymous, 80)]
+    );
+    assert!(memory_of(&memory, 7)[0].regions.is_none());
+
+    let filter = Filter {
+        to_ns: Some(5_000),
+        ..Filter::default()
+    };
+    let memory = overview(&recording, filter).memory.unwrap();
+    let regions = memory_of(&memory, 1)[0].regions.clone().unwrap();
+    assert_eq!(regions.time_ns, 1_000);
 }
 
 #[test]

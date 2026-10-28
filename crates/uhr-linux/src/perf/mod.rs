@@ -447,8 +447,19 @@ fn add_memory(recording: &mut Recording, read: Option<Result<memory::Read, memor
              it its pid."
         ),
     ];
+    known_biases.push(format!(
+        "How much of each kind of region is resident is read from smaps, which walks a \
+         process's page tables, at most every {interval_ms} ms, and after a read that took a \
+         while, a hundred times as long later: a large process's is read less often."
+    ));
     known_biases.extend(read.unreadable.iter().map(|(reason, processes)| {
         format!("{processes} of the target's processes could not be read: {reason}.")
+    }));
+    known_biases.extend(read.no_regions.iter().map(|(reason, processes)| {
+        format!(
+            "{processes} of the target's processes had smaps uhr could not read, so for them how \
+             much of each kind of region is resident is missing from then on: {reason}."
+        )
     }));
     known_biases.extend(read.unchecked.iter().map(|(reason, processes)| {
         format!(
@@ -467,7 +478,10 @@ fn add_memory(recording: &mut Recording, read: Option<Result<memory::Read, memor
         collector: Collector::Procfs {
             interval_ns: memory::INTERVAL.as_nanos() as u64,
         },
-        signals: vec![recording::Signal::ResidentMemory],
+        signals: vec![
+            recording::Signal::ResidentMemory,
+            recording::Signal::RegionMemory,
+        ],
         missing_signals: Vec::new(),
         coverage: StreamCoverage {
             lost_events: 0,
@@ -477,6 +491,7 @@ fn add_memory(recording: &mut Recording, read: Option<Result<memory::Read, memor
         },
     });
     recording.memory = read.readings;
+    recording.region_memory = read.region_memory;
 }
 
 /// Adds what uhr's eBPF programs found as a stream of their own, or says

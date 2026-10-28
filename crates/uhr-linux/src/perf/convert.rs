@@ -22,6 +22,7 @@ use super::unwind::{Unwinding as UserUnwinding, UserCopy};
 use super::{Error, Result, io_error};
 use crate::interpreters::{Interpreters, Program};
 use crate::kallsyms::{self, Kallsyms};
+use crate::procfs;
 use uhr_core::recording::{
     Clock, Collector, Exit, FORMAT_VERSION, FaultSample, FaultSampling, Frame, Interpreted,
     InterpretedCode, InterpreterCoverage, KERNEL, KernelSymbols, Manifest, Mapping, MemoryRegion,
@@ -513,6 +514,7 @@ pub(super) fn convert(input: Input) -> Result<(Recording, Option<EbpfStacks>)> {
         syscall_calls: Vec::new(),
         memory: Vec::new(),
         regions: state.regions,
+        region_memory: Vec::new(),
     };
     Ok((recording, ebpf_stacks))
 }
@@ -902,37 +904,6 @@ fn permissions(protection: u32, flags: u32) -> String {
     .collect()
 }
 
-/// What a region of memory is, from the permissions and name it was mapped
-/// with. The kernel names memory that maps no file `//anon` in its
-/// records, and shared memory as a deleted file.
-fn region_kind(permissions: &str, path: &str) -> RegionKind {
-    let shared = permissions.ends_with('s');
-    let code = permissions.as_bytes().get(2) == Some(&b'x');
-    match path {
-        "[heap]" => RegionKind::Heap,
-        "[stack]" => RegionKind::Stack,
-        "//anon" if shared => RegionKind::Shared,
-        "//anon" if code => RegionKind::AnonymousCode,
-        "//anon" => RegionKind::Anonymous,
-        _ if path.starts_with("[anon_shmem:") => RegionKind::Shared,
-        _ if path.starts_with("[anon:") && code => RegionKind::AnonymousCode,
-        _ if path.starts_with("[anon:") => RegionKind::Anonymous,
-        // The kernel's own, as [vdso], [vvar] and [vsyscall].
-        _ if path.starts_with('[') => RegionKind::Kernel,
-        // Memory in huge pages that maps no file, as MAP_HUGETLB gives.
-        _ if path.starts_with("/anon_hugepage") => region_kind(permissions, "//anon"),
-        _ if shared
-            && ["/dev/zero", "/SYSV", "/memfd:", "/dev/shm/"]
-                .iter()
-                .any(|prefix| path.starts_with(prefix)) =>
-        {
-            RegionKind::Shared
-        }
-        _ if code => RegionKind::Code,
-        _ => RegionKind::File,
-    }
-}
-
 /// The rows of the regions in a process's `space` that hold any of
 /// `start..end`.
 fn overlapping(
@@ -1245,7 +1216,7 @@ impl State {
             end,
             permissions: permissions.to_owned(),
             file_offset: m.file_offset,
-            kind: region_kind(permissions, &m.path),
+            kind: procfs::region_kind(permissions, path.as_deref()),
             path,
             time_ns: m.time,
             unmapped_ns: None,
@@ -2215,31 +2186,6 @@ mod tests {
     fn writes_permissions_as_maps_lists_them() {
         assert_eq!(permissions(PROT_READ | PROT_EXEC, 0x2), "r-xp");
         assert_eq!(permissions(PROT_READ | PROT_WRITE, MAP_SHARED), "rw-s");
-    }
-
-    #[test]
-    fn tells_what_each_region_is_from_how_it_was_mapped() {
-        let cases = [
-            ("rw-p", "[heap]", RegionKind::Heap),
-            ("rw-p", "[stack]", RegionKind::Stack),
-            ("rw-p", "//anon", RegionKind::Anonymous),
-            ("rwxp", "//anon", RegionKind::AnonymousCode),
-            ("rw-s", "/dev/zero (deleted)", RegionKind::Shared),
-            ("rw-s", "/memfd:wayland (deleted)", RegionKind::Shared),
-            ("rw-p", "/anon_hugepage (deleted)", RegionKind::Anonymous),
-            ("rw-s", "/anon_hugepage (deleted)", RegionKind::Shared),
-            ("rw-s", "/data/table.db", RegionKind::File),
-            ("r-xp", "/usr/lib/libc.so.6", RegionKind::Code),
-            ("r--p", "/usr/lib/libc.so.6", RegionKind::File),
-            ("r-xp", "[vdso]", RegionKind::Kernel),
-        ];
-        for (permissions, path, expected) in cases {
-            assert_eq!(
-                region_kind(permissions, path),
-                expected,
-                "{permissions} {path}"
-            );
-        }
     }
 
     /// A mapping by process `pid` of `start..end`, with these permissions,

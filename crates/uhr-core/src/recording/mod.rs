@@ -27,6 +27,7 @@ const OFF_CPU: &str = "off_cpu.parquet";
 const MEMORY: &str = "memory.parquet";
 const PAGE_FAULTS: &str = "page_faults.parquet";
 const REGIONS: &str = "regions.parquet";
+const REGION_MEMORY: &str = "region_memory.parquet";
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -136,6 +137,8 @@ pub struct Recording {
     /// Sorted by time.
     pub memory: Vec<MemoryReading>,
     pub regions: Vec<MemoryRegion>,
+    /// Sorted by time.
+    pub region_memory: Vec<RegionMemory>,
 }
 
 /// One lifetime of a thread. The kernel reuses ids, so `(pid, tid)` can
@@ -337,6 +340,17 @@ pub struct MemoryRegion {
     /// When a later region took its place, or its process exec'd. `None`
     /// if it held its addresses still, as far as the recording knows.
     pub unmapped_ns: Option<u64>,
+}
+
+/// How much memory a process had resident, and in swap, in its regions of
+/// one kind, when read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegionMemory {
+    pub time_ns: u64,
+    pub pid: u32,
+    pub kind: RegionKind,
+    pub rss_bytes: u64,
+    pub swap_bytes: u64,
 }
 
 /// What a region of memory is, from how it was mapped.
@@ -547,6 +561,7 @@ impl Recording {
             syscall_calls: read_syscall_calls(dir)?,
             memory: read_memory(dir)?,
             regions: read_regions(dir)?,
+            region_memory: read_region_memory(dir)?,
         };
         recording
             .check_references()
@@ -869,6 +884,21 @@ impl Recording {
                     regions.iter().map(|r| r.unmapped_ns).collect(),
                 ),
             ],
+        )?;
+
+        let readings = &self.region_memory;
+        table::write(
+            &dir.join(REGION_MEMORY),
+            vec![
+                Column::u64("time_ns", readings.iter().map(|r| r.time_ns).collect()),
+                Column::u32("pid", readings.iter().map(|r| r.pid).collect()),
+                Column::string("kind", readings.iter().map(|r| r.kind.as_str()).collect()),
+                Column::u64("rss_bytes", readings.iter().map(|r| r.rss_bytes).collect()),
+                Column::u64(
+                    "swap_bytes",
+                    readings.iter().map(|r| r.swap_bytes).collect(),
+                ),
+            ],
         )
     }
 
@@ -968,6 +998,16 @@ impl Recording {
                     "memory region {index} was unmapped before it was mapped"
                 ));
             }
+        }
+        if let Some(index) = self
+            .region_memory
+            .windows(2)
+            .position(|pair| pair[0].time_ns > pair[1].time_ns)
+        {
+            return Err(format!(
+                "region memory reading {} comes before the one before it",
+                index + 1
+            ));
         }
         if let Some(index) = self
             .memory
@@ -1307,6 +1347,26 @@ fn read_regions(dir: &Path) -> Result<Vec<MemoryRegion>> {
                 kind: RegionKind::parse(&kind[i]).map_err(|reason| table.invalid(reason))?,
                 time_ns: time_ns[i],
                 unmapped_ns: unmapped_ns[i],
+            })
+        })
+        .collect()
+}
+
+fn read_region_memory(dir: &Path) -> Result<Vec<RegionMemory>> {
+    let table = Table::read(&dir.join(REGION_MEMORY))?;
+    let time_ns = table.u64("time_ns")?;
+    let pid = table.u32("pid")?;
+    let kind = table.string("kind")?;
+    let rss_bytes = table.u64("rss_bytes")?;
+    let swap_bytes = table.u64("swap_bytes")?;
+    (0..table.len())
+        .map(|i| {
+            Ok(RegionMemory {
+                time_ns: time_ns[i],
+                pid: pid[i],
+                kind: RegionKind::parse(&kind[i]).map_err(|reason| table.invalid(reason))?,
+                rss_bytes: rss_bytes[i],
+                swap_bytes: swap_bytes[i],
             })
         })
         .collect()

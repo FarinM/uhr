@@ -4,7 +4,8 @@ use serde::Serialize;
 
 use crate::functions::{self, Functions};
 use crate::recording::{
-    FaultSample, KernelSymbols, MemoryReading, Mode, OffCPUInterval, Recording, RegionKind, Sample,
+    FaultSample, KernelSymbols, MemoryReading, Mode, OffCPUInterval, Recording, RegionKind,
+    RegionMemory, Sample,
 };
 use crate::regions;
 use crate::syscalls::{self, InSyscall};
@@ -184,6 +185,21 @@ impl Filter {
         let start_ns = recording.manifest.start_ns;
         per_process.then(|| {
             recording.memory.iter().filter(move |reading| {
+                (self.pids.is_empty() || self.pids.contains(&reading.pid))
+                    && self.in_time_range(reading.time_ns, start_ns)
+            })
+        })
+    }
+
+    /// The readings of memory by kind of region that pass, as `memory`.
+    pub(crate) fn region_memory<'a>(
+        &'a self,
+        recording: &'a Recording,
+    ) -> Option<impl Iterator<Item = &'a RegionMemory> + 'a> {
+        let per_process = self.memory(recording).is_some();
+        let start_ns = recording.manifest.start_ns;
+        per_process.then(|| {
+            recording.region_memory.iter().filter(move |reading| {
                 (self.pids.is_empty() || self.pids.contains(&reading.pid))
                     && self.in_time_range(reading.time_ns, start_ns)
             })
