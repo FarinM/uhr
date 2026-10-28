@@ -217,6 +217,7 @@ fn take(ctx: &PerfEventContext, event: u32) -> u32 {
         time_ns: unsafe { bpf_ktime_get_ns() },
         ip,
         period: unsafe { (*ctx.ctx).sample_period },
+        address: fault_address(ctx, event),
         event,
         tgid,
         tid,
@@ -438,6 +439,7 @@ fn fill_copy(ctx: &PerfEventContext, event: u32, sample: &mut Copy, stack_bytes:
         time_ns: unsafe { bpf_ktime_get_ns() },
         ip,
         period: unsafe { (*ctx.ctx).sample_period },
+        address: fault_address(ctx, event),
         event,
         tgid,
         tid,
@@ -496,6 +498,18 @@ fn output(sample: *const u8, len: usize) {
         && let Some(dropped) = DROPPED.get_ptr_mut(0)
     {
         unsafe { *dropped += 1 };
+    }
+}
+
+/// Where the page fault `ctx` is a sample of was, the memory touched, and
+/// 0 for a tick. The kernel sets the address only for an event that has
+/// one: a tick's holds what was there before.
+#[inline(always)]
+fn fault_address(ctx: &PerfEventContext, event: u32) -> u64 {
+    if event == event::PAGE_FAULT {
+        unsafe { (*ctx.ctx).addr }
+    } else {
+        0
     }
 }
 

@@ -155,6 +155,7 @@ takes the thread's stack at it.
 | `mode` | string | What the fault came from: `user` code, or the `kernel`, as when a syscall copied to or from the process's memory |
 | `stack_id` | uint32 | |
 | `faults` | uint64 | The faults the sample stands for |
+| `address` | uint64 | Where the fault was: the memory touched |
 
 `off_cpu`, one row per time a thread was switched out, sorted by
 `start_ns`. A thread still off CPU when the capture ends stays off until

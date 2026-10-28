@@ -779,6 +779,9 @@ pub(crate) fn perf_args(
         args.push("--event=cpu-clock".into());
         if let Some(period) = fault_period {
             args.push(format!("--event=page-faults/period={period}/").into());
+            // The address of each fault, which samples of other events
+            // take too, as 0.
+            args.push("--data".into());
         }
         // For the events without a period of their own.
         args.push(format!("--freq={}", options.frequency_hz).into());

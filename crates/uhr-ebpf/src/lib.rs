@@ -71,6 +71,8 @@ pub struct SampleHeader {
     /// nanoseconds of the CPU's clock, or the page faults on the CPU since
     /// the sample before.
     pub period: u64,
+    /// Where a page fault was, the memory touched. 0 for a tick.
+    pub address: u64,
     /// Of `event`.
     pub event: u32,
     pub tgid: u32,

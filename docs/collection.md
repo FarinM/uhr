@@ -98,7 +98,9 @@ Debian and Ubuntu its package must match the running kernel.
 - `cpu-clock` at 999 Hz. Its sample period is in nanoseconds, so a sample's
   weight is CPU time.
 - Page faults, unless `uhr record --no-page-faults`: the `page-faults` event
-  takes the stack of one fault in every period, which the sample stands for.
+  takes the stack and the address of one fault in every period, which the
+  sample stands for. The address needs `--data`, which has perf write a
+  0 address with each CPU sample too.
   A fault is where a thread first touched memory, so they show the code that
   made the process grow, not what holds its memory: one fault can map many
   pages, as a huge page or a file's pages around the one touched, and

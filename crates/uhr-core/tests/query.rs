@@ -1733,6 +1733,7 @@ fn with_page_faults(mut recording: Recording) -> Recording {
         mode,
         stack,
         faults: 64,
+        address: 0x5555_0000_1000,
     };
     recording.page_faults = vec![
         fault(0, Mode::User, 1),

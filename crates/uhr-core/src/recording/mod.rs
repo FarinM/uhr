@@ -349,6 +349,8 @@ pub struct FaultSample {
     pub mode: Mode,
     pub stack: u32,
     pub faults: u64,
+    /// Where the fault was: the memory touched.
+    pub address: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
@@ -654,6 +656,7 @@ impl Recording {
                 Column::string("mode", faults.iter().map(|f| f.mode.as_str()).collect()),
                 Column::u32("stack_id", faults.iter().map(|f| f.stack).collect()),
                 Column::u64("faults", faults.iter().map(|f| f.faults).collect()),
+                Column::u64("address", faults.iter().map(|f| f.address).collect()),
             ],
         )?;
 
@@ -1008,6 +1011,7 @@ fn read_page_faults(dir: &Path) -> Result<Vec<FaultSample>> {
     let mode = table.string("mode")?;
     let stack = table.u32("stack_id")?;
     let faults = table.u64("faults")?;
+    let address = table.u64("address")?;
     (0..table.len())
         .map(|i| {
             Ok(FaultSample {
@@ -1018,6 +1022,7 @@ fn read_page_faults(dir: &Path) -> Result<Vec<FaultSample>> {
                 mode: Mode::parse(&mode[i]).map_err(|reason| table.invalid(reason))?,
                 stack: stack[i],
                 faults: faults[i],
+                address: address[i],
             })
         })
         .collect()

@@ -186,6 +186,7 @@ fn example() -> Recording {
             mode: Mode::Kernel,
             stack: 0,
             faults: 64,
+            address: 0x7f00_0000_8000,
         }],
         off_cpu: vec![
             OffCPUInterval {

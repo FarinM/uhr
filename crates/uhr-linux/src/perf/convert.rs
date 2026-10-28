@@ -1145,6 +1145,9 @@ impl State {
         sample: &SampleRecord,
         period: Option<u64>,
     ) -> Result<()> {
+        let Some(address) = sample.addr else {
+            return Err(unexpected("page-fault sample without its address".into()));
+        };
         let taken = self.taken(record, sample, period)?;
         self.page_faults.push(FaultSample {
             time_ns: taken.time_ns,
@@ -1154,6 +1157,7 @@ impl State {
             mode: taken.mode,
             stack: taken.stack,
             faults: taken.period,
+            address,
         });
         Ok(())
     }
@@ -1274,6 +1278,7 @@ impl State {
                 mode,
                 stack,
                 faults: header.period,
+                address: header.address,
             });
             return;
         }
@@ -2185,6 +2190,7 @@ mod tests {
             time_ns: 5,
             ip: 0xffff_0000_1000,
             period: 1000,
+            address: 0,
             event: event::CPU_CLOCK,
             tgid,
             tid: tgid,
@@ -2226,6 +2232,7 @@ mod tests {
             time_ns: 7,
             ip: 0x1010,
             period: 1000,
+            address: 0,
             event: event::CPU_CLOCK,
             tgid: 1,
             tid: 1,
@@ -2257,10 +2264,11 @@ mod tests {
     fn puts_ebpf_samples_of_page_faults_apart_with_their_period() {
         let mut state = State::new(127);
         state.comm(1, 1, "app".into(), false, None);
-        let header = |event, period| SampleHeader {
+        let header = |event, period, address| SampleHeader {
             time_ns: 7,
             ip: 0x1010,
             period,
+            address,
             event,
             tgid: 1,
             tid: 1,
@@ -2278,8 +2286,8 @@ mod tests {
             mapped: 0,
         };
         for header in [
-            header(event::CPU_CLOCK, 1000),
-            header(event::PAGE_FAULT, 167),
+            header(event::CPU_CLOCK, 1000, 0),
+            header(event::PAGE_FAULT, 167, 0x7f00_0000),
         ] {
             state.ebpf_sample(&header, [(0x1010, None)].into_iter(), None, None, 1000);
         }
@@ -2287,9 +2295,9 @@ mod tests {
         let faults: Vec<_> = state
             .page_faults
             .iter()
-            .map(|f| (f.pid, f.faults))
+            .map(|f| (f.pid, f.faults, f.address))
             .collect();
-        assert_eq!(faults, [(1, 167)]);
+        assert_eq!(faults, [(1, 167, 0x7f00_0000)]);
         assert_eq!(state.page_faults[0].stack, state.samples[0].stack);
     }
 
