@@ -6,17 +6,27 @@
  * Usage: grow [MiB] [child MiB] [ms to keep it]   (128, 64 and 300 by default)
  */
 #include <stdlib.h>
-#include <string.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 #define STEP (8 << 20)
 
-/* Touched, so every page is resident. */
+/*
+ * Writes a byte to each page, so that every page is resident. Through a
+ * volatile pointer, as a compiler may drop writes nothing reads, and in a
+ * function of its own, which the page faults are then in.
+ */
+__attribute__((noinline)) static void touch(volatile char *memory, long bytes)
+{
+	long page = sysconf(_SC_PAGESIZE);
+	for (long at = 0; at < bytes; at += page)
+		memory[at] = 1;
+}
+
 static void grow(long mib)
 {
 	for (long done = 0; done < mib << 20; done += STEP) {
-		memset(malloc(STEP), 1, STEP);
+		touch(malloc(STEP), STEP);
 		usleep(20000);
 	}
 }
