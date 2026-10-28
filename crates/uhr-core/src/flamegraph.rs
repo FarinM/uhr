@@ -51,7 +51,8 @@ pub struct FlameGraph {
     pub filter: Filter,
     /// The function the graph starts at, if not the start of each thread.
     pub root: Option<Function>,
-    /// CPU samples that passed the filter, if the metric counts them.
+    /// CPU samples, or page-fault samples, that passed the filter, if the
+    /// metric counts them.
     pub samples: u64,
     /// Off-CPU intervals that passed the filter, if the metric counts them.
     pub off_cpu_intervals: u64,

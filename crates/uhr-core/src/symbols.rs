@@ -1107,6 +1107,7 @@ mod tests {
             ],
             stacks: Vec::new(),
             samples: Vec::new(),
+            page_faults: Vec::new(),
             off_cpu: Vec::new(),
             kernel_symbols: Vec::new(),
             jit_symbols: Vec::new(),

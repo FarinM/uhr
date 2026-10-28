@@ -15,6 +15,7 @@ A recording is a directory:
 | `frames.parquet` | Unique frames, before symbol resolution |
 | `stacks.parquet` | Unique stacks as lists of frames |
 | `samples.parquet` | CPU samples |
+| `page_faults.parquet` | Samples of the page faults threads took, with their stacks |
 | `off_cpu.parquet` | Times threads spent off CPU, with why and where |
 | `kernel_symbols.parquet` | The kernel functions kernel frames fall in, read while recording |
 | `jit_symbols.parquet` | The code runtimes compiled that frames fall in, named in the runtimes' perf maps while recording |
@@ -58,21 +59,23 @@ Each stream has:
 | Field | Meaning |
 |---|---|
 | `id` | Unique within the recording |
-| `collector` | `name` plus the collector's version and settings. For perf: `version`, `sampling`, `context_switches` (whether perf recorded every context switch). uhr's eBPF programs are `ebpf`, with `programs`, their tags in hex, as in the kernel's names for their code: `bpf_prog_<tag>_<name>`, and `sampling`. uhr reading `/proc` is `procfs`, with `interval_ns`, how often it read |
+| `collector` | `name` plus the collector's version and settings. For perf: `version`, `sampling`, `page_faults`, `context_switches` (whether perf recorded every context switch). uhr's eBPF programs are `ebpf`, with `programs`, their tags in hex, as in the kernel's names for their code: `bpf_prog_<tag>_<name>`, `sampling` and `page_faults`. uhr reading `/proc` is `procfs`, with `interval_ns`, how often it read |
+| `collector.page_faults` | How the collector sampled page faults: `event` and `period`, one fault in every that many, which each sample stands for. Null for one that did not |
 | `collector.sampling` | How the collector sampled CPU time: `event`, `frequency_hz` (what it sampled at), `requested_frequency_hz`. Null for one that did not |
-| `signals` | What was captured: `user_cpu_samples`, `kernel_cpu_samples`, `user_stacks`, `kernel_stacks`, `off_cpu_time` (when threads went off CPU and came back, and whether they were preempted), `off_cpu_stacks` (where they went off CPU), `syscall_calls` (how often threads called each syscall and how long the calls took), `resident_memory` (how much memory each process had resident and in swap, over time) |
+| `signals` | What was captured: `user_cpu_samples`, `kernel_cpu_samples`, `user_stacks`, `kernel_stacks`, `off_cpu_time` (when threads went off CPU and came back, and whether they were preempted), `off_cpu_stacks` (where they went off CPU), `syscall_calls` (how often threads called each syscall and how long the calls took), `resident_memory` (how much memory each process had resident and in swap, over time), `page_faults` (samples of the page faults threads took, with their stacks) |
 | `missing_signals` | Signals requested but not captured, each with a `reason`. Without `kernel_cpu_samples`, CPU time spent in the kernel is not in the samples at all, not merely unnamed. Threads go off CPU in the kernel, so without kernel sampling `off_cpu_stacks` is missing too |
 | `coverage.lost_events` | Events the kernel dropped |
 | `coverage.stacks` | For a collector that takes stacks, the counts below. Null for one that takes none |
 | `coverage.stacks.unwinding` | How user stacks were walked: `frame_pointers` or `dwarf` |
 | `coverage.stacks.stack_copy_bytes` | User stack copied with each stack, as the collector used it. Null without `dwarf` |
-| `coverage.stacks.samples` | Samples written |
+| `coverage.stacks.samples` | CPU samples written |
+| `coverage.stacks.page_fault_samples` | Page-fault samples written. Null without page faults |
 | `coverage.stacks.off_cpu_intervals` | Off-CPU intervals written. Null without `context_switches` |
 | `coverage.stacks.throttle_events` | Times the kernel throttled sampling. Null where the collector does not see it, as for `ebpf`, whose events have no buffer for the kernel to say so in |
 | `coverage.stacks.max_stack_depth` | Stacks deeper than this were cut |
-| `coverage.stacks.stacks_at_stack_limit` | Stacks that reached that depth. This and the next two count every stack: one per sample and one per switch out |
+| `coverage.stacks.stacks_at_stack_limit` | Stacks that reached that depth. This and the next two count every stack: one per CPU or page-fault sample and one per switch out |
 | `coverage.stacks.stacks_cut_at_stack_copy` | Stacks that went on past the end of their stack copy, so their outer callers are missing. A copy the kernel ended early, where it could read no further, does not count. Null without `dwarf` |
-| `coverage.stacks.interpreters` | For each runtime and version whose interpreter frames the collector read, over the samples of the processes that ran it: `runtime`, `version`, `processes`, `samples`, `before_found` (samples taken before uhr found the runtime, without its frames), `no_thread` (of threads it keeps no state for), `unsearched` (of threads whose state was past the 256 the collector searches), `failed` (whose frames could not be read), `cut` (whose frames went on past the 127 uhr reads), `frames`, `unread_frames` (whose code could not be read) and `unmatched`. For a runtime that keeps its frames in its memory, each call native code made into the interpreter ran a group of its frames, which goes just above that call's frames of the eval loop. An interpreter that keeps where each call starts on the native stack has each group go by where that is. For one that does not, groups are matched to the eval loop's frames in the stack, and `unmatched` counts the samples whose native stack lost some of those, so where a group went is a guess. For one that keeps them on the native stack, each takes the place of the native frame that ran it, and `unmatched` is 0. Empty for a collector that reads none |
+| `coverage.stacks.interpreters` | For each runtime and version whose interpreter frames the collector read, over the samples, of CPU time and page faults, of the processes that ran it: `runtime`, `version`, `processes`, `samples`, `before_found` (samples taken before uhr found the runtime, without its frames), `no_thread` (of threads it keeps no state for), `unsearched` (of threads whose state was past the 256 the collector searches), `failed` (whose frames could not be read), `cut` (whose frames went on past the 127 uhr reads), `frames`, `unread_frames` (whose code could not be read) and `unmatched`. For a runtime that keeps its frames in its memory, each call native code made into the interpreter ran a group of its frames, which goes just above that call's frames of the eval loop. An interpreter that keeps where each call starts on the native stack has each group go by where that is. For one that does not, groups are matched to the eval loop's frames in the stack, and `unmatched` counts the samples whose native stack lost some of those, so where a group went is a guess. For one that keeps them on the native stack, each takes the place of the native frame that ran it, and `unmatched` is 0. Empty for a collector that reads none |
 | `coverage.stacks.stacks_not_unwound` | Stacks of 32-bit code, which `dwarf` unwinding cannot walk. They keep only the instruction they were taken at. Null without `dwarf` |
 | `coverage.overhead_ns` | Profiler overhead. Null until it is measured. For `ebpf`, the target's CPU time in uhr's programs, from its samples, which leaves out the sampling program itself, as no sample lands in it. Null without kernel stacks, or their names, to find them by. For `procfs`, uhr's own CPU time reading `/proc` |
 | `coverage.known_biases` | Biases of this collector, in words |
@@ -139,6 +142,19 @@ Each stream has:
 | `mode` | string | `user`, `kernel` or `unknown` (hypervisor, guest) |
 | `stack_id` | uint32 | |
 | `cpu_ns` | uint64 | CPU time this sample stands for |
+
+`page_faults`, one row per sample of the page faults a thread took. The
+collector samples one fault in every period, its `page_faults.period`, and
+takes the thread's stack at it.
+
+| Column | Type | Meaning |
+|---|---|---|
+| `time_ns` | uint64 | |
+| `pid`, `tid` | uint32 | |
+| `cpu` | uint32, nullable | Null if not recorded |
+| `mode` | string | What the fault came from: `user` code, or the `kernel`, as when a syscall copied to or from the process's memory |
+| `stack_id` | uint32 | |
+| `faults` | uint64 | The faults the sample stands for |
 
 `off_cpu`, one row per time a thread was switched out, sorted by
 `start_ns`. A thread still off CPU when the capture ends stays off until

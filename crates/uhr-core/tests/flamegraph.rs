@@ -122,6 +122,7 @@ fn recording() -> (Recording, Symbols) {
         frames,
         stacks: stacks.into_iter().map(|(stack, _)| stack).collect(),
         samples,
+        page_faults: Vec::new(),
         off_cpu: Vec::new(),
         kernel_symbols: Vec::new(),
         jit_symbols: Vec::new(),

@@ -71,6 +71,7 @@ asks otherwise. Deeper signals are added when the question needs them.
 | Syscalls | time level 1 | eBPF on `raw_syscalls` tracepoints, `perf trace` | xctrace System Trace | ETW syscall events |
 | Mixed native and runtime stacks | time levels 2-4 for runtimes | uhr's eBPF collector, perf with runtime perf maps, py-spy `--native` | runtime profilers (limited) | runtime profilers |
 | Runtime CPU profiles | time levels 2-4 | async-profiler, V8 `--cpu-prof`, Go pprof, rbspy, dotnet-trace | same | same |
+| Page faults with stacks | memory level 2: where memory is first touched | perf `page-faults`, eBPF at the page-fault event | xctrace | ETW page fault events |
 | Allocations | memory level 2 | heaptrack-style `LD_PRELOAD`, memray, async-profiler alloc, V8 sampling heap profiler, Go heap profile | xctrace Allocations, runtime profilers | ETW heap events, runtime profilers |
 | Heap snapshots | memory level 3 | V8 heap snapshot, hprof, gcdump | same | same |
 | Hardware counters | time level 5 | perf_event | xctrace CPU Counters | ETW PMC sampling |
@@ -96,6 +97,22 @@ Debian and Ubuntu its package must match the running kernel.
 
 - `cpu-clock` at 999 Hz. Its sample period is in nanoseconds, so a sample's
   weight is CPU time.
+- Page faults, unless `uhr record --no-page-faults`: the `page-faults` event
+  takes the stack of one fault in every period, which the sample stands for.
+  A fault is where a thread first touched memory, so they show the code that
+  made the process grow, not what holds its memory: one fault can map many
+  pages, as a huge page or a file's pages around the one touched, and
+  freeing memory is not seen. The period is fixed, as faults come in bursts
+  that throw off the kernel's frequency mode, which raises the period by
+  part of the gap at each sample: a Python program's 43,000 faults got 14
+  samples. With frame pointers it is 64 faults, where counting every fault
+  costs more than the samples. A copy of the stack costs most of a sample,
+  so with `--unwind dwarf` the period is the copy's size over 128 bytes, at
+  least 64: 256 for 32 KB, so the copies come to at most 128 bytes a fault.
+  A program that did nothing but touch 2 GiB, a page at a time, took
+  524,288 faults, and uhr took 8,193 samples with frame pointers, or 2,048
+  with copies, 64 MB of them. The program ran up to 7% longer than without
+  them, under perf or uhr's eBPF programs.
 - Off CPU, unless `uhr record --no-off-cpu`: the `context-switches` event
   with a period of 1 takes the stack of each thread going off CPU, and
   `--switch-events` records when it went and came back, and whether it was
@@ -202,6 +219,14 @@ from tracepoints, such as wakeups and syscall latency.
   accounting uses, which uhr finds in the kernel's BTF. The kernel drops the
   sampling event of a CPU going offline, as across a suspend, so they see
   CPUs go and come back, and uhr starts sampling each again once it is back.
+- They sample page faults in place of perf too, with the period perf would
+  use, at the page-fault event on each CPU, and walk the same frames,
+  interpreters' too, so a fault in Python code names the Python function.
+  The event counts the faults of every process on its CPU, so the target's
+  count is right on average, but less sure the more others fault there.
+  Samples taken before uhr finds a process's runtime, from its first
+  samples, have none of its frames, and a program faults most as it starts,
+  so its faults lose more of them than its CPU time does.
 - They walk the frames of the interpreters uhr finds in the target's
   processes, and count the times each maps a file's code, so uhr knows when
   to look for one again, see [runtimes](#runtimes).

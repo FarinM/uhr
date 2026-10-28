@@ -20,7 +20,7 @@ use uhr_core::doctor::{Report, Status};
 use uhr_core::filter::Filter;
 use uhr_core::flamegraph::{self, FlameGraph};
 use uhr_core::functions::Function;
-use uhr_core::metric::Metric;
+use uhr_core::metric::{Metric, Unit};
 use uhr_core::overview::{self, CPUTime, Memory, Overview};
 use uhr_core::query::{
     self, FunctionRow, GroupBy, Latency, ModuleRow, Query, QueryResult, Rows, SyscallRow,
@@ -178,6 +178,11 @@ struct RecordArgs {
     /// does from /proc every 100 ms
     #[arg(long)]
     no_memory: bool,
+    /// Don't sample the page faults the target's threads take, which show
+    /// the code that first touched memory. The sampler of CPU time samples
+    /// one in every 64, or fewer with stack copies
+    #[arg(long)]
+    no_page_faults: bool,
     /// What samples CPU time. By default uhr's eBPF programs do, when uhr
     /// may load them, and perf does otherwise
     #[arg(long, value_enum)]
@@ -235,6 +240,9 @@ enum MetricArg {
     OffCpu,
     /// Both, all the time threads were alive
     Wall,
+    /// Page faults, from samples of them: the code that first touched
+    /// memory
+    PageFaults,
 }
 
 impl From<MetricArg> for Metric {
@@ -243,6 +251,7 @@ impl From<MetricArg> for Metric {
             MetricArg::Cpu => Metric::OnCPU,
             MetricArg::OffCpu => Metric::OffCPU,
             MetricArg::Wall => Metric::Wall,
+            MetricArg::PageFaults => Metric::PageFaults,
         }
     }
 }
@@ -503,6 +512,7 @@ fn run_record(args: RecordArgs) -> Result<ExitCode> {
         runtime_support: !args.no_runtime_support,
         syscalls: !args.no_syscalls,
         memory: !args.no_memory,
+        page_faults: !args.no_page_faults,
         sampler: args.sampler.map(|sampler| match sampler {
             SamplerArg::Perf => Sampler::Perf,
             SamplerArg::Ebpf => Sampler::Ebpf,
@@ -797,6 +807,7 @@ fn run_flamegraph(
             Metric::OnCPU => "CPU time",
             Metric::OffCPU => "Off-CPU time",
             Metric::Wall => "Thread time",
+            Metric::PageFaults => "Page faults",
         };
         let title = match graph.command.is_empty() {
             true => what.to_owned(),
@@ -849,7 +860,8 @@ fn write_flamegraph(out: &mut impl Write, graph: &FlameGraph, output: &Path) -> 
     if let Some(share) = coverage.named_share {
         writeln!(
             out,
-            "  graphed time with every frame named: {:.1}%",
+            "  graphed {} with every frame named: {:.1}%",
+            counted(graph.unit),
             share * 100.0
         )?;
     }
@@ -908,10 +920,15 @@ fn write_call_paths(out: &mut impl Write, result: &CallPaths) -> io::Result<()> 
     match coverage.named_share {
         Some(share) => writeln!(
             out,
-            "  function time with every frame named, within the depth: {:.1}%",
+            "  function {} with every frame named, within the depth: {:.1}%",
+            counted(result.unit),
             share * 100.0
         ),
-        None => writeln!(out, "  named frames: unknown, no time in the function"),
+        None => writeln!(
+            out,
+            "  named frames: unknown, no {} in the function",
+            counted(result.unit)
+        ),
     }?;
     for (origin, share) in &coverage.unnamed_by_origin {
         writeln!(out, "  unnamed {}: {:.1}%", origin.as_str(), share * 100.0)?;
@@ -1009,7 +1026,7 @@ fn write_query(out: &mut impl Write, result: &QueryResult) -> io::Result<()> {
     match &result.rows {
         Rows::Functions(rows) => write_function_rows(out, result.group_by == GroupBy::Line, rows)?,
         Rows::Modules(rows) => write_module_rows(out, rows)?,
-        Rows::Syscalls(rows) => write_syscall_rows(out, rows)?,
+        Rows::Syscalls(rows) => write_syscall_rows(out, rows, result.unit)?,
     }
     if result.rows_omitted > 0 {
         writeln!(
@@ -1022,15 +1039,29 @@ fn write_query(out: &mut impl Write, result: &QueryResult) -> io::Result<()> {
     let coverage = &result.coverage;
     writeln!(out, "\ncoverage")?;
     match coverage.named_share {
-        Some(share) => writeln!(out, "  time with a named leaf frame: {:.1}%", share * 100.0),
-        None => writeln!(out, "  time with a named leaf frame: unknown, no time"),
+        Some(share) => writeln!(
+            out,
+            "  {} with a named leaf frame: {:.1}%",
+            counted(result.unit),
+            share * 100.0
+        ),
+        None => writeln!(
+            out,
+            "  {0} with a named leaf frame: unknown, no {0}",
+            counted(result.unit)
+        ),
     }?;
     for (origin, share) in &coverage.unnamed_by_origin {
         writeln!(out, "  unnamed {}: {:.1}%", origin.as_str(), share * 100.0)?;
     }
     write_no_stack(out, coverage.no_stack_share)?;
     if let Some(share) = coverage.own_programs_share {
-        writeln!(out, "  time in uhr's eBPF programs: {:.1}%", share * 100.0)?;
+        writeln!(
+            out,
+            "  {} in uhr's eBPF programs: {:.1}%",
+            counted(result.unit),
+            share * 100.0
+        )?;
     }
     write_symbol_coverage(out, &coverage.symbols)?;
     write_coverage(out, &coverage.recording)
@@ -1078,16 +1109,17 @@ fn write_module_rows(out: &mut impl Write, rows: &[ModuleRow]) -> io::Result<()>
     Ok(())
 }
 
-fn write_syscall_rows(out: &mut impl Write, rows: &[SyscallRow]) -> io::Result<()> {
-    let counted = rows.iter().any(|row| row.calls.is_some());
-    if counted {
+fn write_syscall_rows(out: &mut impl Write, rows: &[SyscallRow], unit: Unit) -> io::Result<()> {
+    let what = counted(unit);
+    let calls = rows.iter().any(|row| row.calls.is_some());
+    if calls {
         writeln!(
             out,
             "{:>7} {:>9} {:>10} {:>9} {:>9}  syscall",
-            "time", "calls", "in calls", "median", "p99"
+            what, "calls", "in calls", "median", "p99"
         )?;
     } else {
-        writeln!(out, "{:>7}  syscall", "time")?;
+        writeln!(out, "{what:>7}  syscall")?;
     }
     for row in rows {
         let syscall = match (row.in_syscall, &row.syscall) {
@@ -1112,7 +1144,7 @@ fn write_syscall_rows(out: &mut impl Write, rows: &[SyscallRow]) -> io::Result<(
                     calls.p99.map(latency).unwrap_or_default(),
                 )?;
             }
-            None if counted => write!(out, " {:>9} {:>10} {:>9} {:>9}", "", "", "", "")?,
+            None if calls => write!(out, " {:>9} {:>10} {:>9} {:>9}", "", "", "", "")?,
             None => {}
         }
         writeln!(out, "  {syscall}")?;
@@ -1156,6 +1188,15 @@ fn describe_amount(metric: Metric, samples: u64, intervals: u64, value: u64) -> 
         Metric::Wall => format!(
             "{samples} samples and {intervals} off-CPU intervals, {seconds:.2} s of thread time"
         ),
+        Metric::PageFaults => format!("{samples} page-fault samples, {value} page faults"),
+    }
+}
+
+/// What a result's amounts are of, in its coverage.
+fn counted(unit: Unit) -> &'static str {
+    match unit {
+        Unit::Ns => "time",
+        Unit::Faults => "faults",
     }
 }
 

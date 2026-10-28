@@ -23,13 +23,13 @@ use super::{Error, Result, io_error};
 use crate::interpreters::{Interpreters, Program};
 use crate::kallsyms::{self, Kallsyms};
 use uhr_core::recording::{
-    Clock, Collector, Exit, FORMAT_VERSION, Frame, Interpreted, InterpretedCode,
-    InterpreterCoverage, KERNEL, KernelSymbols, Manifest, Mapping, MissingSignal, Mode,
-    OffCPUInterval, Origin, Platform, Recording, Sample, Sampling, Signal, StackCoverage, Stream,
-    StreamCoverage, Target, Thread, ThreadName, ThreadState, Unwinding,
+    Clock, Collector, Exit, FORMAT_VERSION, FaultSample, FaultSampling, Frame, Interpreted,
+    InterpretedCode, InterpreterCoverage, KERNEL, KernelSymbols, Manifest, Mapping, MissingSignal,
+    Mode, OffCPUInterval, Origin, Platform, Recording, Sample, Sampling, Signal, StackCoverage,
+    Stream, StreamCoverage, Target, Thread, ThreadName, ThreadState, Unwinding,
 };
 use uhr_core::runtimes::{Frames, Interpreter, WalkedFrame};
-use uhr_ebpf::{MAX_FRAMES, SampleHeader, UserRegisters, mode, walk};
+use uhr_ebpf::{MAX_FRAMES, SampleHeader, UserRegisters, event, mode, walk};
 
 pub(super) struct Input<'a> {
     pub perf_data: &'a Path,
@@ -65,11 +65,18 @@ pub(super) struct EbpfSamples<'a> {
     pub stack_bytes: Option<u32>,
     /// The interpreters whose frames they walked.
     pub interpreters: &'a Interpreters,
+    /// Whether they sampled page faults too.
+    pub page_faults: bool,
 }
 
 pub(super) const TIMER_BIAS: &str = "cpu-clock samples come from a timer interrupt, so code \
      that runs with interrupts disabled is under-sampled and samples can land a few instructions \
      late.";
+pub(super) const FAULTS_BIAS: &str = "Page faults show where threads first touched memory, \
+     not how much they use: one fault can map many pages, as a huge page or the pages of a file \
+     around the one touched, memory touched before the capture faults no more, and freeing it is \
+     not seen. One fault in every period is sampled, and stands for the period's faults, so code \
+     that faults fewer times than that shows only by chance.";
 pub(super) const FRAME_POINTER_BIAS: &str = "Frame-pointer unwinding cuts stacks short in code \
      built without frame pointers, and misses the caller of a leaf function that has no frame \
      setup.";
@@ -114,16 +121,21 @@ pub(super) fn convert(input: Input) -> Result<(Recording, Option<EbpfStacks>)> {
             PerfEventType::Software(SoftwareCounterType::ContextSwitches)
         )
     });
+    let faults = index(|t| matches!(t, PerfEventType::Software(SoftwareCounterType::PageFaults)));
     // With uhr's eBPF programs sampling, perf only tracks the processes.
     let sampled = input.ebpf_samples.is_none();
-    let expected = usize::from(sampled) + usize::from(switches.is_some());
-    if cpu_clock.is_some() != sampled || attributes.len() != expected {
+    let expected =
+        usize::from(sampled) + usize::from(switches.is_some()) + usize::from(faults.is_some());
+    if cpu_clock.is_some() != sampled
+        || (faults.is_some() && !sampled)
+        || attributes.len() != expected
+    {
         let types: Vec<_> = attributes
             .iter()
             .map(|(_, a)| a.attributes().type_)
             .collect();
         let wanted = if sampled {
-            "a cpu-clock event and maybe a context-switches event"
+            "a cpu-clock event, and maybe a context-switches and a page-faults event"
         } else {
             "at most a context-switches event"
         };
@@ -143,6 +155,18 @@ pub(super) fn convert(input: Input) -> Result<(Recording, Option<EbpfStacks>)> {
         };
         frequency_hz = Some(frequency);
         kernel_excluded = attr.flags.contains(AttrFlags::EXCLUDE_KERNEL);
+    }
+    let mut fault_period = None;
+    if let Some(faults) = faults {
+        let attr = all[faults].attributes();
+        check_clock(attr)?;
+        let SamplingPolicy::Period(period) = attr.sampling_policy else {
+            return Err(unexpected(format!(
+                "expected page faults sampled by period, found {:?}",
+                attr.sampling_policy
+            )));
+        };
+        fault_period = Some(period.get());
     }
     // perf takes every stack the same way.
     let stack_copy_bytes = cpu_clock.or(switches).and_then(|index| {
@@ -227,6 +251,9 @@ pub(super) fn convert(input: Input) -> Result<(Recording, Option<EbpfStacks>)> {
             }
             EventRecord::Sample(sample) if Some(attr_index) == switches => {
                 state.switch_sample(&record, &sample)?
+            }
+            EventRecord::Sample(sample) if Some(attr_index) == faults => {
+                state.fault_sample(&record, &sample, fault_period)?
             }
             EventRecord::Sample(_) => {
                 return Err(unexpected(
@@ -337,6 +364,9 @@ pub(super) fn convert(input: Input) -> Result<(Recording, Option<EbpfStacks>)> {
             signals.extend(kernel_signals);
         }
     }
+    if faults.is_some() {
+        signals.push(Signal::PageFaults);
+    }
     if switches.is_some() {
         signals.push(Signal::OffCPUTime);
         if switch_stacks_excluded {
@@ -357,6 +387,15 @@ pub(super) fn convert(input: Input) -> Result<(Recording, Option<EbpfStacks>)> {
     if sampled {
         known_biases.push(TIMER_BIAS);
     }
+    if faults.is_some() {
+        known_biases.push(FAULTS_BIAS);
+        if kernel_excluded {
+            known_biases.push(
+                "Page faults taken in the kernel, as when a syscall copies to or from the \
+                 process's memory, are not sampled: perf excluded the kernel.",
+            );
+        }
+    }
     if stacks_taken {
         known_biases.push(match stack_copy_bytes {
             Some(_) => DWARF_BIAS,
@@ -375,6 +414,10 @@ pub(super) fn convert(input: Input) -> Result<(Recording, Option<EbpfStacks>)> {
                 frequency_hz,
                 requested_frequency_hz: input.requested_frequency_hz,
             }),
+            page_faults: fault_period.map(|period| FaultSampling {
+                event: "page-faults".into(),
+                period,
+            }),
             context_switches: switches.is_some(),
         },
         signals,
@@ -388,6 +431,7 @@ pub(super) fn convert(input: Input) -> Result<(Recording, Option<EbpfStacks>)> {
                 },
                 stack_copy_bytes,
                 samples: state.samples.len() as u64 - state.ebpf_samples,
+                page_fault_samples: faults.map(|_| state.page_faults.len() as u64),
                 off_cpu_intervals: switches.map(|_| state.off_cpu.len() as u64),
                 throttle_events: Some(state.throttle_events),
                 max_stack_depth: input.max_stack_depth,
@@ -401,7 +445,7 @@ pub(super) fn convert(input: Input) -> Result<(Recording, Option<EbpfStacks>)> {
         },
     };
     let ebpf_stacks = input.ebpf_samples.map(|samples| EbpfStacks {
-        coverage: ebpf_coverage(&state, input.max_stack_depth, samples.stack_bytes),
+        coverage: ebpf_coverage(&state, input.max_stack_depth, samples),
         untracked: state.ebpf_untracked,
     });
 
@@ -443,6 +487,7 @@ pub(super) fn convert(input: Input) -> Result<(Recording, Option<EbpfStacks>)> {
         frames: state.frames,
         stacks: state.stacks,
         samples: state.samples,
+        page_faults: state.page_faults,
         off_cpu: state.off_cpu,
         kernel_symbols,
         jit_symbols: Vec::new(),
@@ -453,7 +498,8 @@ pub(super) fn convert(input: Input) -> Result<(Recording, Option<EbpfStacks>)> {
     Ok((recording, ebpf_stacks))
 }
 
-fn ebpf_coverage(state: &State, max_stack_depth: u32, stack_bytes: Option<u32>) -> StackCoverage {
+fn ebpf_coverage(state: &State, max_stack_depth: u32, samples: EbpfSamples) -> StackCoverage {
+    let stack_bytes = samples.stack_bytes;
     StackCoverage {
         unwinding: match stack_bytes {
             Some(_) => Unwinding::Dwarf,
@@ -461,6 +507,9 @@ fn ebpf_coverage(state: &State, max_stack_depth: u32, stack_bytes: Option<u32>) 
         },
         stack_copy_bytes: stack_bytes,
         samples: state.ebpf_samples,
+        page_fault_samples: samples
+            .page_faults
+            .then_some(state.page_faults.len() as u64),
         off_cpu_intervals: None,
         // The kernel reports throttling in an event's buffer, and the
         // events the programs sample at have none.
@@ -846,6 +895,7 @@ struct State {
     stacks: Vec<Vec<u32>>,
     stack_ids: HashMap<Vec<u32>, u32>,
     samples: Vec<Sample>,
+    page_faults: Vec<FaultSample>,
     /// The stack perf took of a thread about to go off CPU, until its
     /// switch record comes.
     switch_stacks: HashMap<(u32, u32), u32>,
@@ -891,6 +941,16 @@ struct Walks {
     unmatched: u64,
 }
 
+struct Taken {
+    time_ns: u64,
+    pid: u32,
+    tid: u32,
+    mode: Mode,
+    stack: u32,
+    /// The time or the faults the sample stands for.
+    period: u64,
+}
+
 struct SwitchedOut {
     time_ns: u64,
     state: ThreadState,
@@ -918,6 +978,7 @@ impl State {
             samples: Vec::new(),
             switch_stacks: HashMap::new(),
             switched_out: HashMap::new(),
+            page_faults: Vec::new(),
             off_cpu: Vec::new(),
             attached_ns: None,
             first_on_cpu: HashMap::new(),
@@ -1063,29 +1124,71 @@ impl State {
     }
 
     fn sample(&mut self, record: &RawEventRecord, sample: &SampleRecord) -> Result<()> {
-        let (Some(pid), Some(tid), Some(time_ns), Some(period)) =
-            (sample.pid, sample.tid, sample.timestamp, sample.period)
-        else {
+        let taken = self.taken(record, sample, None)?;
+        self.samples.push(Sample {
+            time_ns: taken.time_ns,
+            pid: taken.pid,
+            tid: taken.tid,
+            cpu: sample.cpu,
+            mode: taken.mode,
+            stack: taken.stack,
+            cpu_ns: taken.period,
+        });
+        Ok(())
+    }
+
+    /// A sample of page faults, one in every `period`, which perf then
+    /// leaves out of each.
+    fn fault_sample(
+        &mut self,
+        record: &RawEventRecord,
+        sample: &SampleRecord,
+        period: Option<u64>,
+    ) -> Result<()> {
+        let taken = self.taken(record, sample, period)?;
+        self.page_faults.push(FaultSample {
+            time_ns: taken.time_ns,
+            pid: taken.pid,
+            tid: taken.tid,
+            cpu: sample.cpu,
+            mode: taken.mode,
+            stack: taken.stack,
+            faults: taken.period,
+        });
+        Ok(())
+    }
+
+    /// What perf took of a thread on CPU, at a timer's tick or a fault,
+    /// with the event's period where the sample has none.
+    fn taken(
+        &mut self,
+        record: &RawEventRecord,
+        sample: &SampleRecord,
+        period: Option<u64>,
+    ) -> Result<Taken> {
+        let (Some(pid), Some(tid), Some(time_ns), Some(period)) = (
+            sample.pid,
+            sample.tid,
+            sample.timestamp,
+            sample.period.or(period),
+        ) else {
             return Err(unexpected("sample without pid, tid, time or period".into()));
         };
         let (pid, tid) = (id(pid)?, id(tid)?);
         self.thread(pid, tid);
         self.seen_on_cpu(pid, tid, time_ns);
-        let stack = self.stack(pid, time_ns, record, sample)?;
-        self.samples.push(Sample {
+        Ok(Taken {
             time_ns,
             pid,
             tid,
-            cpu: sample.cpu,
             mode: match sample.cpu_mode {
                 CpuMode::User => Mode::User,
                 CpuMode::Kernel => Mode::Kernel,
                 _ => Mode::Unknown,
             },
-            stack,
-            cpu_ns: period,
-        });
-        Ok(())
+            stack: self.stack(pid, time_ns, record, sample)?,
+            period,
+        })
     }
 
     /// A sample of uhr's eBPF programs, with its kernel frames and then its
@@ -1162,6 +1265,18 @@ impl State {
             self.add_walked(header, &mut stack, &ends, interpreters, walked, cut_short);
         }
         let stack = intern(&mut self.stacks, &mut self.stack_ids, stack);
+        if header.event == event::PAGE_FAULT {
+            self.page_faults.push(FaultSample {
+                time_ns,
+                pid,
+                tid,
+                cpu: Some(header.cpu),
+                mode,
+                stack,
+                faults: header.period,
+            });
+            return;
+        }
         self.ebpf_samples += 1;
         self.samples.push(Sample {
             time_ns,
@@ -2069,6 +2184,8 @@ mod tests {
         let header = |tgid| SampleHeader {
             time_ns: 5,
             ip: 0xffff_0000_1000,
+            period: 1000,
+            event: event::CPU_CLOCK,
             tgid,
             tid: tgid,
             cpu: 0,
@@ -2108,6 +2225,8 @@ mod tests {
         let header = SampleHeader {
             time_ns: 7,
             ip: 0x1010,
+            period: 1000,
+            event: event::CPU_CLOCK,
             tgid: 1,
             tid: 1,
             cpu: 0,
@@ -2132,6 +2251,46 @@ mod tests {
             .map(|t| (t.start_ns, t.end_ns))
             .collect();
         assert_eq!(main, [(None, Some(5)), (Some(6), None)]);
+    }
+
+    #[test]
+    fn puts_ebpf_samples_of_page_faults_apart_with_their_period() {
+        let mut state = State::new(127);
+        state.comm(1, 1, "app".into(), false, None);
+        let header = |event, period| SampleHeader {
+            time_ns: 7,
+            ip: 0x1010,
+            period,
+            event,
+            tgid: 1,
+            tid: 1,
+            cpu: 0,
+            mode: mode::USER,
+            kernel_frames: 0,
+            user_frames: 1,
+            stack_bytes: 0,
+            copy: 0,
+            walk: 0,
+            walked_frames: 0,
+            walked_bytes: 0,
+            frame_ends: 0,
+            exec: 0,
+            mapped: 0,
+        };
+        for header in [
+            header(event::CPU_CLOCK, 1000),
+            header(event::PAGE_FAULT, 167),
+        ] {
+            state.ebpf_sample(&header, [(0x1010, None)].into_iter(), None, None, 1000);
+        }
+        assert_eq!((state.samples.len(), state.ebpf_samples), (1, 1));
+        let faults: Vec<_> = state
+            .page_faults
+            .iter()
+            .map(|f| (f.pid, f.faults))
+            .collect();
+        assert_eq!(faults, [(1, 167)]);
+        assert_eq!(state.page_faults[0].stack, state.samples[0].stack);
     }
 
     #[test]

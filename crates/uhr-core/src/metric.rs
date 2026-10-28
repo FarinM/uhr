@@ -16,6 +16,10 @@ pub enum Metric {
     /// Both, so all the time each thread was alive, summed over threads.
     #[serde(rename = "wall")]
     Wall,
+    /// Page faults, from samples of them, which show the code that first
+    /// touched memory.
+    #[serde(rename = "page_faults")]
+    PageFaults,
 }
 
 /// What a metric's amounts count.
@@ -24,6 +28,8 @@ pub enum Metric {
 pub enum Unit {
     /// Nanoseconds.
     Ns,
+    /// Page faults.
+    Faults,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -33,26 +39,36 @@ pub enum Error {
          --no-off-cpu"
     )]
     NoContextSwitches,
+    #[error("the recording has no page faults. Record without --no-page-faults")]
+    NoPageFaults,
 }
 
 impl Metric {
     pub fn unit(self) -> Unit {
         match self {
             Metric::OnCPU | Metric::OffCPU | Metric::Wall => Unit::Ns,
+            Metric::PageFaults => Unit::Faults,
         }
     }
 
     /// Fails if the recording lacks what the metric is made of.
     pub(crate) fn check(self, recording: &Recording) -> Result<(), Error> {
-        let switches = recording
-            .manifest
-            .streams
-            .iter()
-            .any(|s| s.signals.contains(&Signal::OffCPUTime));
-        if self != Metric::OnCPU && !switches {
-            return Err(Error::NoContextSwitches);
+        let has = |signal| {
+            recording
+                .manifest
+                .streams
+                .iter()
+                .any(|s| s.signals.contains(&signal))
+        };
+        match self {
+            Metric::OnCPU => Ok(()),
+            Metric::OffCPU | Metric::Wall if !has(Signal::OffCPUTime) => {
+                Err(Error::NoContextSwitches)
+            }
+            Metric::OffCPU | Metric::Wall => Ok(()),
+            Metric::PageFaults if !has(Signal::PageFaults) => Err(Error::NoPageFaults),
+            Metric::PageFaults => Ok(()),
         }
-        Ok(())
     }
 }
 
@@ -64,6 +80,7 @@ pub(crate) struct StackAmounts {
     pub user: Vec<u64>,
     /// Off-CPU time whose stack was not recorded.
     pub no_stack: u64,
+    /// CPU samples, or page-fault samples, as the metric counts.
     pub samples: u64,
     pub off_cpu_intervals: u64,
 }
@@ -88,6 +105,16 @@ pub(crate) fn stack_amounts(
         samples: 0,
         off_cpu_intervals: 0,
     };
+    if metric == Metric::PageFaults {
+        for sample in filter.page_faults(recording, functions)? {
+            amounts.by_stack[sample.stack as usize] += sample.faults;
+            if sample.mode == Mode::User {
+                amounts.user[sample.stack as usize] += sample.faults;
+            }
+            amounts.samples += 1;
+        }
+        return Ok(amounts);
+    }
     if metric != Metric::OffCPU {
         for sample in filter.samples(recording, functions)? {
             amounts.by_stack[sample.stack as usize] += sample.cpu_ns;

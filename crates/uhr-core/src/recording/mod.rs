@@ -25,6 +25,7 @@ const INTERPRETED_CODE: &str = "interpreted_code.parquet";
 const SYSCALL_CALLS: &str = "syscall_calls.parquet";
 const OFF_CPU: &str = "off_cpu.parquet";
 const MEMORY: &str = "memory.parquet";
+const PAGE_FAULTS: &str = "page_faults.parquet";
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -123,6 +124,7 @@ pub struct Recording {
     /// Frame ids, leaf first.
     pub stacks: Vec<Vec<u32>>,
     pub samples: Vec<Sample>,
+    pub page_faults: Vec<FaultSample>,
     pub off_cpu: Vec<OffCPUInterval>,
     /// Sorted by start, and not overlapping.
     pub kernel_symbols: Vec<KernelSymbol>,
@@ -334,6 +336,21 @@ pub struct Sample {
     pub cpu_ns: u64,
 }
 
+/// A sample of the page faults a thread took: its stack at one, which
+/// stands for `faults` of them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FaultSample {
+    pub time_ns: u64,
+    pub pid: u32,
+    pub tid: u32,
+    pub cpu: Option<u32>,
+    /// What the fault came from: user code, or the kernel, as when a
+    /// syscall copied to or from the process's memory.
+    pub mode: Mode,
+    pub stack: u32,
+    pub faults: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Mode {
@@ -439,6 +456,7 @@ impl Recording {
             frames: read_frames(dir)?,
             stacks: read_stacks(dir)?,
             samples: read_samples(dir)?,
+            page_faults: read_page_faults(dir)?,
             off_cpu: read_off_cpu(dir)?,
             kernel_symbols: read_kernel_symbols(dir)?,
             jit_symbols: read_jit_symbols(dir)?,
@@ -625,6 +643,20 @@ impl Recording {
             ],
         )?;
 
+        let faults = &self.page_faults;
+        table::write(
+            &dir.join(PAGE_FAULTS),
+            vec![
+                Column::u64("time_ns", faults.iter().map(|f| f.time_ns).collect()),
+                Column::u32("pid", faults.iter().map(|f| f.pid).collect()),
+                Column::u32("tid", faults.iter().map(|f| f.tid).collect()),
+                Column::optional_u32("cpu", faults.iter().map(|f| f.cpu).collect()),
+                Column::string("mode", faults.iter().map(|f| f.mode.as_str()).collect()),
+                Column::u32("stack_id", faults.iter().map(|f| f.stack).collect()),
+                Column::u64("faults", faults.iter().map(|f| f.faults).collect()),
+            ],
+        )?;
+
         let off_cpu = &self.off_cpu;
         table::write(
             &dir.join(OFF_CPU),
@@ -763,6 +795,15 @@ impl Recording {
         }
         for (index, sample) in self.samples.iter().enumerate() {
             check_id("sample", index, "stack", sample.stack, self.stacks.len())?;
+        }
+        for (index, sample) in self.page_faults.iter().enumerate() {
+            check_id(
+                "page-fault sample",
+                index,
+                "stack",
+                sample.stack,
+                self.stacks.len(),
+            )?;
         }
         for (index, interval) in self.off_cpu.iter().enumerate() {
             if interval.start_ns > interval.end_ns {
@@ -953,6 +994,30 @@ fn read_samples(dir: &Path) -> Result<Vec<Sample>> {
                 mode: Mode::parse(&mode[i]).map_err(|reason| table.invalid(reason))?,
                 stack: stack[i],
                 cpu_ns: cpu_ns[i],
+            })
+        })
+        .collect()
+}
+
+fn read_page_faults(dir: &Path) -> Result<Vec<FaultSample>> {
+    let table = Table::read(&dir.join(PAGE_FAULTS))?;
+    let time_ns = table.u64("time_ns")?;
+    let pid = table.u32("pid")?;
+    let tid = table.u32("tid")?;
+    let cpu = table.optional_u32("cpu")?;
+    let mode = table.string("mode")?;
+    let stack = table.u32("stack_id")?;
+    let faults = table.u64("faults")?;
+    (0..table.len())
+        .map(|i| {
+            Ok(FaultSample {
+                time_ns: time_ns[i],
+                pid: pid[i],
+                tid: tid[i],
+                cpu: cpu[i],
+                mode: Mode::parse(&mode[i]).map_err(|reason| table.invalid(reason))?,
+                stack: stack[i],
+                faults: faults[i],
             })
         })
         .collect()

@@ -41,7 +41,8 @@ pub struct QueryResult {
     /// What `value` and the rows' amounts count.
     pub unit: Unit,
     pub filter: Filter,
-    /// CPU samples that passed the filter, if the metric counts them.
+    /// CPU samples, or page-fault samples, that passed the filter, if the
+    /// metric counts them.
     pub samples: u64,
     /// Off-CPU intervals that passed the filter, if the metric counts them.
     pub off_cpu_intervals: u64,
@@ -105,7 +106,7 @@ pub struct ModuleRow {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SyscallRow {
-    /// Whether the time was in a syscall. `None` when the stack does not
+    /// Whether the amount was in a syscall. `None` when the stack does not
     /// show it: its kernel functions have no names, it may have been cut
     /// short, or it has none and the CPU was not in user mode, as when
     /// running a virtual machine's guest code. Off-CPU time without a stack

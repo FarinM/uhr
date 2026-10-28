@@ -105,9 +105,12 @@ unknown.
 
 `query` and `call_paths` weigh stacks by a metric: CPU time from the CPU
 samples, time off CPU from the context switches, or both, which is the
-time threads were alive. A thread goes off CPU in the scheduler, so off-CPU
-stacks all end in it and their self time says little; their total time
-shows what the threads waited in.
+time threads were alive, or page faults from samples of them. A thread goes
+off CPU in the scheduler, so off-CPU stacks all end in it and their self
+time says little; their total time shows what the threads waited in. Page
+faults show the code that first touched memory, as it grew. Results say the
+metric's `unit`, `ns` or `faults`, and give its amounts as `value`, `self`
+and `total`, with their shares.
 
 A function picked the same way also works as a filter: `under` keeps the
 samples whose stack contains it. One recording can then be split by the code

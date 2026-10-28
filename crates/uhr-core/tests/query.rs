@@ -1,7 +1,7 @@
 use uhr_core::call_paths;
 use uhr_core::filter::{self, Filter};
 use uhr_core::functions;
-use uhr_core::metric::{self, Metric};
+use uhr_core::metric::{self, Metric, Unit};
 use uhr_core::query::{
     Counted, Error, FunctionRow, GroupBy, Latency, ModuleRow, Query, QueryResult, Rows, SyscallRow,
     run,
@@ -80,6 +80,7 @@ fn recording() -> Recording {
         ],
         stacks: vec![vec![0, 1, 2, 3], vec![4, 3], vec![5, 3]],
         samples: vec![sample(0, 6), sample(0, 2), sample(1, 1), sample(2, 1)],
+        page_faults: Vec::new(),
         off_cpu: Vec::new(),
         kernel_symbols: Vec::new(),
         jit_symbols: Vec::new(),
@@ -231,6 +232,7 @@ fn perf_stream() -> Stream {
                 frequency_hz: 999,
                 requested_frequency_hz: 999,
             }),
+            page_faults: None,
             context_switches: false,
         },
         signals: vec![Signal::UserCPUSamples],
@@ -241,6 +243,7 @@ fn perf_stream() -> Stream {
                 unwinding: Unwinding::FramePointers,
                 stack_copy_bytes: None,
                 samples: 4,
+                page_fault_samples: None,
                 off_cpu_intervals: None,
                 throttle_events: Some(3),
                 max_stack_depth: 127,
@@ -453,6 +456,7 @@ fn with_own_programs() -> (Recording, Symbols) {
         collector: Collector::Ebpf {
             programs: vec!["8782325c7cb17f7f".into()],
             sampling: None,
+            page_faults: None,
         },
         signals: vec![Signal::SyscallCalls],
         missing_signals: Vec::new(),
@@ -1226,6 +1230,7 @@ fn with_counted_calls() -> (Recording, Symbols) {
         collector: Collector::Ebpf {
             programs: Vec::new(),
             sampling: None,
+            page_faults: None,
         },
         signals: vec![Signal::SyscallCalls],
         missing_signals: Vec::new(),
@@ -1695,4 +1700,91 @@ fn counts_a_runtimes_own_code_for_the_function_it_runs() {
     )
     .unwrap();
     assert_eq!((paths.self_, paths.total), (5, 8));
+}
+
+/// Page faults one in every 64: two of them under `leaf`, from user code,
+/// and one in the kernel.
+fn with_page_faults(mut recording: Recording) -> Recording {
+    recording.manifest.streams.push(Stream {
+        id: "perf".into(),
+        collector: Collector::Perf {
+            version: "6.8".into(),
+            sampling: None,
+            page_faults: Some(FaultSampling {
+                event: "page-faults".into(),
+                period: 64,
+            }),
+            context_switches: false,
+        },
+        signals: vec![Signal::PageFaults],
+        missing_signals: Vec::new(),
+        coverage: StreamCoverage {
+            lost_events: 0,
+            stacks: None,
+            overhead_ns: None,
+            known_biases: Vec::new(),
+        },
+    });
+    let fault = |stack, mode, time_ns| FaultSample {
+        time_ns,
+        pid: 1,
+        tid: 1,
+        cpu: None,
+        mode,
+        stack,
+        faults: 64,
+    };
+    recording.page_faults = vec![
+        fault(0, Mode::User, 1),
+        fault(0, Mode::User, 2),
+        fault(2, Mode::Kernel, 3),
+    ];
+    recording
+}
+
+fn page_faults(filter: Filter) -> Query {
+    Query {
+        metric: Metric::PageFaults,
+        filter,
+        ..query(10)
+    }
+}
+
+#[test]
+fn weighs_stacks_by_their_page_faults() {
+    let recording = with_page_faults(recording());
+    let result = run(
+        &recording,
+        Some(&symbols()),
+        &page_faults(Filter::default()),
+    )
+    .unwrap();
+    assert_eq!(result.unit, Unit::Faults);
+    assert_eq!((result.samples, result.value), (3, 192));
+    let leaf = row(&result, "leaf");
+    assert_eq!((leaf.self_, leaf.total), (128, 128));
+    assert_eq!(row(&result, "main").total, 192);
+}
+
+#[test]
+fn filters_page_faults_as_cpu_samples() {
+    let filter = Filter {
+        modes: vec![Mode::Kernel],
+        ..Filter::default()
+    };
+    let recording = with_page_faults(recording());
+    let result = run(&recording, Some(&symbols()), &page_faults(filter)).unwrap();
+    assert_eq!((result.samples, result.value), (1, 64));
+}
+
+#[test]
+fn needs_page_faults_to_weigh_stacks_by_them() {
+    match run(
+        &recording(),
+        Some(&symbols()),
+        &page_faults(Filter::default()),
+    ) {
+        Err(Error::Metric(metric::Error::NoPageFaults)) => {}
+        other => panic!("{other:?}"),
+    }
 }

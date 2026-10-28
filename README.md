@@ -15,8 +15,10 @@ anywhere. The [docs](#docs) describe the whole design, which the code only
 partly covers.
 
 uhr records CPU samples with user and kernel stacks, and time off CPU, per
-process and thread, and how much memory each process has resident over
-time, of a program it starts or one already running. It names
+process and thread, how much memory each process has resident over time,
+and samples of page faults with their stacks, which show the code that
+first touched memory, of a program it starts or one already running. It
+names
 the code Python 3.12+ and Node compile from their perf maps. It samples with
 one of two samplers:
 
@@ -56,6 +58,7 @@ uhr overview rec                                   # computing or waiting? how b
 uhr query rec --group-by function                  # top functions
 uhr query rec --group-by line --under parse_json   # hot lines under a function
 uhr query rec --group-by syscall --metric off-cpu  # syscalls threads waited in
+uhr query rec --group-by function --metric page-faults  # code that grew memory
 uhr call-paths rec --function memcpy               # callers and callees
 uhr flamegraph rec -o cpu.svg                      # a flame graph to open
 ```

@@ -117,6 +117,9 @@ const SYSCALLS: [&str; 2] = ["sys_enter", "sys_exit"];
 
 const SAMPLER: &str = "sample";
 
+/// The sampler at page faults.
+const FAULT_SAMPLER: &str = "sample_fault";
+
 /// The programs the sampler goes on in to walk interpreter frames, by
 /// their place in `PROGRAMS`: to find a thread's state in the runtime, to
 /// walk frames on the native stack, and to walk them in the runtime's
@@ -160,6 +163,8 @@ pub(crate) struct Options {
 /// `path`, stacks of up to `max_stack` frames.
 pub(crate) struct Sampling {
     pub(crate) period_ns: u64,
+    /// Sampling at page faults too, one in every this many on each CPU.
+    pub(crate) fault_period: Option<u64>,
     pub(crate) path: PathBuf,
     pub(crate) max_stack: u32,
     /// The bytes of user stack to copy with each sample, for uhr to unwind.
@@ -178,6 +183,8 @@ pub(crate) struct Samples {
     /// Samples that found the ring buffer full.
     pub(crate) dropped: u64,
     pub(crate) interpreters: Interpreters,
+    /// One in every how many page faults they sampled, if they did.
+    pub(crate) fault_period: Option<u64>,
 }
 
 /// What the programs found. Each part is `None` if it was not asked for.
@@ -212,8 +219,9 @@ pub(crate) struct Programs {
     tracepoints: Vec<(&'static str, TracePointLinkId)>,
     syscalls: Option<Vec<(&'static str, RawTracePointLinkId)>>,
     /// By CPU, with when each was attached.
-    sampler: BTreeMap<u32, (PerfEventLinkId, u64)>,
+    sampler: BTreeMap<u32, (Links, u64)>,
     period_ns: u64,
+    fault_period: Option<u64>,
     late_cpus: u32,
     unsampled_cpus: BTreeSet<u32>,
     restarted_cpus: BTreeSet<u32>,
@@ -229,6 +237,13 @@ pub(crate) struct Programs {
     /// The kernel empties a program array once uhr no longer has it open.
     next: Option<ProgramArray<MapData>>,
     ended: Option<Result<u64, Error>>,
+}
+
+/// A CPU's sampling events: at its clock, and at its page faults if asked
+/// for.
+struct Links {
+    clock: PerfEventLinkId,
+    faults: Option<PerfEventLinkId>,
 }
 
 /// What the programs found, and the programs: detached, but loaded until
@@ -291,6 +306,7 @@ impl Programs {
             syscalls,
             sampler: BTreeMap::new(),
             period_ns: 0,
+            fault_period: None,
             late_cpus: 0,
             unsampled_cpus: BTreeSet::new(),
             restarted_cpus: BTreeSet::new(),
@@ -319,6 +335,11 @@ impl Programs {
         sampler_program(&mut self.ebpf)?
             .load()
             .map_err(|e| Error::Program(SAMPLER, e).or_not_permitted())?;
+        if sampling.fault_period.is_some() {
+            perf_event(&mut self.ebpf, FAULT_SAMPLER)?
+                .load()
+                .map_err(|e| Error::Program(FAULT_SAMPLER, e).or_not_permitted())?;
+        }
         let next = self
             .ebpf
             .take_map("PROGRAMS")
@@ -335,6 +356,7 @@ impl Programs {
         }
         self.next = Some(next);
         self.period_ns = sampling.period_ns;
+        self.fault_period = sampling.fault_period;
         // Before the CPUs' events, so no step of a CPU's goes unseen.
         let (program, category, name) = HOTPLUG;
         let hotplug = tracepoint(&mut self.ebpf, program)?;
@@ -362,8 +384,8 @@ impl Programs {
             // Before the event opens, so a CPU that goes offline and back in
             // between is seen to.
             let attached = monotonic_ns();
-            let link = self.attach(cpu)?;
-            self.sampler.insert(cpu, (link, attached));
+            let links = self.attach(cpu)?;
+            self.sampler.insert(cpu, (links, attached));
             self.sampled_cpus.insert(cpu);
         }
         let walks = self.ebpf.take_map("WALKS").ok_or(Error::Missing("WALKS"))?;
@@ -381,15 +403,40 @@ impl Programs {
         Ok(())
     }
 
-    fn attach(&mut self, cpu: u32) -> Result<PerfEventLinkId, Error> {
-        sampler_program(&mut self.ebpf)?
+    fn attach(&mut self, cpu: u32) -> Result<Links, Error> {
+        let clock = sampler_program(&mut self.ebpf)?
             .attach(
                 PerfEventConfig::Software(SoftwareEvent::CpuClock),
                 PerfEventScope::AllProcessesOneCpu { cpu },
                 SamplePolicy::Period(self.period_ns),
                 false,
             )
-            .map_err(|e| Error::Program(SAMPLER, e).or_not_permitted())
+            .map_err(|e| Error::Program(SAMPLER, e).or_not_permitted())?;
+        let Some(period) = self.fault_period else {
+            return Ok(Links {
+                clock,
+                faults: None,
+            });
+        };
+        let faults = perf_event(&mut self.ebpf, FAULT_SAMPLER)?.attach(
+            PerfEventConfig::Software(SoftwareEvent::PageFaults),
+            PerfEventScope::AllProcessesOneCpu { cpu },
+            SamplePolicy::Period(period),
+            false,
+        );
+        match faults {
+            Ok(faults) => Ok(Links {
+                clock,
+                faults: Some(faults),
+            }),
+            // So the CPU is sampled at both or neither.
+            Err(error) => {
+                if let Ok(sampler) = sampler_program(&mut self.ebpf) {
+                    let _ = sampler.detach(clock);
+                }
+                Err(Error::Program(FAULT_SAMPLER, error).or_not_permitted())
+            }
+        }
     }
 
     /// Keeps every online CPU sampled while the capture runs. The kernel
@@ -424,11 +471,11 @@ impl Programs {
             }
             // A CPU can show online before perf can sample on it, so one
             // that fails is tried again.
-            let Ok(link) = self.attach(cpu) else {
+            let Ok(links) = self.attach(cpu) else {
                 self.unsampled_cpus.insert(cpu);
                 continue;
             };
-            self.sampler.insert(cpu, (link, now));
+            self.sampler.insert(cpu, (links, now));
             self.unsampled_cpus.remove(&cpu);
             if let Some(went) = self.down_since.remove(&cpu) {
                 self.restarted_cpus.insert(cpu);
@@ -440,10 +487,16 @@ impl Programs {
     }
 
     fn detach(&mut self, cpu: u32) {
-        if let (Some((link, _)), Ok(sampler)) =
-            (self.sampler.remove(&cpu), sampler_program(&mut self.ebpf))
+        let Some((links, _)) = self.sampler.remove(&cpu) else {
+            return;
+        };
+        if let Ok(sampler) = sampler_program(&mut self.ebpf) {
+            let _ = sampler.detach(links.clock);
+        }
+        if let (Some(faults), Ok(sampler)) =
+            (links.faults, perf_event(&mut self.ebpf, FAULT_SAMPLER))
         {
-            let _ = sampler.detach(link);
+            let _ = sampler.detach(faults);
         }
     }
 
@@ -495,6 +548,7 @@ impl Programs {
             tracepoints,
             syscalls,
             sampler,
+            fault_period,
             late_cpus,
             unsampled_cpus,
             restarted_cpus,
@@ -507,14 +561,28 @@ impl Programs {
         } = self;
         let mut programs = Vec::new();
         if reader.is_some() {
+            let mut faults = Vec::new();
             let program = sampler_program(&mut ebpf)?;
-            for (link, _) in sampler.into_values() {
+            for (links, _) in sampler.into_values() {
                 program
-                    .detach(link)
+                    .detach(links.clock)
                     .map_err(|e| Error::Program(SAMPLER, e))?;
+                faults.extend(links.faults);
             }
             let info = program.info().map_err(|e| Error::Program(SAMPLER, e))?;
             programs.push(format!("{:016x}", info.tag()));
+            if fault_period.is_some() {
+                let program = perf_event(&mut ebpf, FAULT_SAMPLER)?;
+                for link in faults {
+                    program
+                        .detach(link)
+                        .map_err(|e| Error::Program(FAULT_SAMPLER, e))?;
+                }
+                let info = program
+                    .info()
+                    .map_err(|e| Error::Program(FAULT_SAMPLER, e))?;
+                programs.push(format!("{:016x}", info.tag()));
+            }
             for name in WALKERS {
                 let walker = perf_event(&mut ebpf, name)?;
                 let info = walker.info().map_err(|e| Error::Program(name, e))?;
@@ -545,6 +613,7 @@ impl Programs {
                 Some(Samples {
                     dropped: sum(&mut ebpf, "DROPPED")?,
                     interpreters: finder.finish(),
+                    fault_period,
                 })
             }
             _ => None,

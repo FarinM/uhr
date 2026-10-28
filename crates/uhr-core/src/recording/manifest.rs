@@ -83,6 +83,8 @@ pub enum Collector {
     Perf {
         version: String,
         sampling: Option<Sampling>,
+        /// How perf sampled page faults, if it did.
+        page_faults: Option<FaultSampling>,
         /// Whether perf recorded every context switch, and the stack of each
         /// thread going off CPU.
         context_switches: bool,
@@ -93,6 +95,8 @@ pub enum Collector {
         /// `bpf_prog_<tag>_<name>`, so its frames can be told apart.
         programs: Vec<String>,
         sampling: Option<Sampling>,
+        /// How they sampled page faults, if they did.
+        page_faults: Option<FaultSampling>,
     },
     /// uhr reading the processes' files in `/proc`.
     Procfs {
@@ -119,6 +123,14 @@ pub struct Sampling {
     /// What it sampled at. perf lowers requests above the kernel's limit.
     pub frequency_hz: u64,
     pub requested_frequency_hz: u64,
+}
+
+/// How a collector sampled page faults: one in every `period`, which each
+/// sample stands for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FaultSampling {
+    pub event: String,
+    pub period: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -155,6 +167,9 @@ pub enum Signal {
     /// took.
     #[serde(rename = "syscall_calls")]
     SyscallCalls,
+    /// Samples of the page faults threads took, with their stacks.
+    #[serde(rename = "page_faults")]
+    PageFaults,
     /// How much memory each process had resident and in swap, over time.
     #[serde(rename = "resident_memory")]
     ResidentMemory,
@@ -170,6 +185,7 @@ impl Signal {
             Signal::OffCPUTime => "off_cpu_time",
             Signal::OffCPUStacks => "off_cpu_stacks",
             Signal::SyscallCalls => "syscall_calls",
+            Signal::PageFaults => "page_faults",
             Signal::ResidentMemory => "resident_memory",
         }
     }
@@ -192,8 +208,8 @@ pub struct StreamCoverage {
     pub known_biases: Vec<String>,
 }
 
-/// The stack counts cover every stack recorded: one per CPU sample, and one
-/// per thread going off CPU.
+/// The stack counts cover every stack recorded: one per CPU sample, one per
+/// page-fault sample, and one per thread going off CPU.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StackCoverage {
     pub unwinding: Unwinding,
@@ -201,6 +217,8 @@ pub struct StackCoverage {
     /// `None` without DWARF unwinding.
     pub stack_copy_bytes: Option<u32>,
     pub samples: u64,
+    /// `None` without page faults.
+    pub page_fault_samples: Option<u64>,
     /// `None` without context switches.
     pub off_cpu_intervals: Option<u64>,
     /// `None` where the collector does not see them.

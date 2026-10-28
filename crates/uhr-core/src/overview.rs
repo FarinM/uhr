@@ -356,8 +356,16 @@ pub fn run(
         .streams
         .iter()
         .any(|s| s.signals.contains(&Signal::ResidentMemory));
+    let faults_sampled = manifest
+        .streams
+        .iter()
+        .any(|s| s.signals.contains(&Signal::PageFaults));
     coverage.unknown.push(
         match &memory {
+            Some(_) if faults_sampled => {
+                "which code holds the memory: page faults show the code that first touched it, \
+                 but no allocations were recorded"
+            }
             Some(_) => "which code uses the memory: no allocations or page faults were recorded",
             None if !memory_read => "memory use: it was not read",
             None => {

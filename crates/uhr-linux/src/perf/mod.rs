@@ -129,6 +129,9 @@ pub struct RecordOptions {
     pub syscalls: bool,
     /// Read how much memory the target's processes have, at intervals.
     pub memory: bool,
+    /// Sample the page faults the target's threads take, with their
+    /// stacks, as CPU time is sampled.
+    pub page_faults: bool,
     /// What samples CPU time. `None` for uhr's eBPF programs where this host
     /// lets uhr load them, and perf elsewhere.
     pub sampler: Option<Sampler>,
@@ -239,6 +242,7 @@ pub fn record(options: &RecordOptions, interrupts: &Interrupts, out: &Path) -> R
 
     let max_stack_depth = read_number(MAX_STACK)?;
     let tick = tick(options)?;
+    let fault_period = options.page_faults.then(|| fault_period(options.unwind));
     let perf_data = staging.join("perf.data");
     let samples = staging.join(SAMPLES);
     // Without the watch, a map counts only if it belongs to root or the
@@ -250,6 +254,7 @@ pub fn record(options: &RecordOptions, interrupts: &Interrupts, out: &Path) -> R
         &perf_data,
         &samples,
         tick.as_ref(),
+        fault_period,
         options,
         interrupts,
         &ready,
@@ -267,10 +272,11 @@ pub fn record(options: &RecordOptions, interrupts: &Interrupts, out: &Path) -> R
     let kallsyms = Kallsyms::read();
     let found = ended.ebpf.map(|s| s.map(ebpf::Stopped::unload));
     let none = Interpreters::default();
-    let interpreters = found
+    let ebpf_samples = found
         .as_ref()
-        .and_then(|found| found.as_ref().ok()?.samples.as_ref())
-        .map_or(&none, |samples| &samples.interpreters);
+        .and_then(|found| found.as_ref().ok()?.samples.as_ref());
+    let interpreters = ebpf_samples.map_or(&none, |samples| &samples.interpreters);
+    let page_faults = ebpf_samples.is_some_and(|samples| samples.fault_period.is_some());
     let ebpf_samples = match tick.as_ref().filter(|_| !ended.perf_sampled) {
         Some(_) if let Some(Err(error)) = found => {
             remove_staging(&staging);
@@ -281,6 +287,7 @@ pub fn record(options: &RecordOptions, interrupts: &Interrupts, out: &Path) -> R
             period_ns: tick.period_ns,
             stack_bytes: tick.stack_bytes,
             interpreters,
+            page_faults,
         }),
         None => None,
     };
@@ -316,7 +323,7 @@ pub fn record(options: &RecordOptions, interrupts: &Interrupts, out: &Path) -> R
             remove_staging(&staging);
             return Err(Error::NoUsableData {
                 status: ended.perf,
-                command: diagnosis(options, ended.perf_sampled),
+                command: diagnosis(options, ended.perf_sampled, fault_period),
                 source: Box::new(error),
             });
         }
@@ -529,6 +536,18 @@ fn add_ebpf(
                  their stacks show only its own code: {reason}."
             )
         }));
+        if samples.fault_period.is_some() {
+            signals.push(recording::Signal::PageFaults);
+            known_biases.extend(
+                [
+                    convert::FAULTS_BIAS,
+                    "uhr's eBPF programs count the page faults of every process on a CPU, and \
+                     sample the one at each period, so the target's count is right on average, \
+                     but less sure the more other processes fault there.",
+                ]
+                .map(String::from),
+            );
+        }
     }
     if let Some((stacks, _)) = sampled.as_ref().filter(|(s, _)| s.untracked > 0) {
         known_biases.push(format!(
@@ -621,11 +640,20 @@ fn add_ebpf(
                 .sum()
         });
     let (stacks, sampling) = sampled.map(|(stacks, s)| (stacks.coverage, s)).unzip();
+    let page_faults = found
+        .samples
+        .as_ref()
+        .and_then(|samples| samples.fault_period)
+        .map(|period| recording::FaultSampling {
+            event: "page-faults".into(),
+            period,
+        });
     recording.manifest.streams.push(recording::Stream {
         id: "ebpf".into(),
         collector: Collector::Ebpf {
             programs: found.programs,
             sampling,
+            page_faults,
         },
         signals,
         missing_signals: Vec::new(),
@@ -738,11 +766,21 @@ fn log_summary(recording: &Recording, out: &Path) {
 }
 
 /// perf's flags, without what it records: `-p` and a pid, or a command.
-/// Unless `sampled`, perf samples no CPU time.
-pub(crate) fn perf_args(perf_data: &Path, options: &RecordOptions, sampled: bool) -> Vec<OsString> {
+/// Unless `sampled`, perf samples no CPU time, nor page faults, which it
+/// samples one in every `fault_period` of.
+pub(crate) fn perf_args(
+    perf_data: &Path,
+    options: &RecordOptions,
+    sampled: bool,
+    fault_period: Option<u64>,
+) -> Vec<OsString> {
     let mut args: Vec<OsString> = vec!["record".into(), "--quiet".into()];
     if sampled {
         args.push("--event=cpu-clock".into());
+        if let Some(period) = fault_period {
+            args.push(format!("--event=page-faults/period={period}/").into());
+        }
+        // For the events without a period of their own.
         args.push(format!("--freq={}", options.frequency_hz).into());
     }
     for flag in [
@@ -776,8 +814,8 @@ pub(crate) fn perf_args(perf_data: &Path, options: &RecordOptions, sampled: bool
 
 /// A perf command a person can run to see the error perf printed to
 /// itself: the same flags without --quiet, launching a command itself.
-fn diagnosis(options: &RecordOptions, sampled: bool) -> String {
-    let mut args = perf_args(Path::new("perf.data"), options, sampled);
+fn diagnosis(options: &RecordOptions, sampled: bool, fault_period: Option<u64>) -> String {
+    let mut args = perf_args(Path::new("perf.data"), options, sampled, fault_period);
     args.retain(|a| a != "--quiet");
     match &options.target {
         Target::Launch(command) => {
@@ -842,6 +880,7 @@ fn run(
     perf_data: &Path,
     samples: &Path,
     tick: Option<&Tick>,
+    fault_period: Option<u64>,
     options: &RecordOptions,
     interrupts: &Interrupts,
     ready: &Ready,
@@ -854,10 +893,10 @@ fn run(
                 uhr_core::runtimes::environment(|v| env::var_os(v), options.runtime_support);
             let held = Held::spawn(command, &environment)?;
             let pid = held.pid();
-            let mut ebpf = start_ebpf(pid, true, options, tick, samples)?;
+            let mut ebpf = start_ebpf(pid, true, options, tick, fault_period, samples)?;
             let mut memory = options.memory.then(|| memory::Reader::start(pid));
             let perf_sampled = !samples_with(&ebpf);
-            let mut sampling = sample(perf_data, options, pid, perf_sampled)?;
+            let mut sampling = sample(perf_data, options, pid, perf_sampled, fault_period)?;
             begin(&mut ebpf);
             sampling.stop_if_interrupted(interrupts)?;
             let mut target = held.release()?;
@@ -892,10 +931,10 @@ fn run(
             process,
             ..
         } => {
-            let mut ebpf = start_ebpf(*pid, false, options, tick, samples)?;
+            let mut ebpf = start_ebpf(*pid, false, options, tick, fault_period, samples)?;
             let mut memory = options.memory.then(|| memory::Reader::start(*pid));
             let perf_sampled = !samples_with(&ebpf);
-            let mut sampling = sample(perf_data, options, *pid, perf_sampled)?;
+            let mut sampling = sample(perf_data, options, *pid, perf_sampled, fault_period)?;
             begin(&mut ebpf);
             let attached_ns = monotonic_ns();
             if let Some(Ok(memory)) = memory.as_mut() {
@@ -951,10 +990,12 @@ fn start_ebpf(
     held: bool,
     options: &RecordOptions,
     tick: Option<&Tick>,
+    fault_period: Option<u64>,
     samples: &Path,
 ) -> Result<Option<Result<Programs, ebpf::Error>>> {
     let sampling = tick.map(|tick| ebpf::Sampling {
         period_ns: tick.period_ns,
+        fault_period,
         path: samples.to_owned(),
         max_stack: tick.max_stack,
         stack_bytes: tick.stack_bytes,
@@ -1045,6 +1086,26 @@ struct Tick {
     stack_bytes: Option<u32>,
 }
 
+/// The page faults a sample stands for with frame pointers, where samples
+/// cost little but counting every fault does.
+const FAULT_PERIOD: u64 = 64;
+
+/// The most bytes of stack copies a page fault costs. A program that only
+/// faults takes a million or so a second on each CPU.
+const COPY_BYTES_PER_FAULT: u64 = 128;
+
+/// How many page faults each sample of them stands for: with a copy of the
+/// stack, which costs most of a sample, enough that the copies come to at
+/// most `COPY_BYTES_PER_FAULT` a fault.
+fn fault_period(unwind: Unwind) -> u64 {
+    match unwind {
+        Unwind::FramePointers => FAULT_PERIOD,
+        Unwind::Dwarf { stack_bytes } => {
+            (u64::from(stack_bytes) / COPY_BYTES_PER_FAULT).max(FAULT_PERIOD)
+        }
+    }
+}
+
 /// Where uhr's eBPF programs are to sample, at the frequency asked for,
 /// lowered to the kernel's limit as perf lowers it. `None` where perf is to
 /// sample.
@@ -1095,8 +1156,14 @@ impl Sampling {
 
 /// Attaches perf to `pid` and returns once it records: samples, if
 /// `sampled`.
-fn sample(perf_data: &Path, options: &RecordOptions, pid: u32, sampled: bool) -> Result<Sampling> {
-    let mut args = perf_args(perf_data, options, sampled);
+fn sample(
+    perf_data: &Path,
+    options: &RecordOptions,
+    pid: u32,
+    sampled: bool,
+    fault_period: Option<u64>,
+) -> Result<Sampling> {
+    let mut args = perf_args(perf_data, options, sampled, fault_period);
     args.extend(["--pid".into(), pid.to_string().into(), "--delay=-1".into()]);
     debug!(command = %format!("perf {}", join_args(&args)), "running perf");
     let stderr = if stderr_can_break() {
@@ -1116,7 +1183,7 @@ fn sample(perf_data: &Path, options: &RecordOptions, pid: u32, sampled: bool) ->
         sampling.finish_relay();
         return Err(Error::PerfStart {
             status,
-            command: diagnosis(options, sampled),
+            command: diagnosis(options, sampled, fault_period),
         });
     }
     Ok(sampling)
@@ -1435,6 +1502,13 @@ fn read_number<T: std::str::FromStr>(path: &'static str) -> Result<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn samples_fewer_page_faults_with_stack_copies() {
+        assert_eq!(fault_period(Unwind::FramePointers), 64);
+        assert_eq!(fault_period(Unwind::Dwarf { stack_bytes: 32768 }), 256);
+        assert_eq!(fault_period(Unwind::Dwarf { stack_bytes: 4096 }), 64);
+    }
 
     #[test]
     fn a_dropped_perf_is_stopped_and_reaped() {

@@ -250,10 +250,11 @@ fn probe_recording(perf: &Path) -> Result<bool, String> {
         runtime_support: false,
         syscalls: false,
         memory: false,
+        page_faults: false,
         sampler: Some(Sampler::Perf),
     };
     let held = Held::spawn(&["true".into()], &[]).map_err(|e| format!("starting `true`: {e}"))?;
-    let mut args = perf_args(&data, &options, true);
+    let mut args = perf_args(&data, &options, true, None);
     // Permission errors from perf are suppressed by --quiet.
     args.retain(|arg| arg != "--quiet");
     args.extend([

@@ -36,11 +36,16 @@ fn example() -> Recording {
                             frequency_hz: 999,
                             requested_frequency_hz: 999,
                         }),
+                        page_faults: Some(FaultSampling {
+                            event: "page-faults".into(),
+                            period: 64,
+                        }),
                         context_switches: true,
                     },
                     signals: vec![
                         Signal::UserCPUSamples,
                         Signal::UserStacks,
+                        Signal::PageFaults,
                         Signal::OffCPUTime,
                         Signal::OffCPUStacks,
                     ],
@@ -56,6 +61,7 @@ fn example() -> Recording {
                             unwinding: Unwinding::FramePointers,
                             stack_copy_bytes: None,
                             samples: 2,
+                            page_fault_samples: Some(1),
                             off_cpu_intervals: Some(2),
                             throttle_events: Some(0),
                             max_stack_depth: 127,
@@ -172,6 +178,15 @@ fn example() -> Recording {
                 cpu_ns: 1_001_001,
             },
         ],
+        page_faults: vec![FaultSample {
+            time_ns: 1_500,
+            pid: 7,
+            tid: 8,
+            cpu: Some(3),
+            mode: Mode::Kernel,
+            stack: 0,
+            faults: 64,
+        }],
         off_cpu: vec![
             OffCPUInterval {
                 start_ns: 2_500,

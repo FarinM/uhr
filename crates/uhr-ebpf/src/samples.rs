@@ -1,5 +1,5 @@
 //! Samples the stacks of the target's threads at each tick of a CPU's
-//! clock.
+//! clock, and at page faults.
 
 use core::mem::size_of;
 
@@ -18,7 +18,8 @@ use aya_ebpf::maps::{Array, HashMap, PerCpuArray, ProgramArray, RingBuf};
 use aya_ebpf::programs::{PerfEventContext, TracePointContext};
 use aya_ebpf::{EbpfContext, Global};
 use uhr_ebpf::{
-    MAX_FRAMES, MAX_STACK_COPY, SampleHeader, UserRegisters, WALKED_BYTES, Walk, frames, mode, walk,
+    MAX_FRAMES, MAX_STACK_COPY, SampleHeader, UserRegisters, WALKED_BYTES, Walk, event, frames,
+    mode, walk,
 };
 
 use crate::mappings;
@@ -154,6 +155,19 @@ fn exec() -> u32 {
 
 #[perf_event]
 pub fn sample(ctx: PerfEventContext) -> u32 {
+    take(&ctx, event::CPU_CLOCK)
+}
+
+/// At page faults: one in every period of those the kernel counts on each
+/// CPU.
+#[perf_event]
+pub fn sample_fault(ctx: PerfEventContext) -> u32 {
+    take(&ctx, event::PAGE_FAULT)
+}
+
+/// Samples the thread the CPU runs at `event`, if it is the target's.
+#[inline(always)]
+fn take(ctx: &PerfEventContext, event: u32) -> u32 {
     let (tgid, tid) = current();
     if !running() || !active(tgid) {
         return 0;
@@ -161,7 +175,25 @@ pub fn sample(ctx: PerfEventContext) -> u32 {
     let process = walker::of(tgid);
     let stack_bytes = (STACK_BYTES.load() as usize).min(MAX_STACK_COPY);
     if stack_bytes > 0 {
-        return sample_with_copy(&ctx, process, tgid, tid, stack_bytes);
+        let cpu = unsafe { bpf_get_smp_processor_id() };
+        let Some(sample) = COPIES.get_ptr_mut(cpu) else {
+            return 0;
+        };
+        let sample = unsafe { &mut *sample };
+        let len = fill_copy(ctx, event, sample, stack_bytes);
+        // Here, in the program: the verifier takes tail calls only from a
+        // function that returns a number, and the compiler need not keep
+        // `fill_copy` returning one.
+        if sample.header.mode != mode::GUEST
+            && let Some(process) = process
+        {
+            walk_next(ctx, process, &mut sample.header);
+        }
+        let len = size_of::<SampleHeader>() + len;
+        if len <= size_of::<Copy>() {
+            output((sample as *const Copy).cast(), len);
+        }
+        return 0;
     }
     let Some(sample) = SCRATCH.get_ptr_mut(0) else {
         return 0;
@@ -173,7 +205,7 @@ pub fn sample(ctx: PerfEventContext) -> u32 {
         (0, mode::GUEST, 0, 0, false)
     } else {
         let (ip, kernel_mode) = interrupted(unsafe { &(*ctx.ctx).regs });
-        let (kernel, user, ends) = stacks(&ctx, sample, process, kernel_mode);
+        let (kernel, user, ends) = stacks(ctx, sample, process, kernel_mode);
         let mode = if kernel_mode {
             mode::KERNEL
         } else {
@@ -184,6 +216,8 @@ pub fn sample(ctx: PerfEventContext) -> u32 {
     sample.header = SampleHeader {
         time_ns: unsafe { bpf_ktime_get_ns() },
         ip,
+        period: unsafe { (*ctx.ctx).sample_period },
+        event,
         tgid,
         tid,
         cpu: unsafe { bpf_get_smp_processor_id() },
@@ -202,7 +236,7 @@ pub fn sample(ctx: PerfEventContext) -> u32 {
     if mode != mode::GUEST
         && let Some(process) = process
     {
-        walk_next(&ctx, process, &mut sample.header);
+        walk_next(ctx, process, &mut sample.header);
     }
     let len = size_of::<SampleHeader>() + native_frames(&sample.header);
     if len <= size_of::<Sample>() {
@@ -214,7 +248,9 @@ pub fn sample(ctx: PerfEventContext) -> u32 {
 /// Has `walk_frames` or `walk_native` walk the sampled thread's interpreter
 /// frames, as `process` says, and write the sample, which keeps each
 /// program short enough for the verifier. Returns only where it can't, and
-/// says so in `header`.
+/// says so in `header`. Inline, as the verifier takes tail calls only from
+/// a function that returns a number.
+#[inline(always)]
 fn walk_next(ctx: &PerfEventContext, process: &Walk, header: &mut SampleHeader) {
     let next = u32::from(process.frames == frames::NATIVE);
     unsafe { PROGRAMS.tail_call(ctx, next) };
@@ -367,20 +403,12 @@ fn finish((status, frames, each): (u32, u32, u32), walked: *mut u8) {
     }
 }
 
-/// Samples with the kernel's frames and a copy of the user stack, for uhr
-/// to unwind.
-fn sample_with_copy(
-    ctx: &PerfEventContext,
-    process: Option<&Walk>,
-    tgid: u32,
-    tid: u32,
-    stack_bytes: usize,
-) -> u32 {
+/// Puts together a sample with the kernel's frames and a copy of the user
+/// stack, for uhr to unwind, and returns the bytes after its header.
+fn fill_copy(ctx: &PerfEventContext, event: u32, sample: &mut Copy, stack_bytes: usize) -> usize {
+    // Not passed in, as a BPF function takes at most five arguments.
+    let (tgid, tid) = current();
     let cpu = unsafe { bpf_get_smp_processor_id() };
-    let Some(sample) = COPIES.get_ptr_mut(cpu) else {
-        return 0;
-    };
-    let sample = unsafe { &mut *sample };
     let data = sample.data.as_mut_ptr();
     let regs = unsafe { &(*ctx.ctx).regs };
     let (ip, kernel_mode) = interrupted(regs);
@@ -409,6 +437,8 @@ fn sample_with_copy(
     sample.header = SampleHeader {
         time_ns: unsafe { bpf_ktime_get_ns() },
         ip,
+        period: unsafe { (*ctx.ctx).sample_period },
+        event,
         tgid,
         tid,
         cpu,
@@ -424,16 +454,7 @@ fn sample_with_copy(
         exec: exec(),
         mapped: mappings::count(tgid),
     };
-    if mode != mode::GUEST
-        && let Some(process) = process
-    {
-        walk_next(ctx, process, &mut sample.header);
-    }
-    let len = size_of::<SampleHeader>() + len;
-    if len <= size_of::<Copy>() {
-        output((sample as *const Copy).cast(), len);
-    }
-    0
+    len
 }
 
 /// Copies the user stack from `sp` up, a page at a time, until `limit`

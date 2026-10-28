@@ -48,6 +48,13 @@ pub mod mode {
     pub const GUEST: u32 = 2;
 }
 
+/// What a sample was taken at.
+pub mod event {
+    /// A tick of the CPU's clock.
+    pub const CPU_CLOCK: u32 = 0;
+    pub const PAGE_FAULT: u32 = 1;
+}
+
 /// The most bytes of user stack a sample copies, as perf's limit.
 pub const MAX_STACK_COPY: usize = 65528;
 
@@ -60,6 +67,12 @@ pub struct SampleHeader {
     pub time_ns: u64,
     /// The instruction the CPU was at.
     pub ip: u64,
+    /// The events the sample stands for, the kernel's period at it: the
+    /// nanoseconds of the CPU's clock, or the page faults on the CPU since
+    /// the sample before.
+    pub period: u64,
+    /// Of `event`.
+    pub event: u32,
     pub tgid: u32,
     pub tid: u32,
     pub cpu: u32,

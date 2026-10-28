@@ -3,7 +3,9 @@ use std::collections::{HashMap, HashSet};
 use serde::Serialize;
 
 use crate::functions::{self, Functions};
-use crate::recording::{KernelSymbols, MemoryReading, Mode, OffCPUInterval, Recording, Sample};
+use crate::recording::{
+    FaultSample, KernelSymbols, MemoryReading, Mode, OffCPUInterval, Recording, Sample,
+};
 use crate::syscalls::{self, InSyscall};
 use crate::threads::ThreadNames;
 
@@ -64,10 +66,43 @@ impl Filter {
         recording: &'a Recording,
         functions: &Functions,
     ) -> Result<impl Iterator<Item = &'a Sample> + 'a, Error> {
+        self.taken(recording, functions, &recording.samples, |s| Taken {
+            pid: s.pid,
+            tid: s.tid,
+            mode: s.mode,
+            time_ns: s.time_ns,
+            stack: s.stack,
+        })
+    }
+
+    /// The page-fault samples that pass. Fails as `samples` does.
+    pub(crate) fn page_faults<'a>(
+        &'a self,
+        recording: &'a Recording,
+        functions: &Functions,
+    ) -> Result<impl Iterator<Item = &'a FaultSample> + 'a, Error> {
+        self.taken(recording, functions, &recording.page_faults, |s| Taken {
+            pid: s.pid,
+            tid: s.tid,
+            mode: s.mode,
+            time_ns: s.time_ns,
+            stack: s.stack,
+        })
+    }
+
+    /// What passes of `taken`, samples of threads on CPU, as `of` says.
+    fn taken<'a, T>(
+        &'a self,
+        recording: &'a Recording,
+        functions: &Functions,
+        taken: &'a [T],
+        of: fn(&T) -> Taken,
+    ) -> Result<impl Iterator<Item = &'a T> + 'a, Error> {
         let stacks = self.stacks(recording, functions)?;
         let mut names = (!self.thread_names.is_empty()).then(|| NameMatcher::new(recording));
         let start_ns = recording.manifest.start_ns;
-        Ok(recording.samples.iter().filter(move |sample| {
+        Ok(taken.iter().filter(move |sample| {
+            let sample = of(sample);
             (self.pids.is_empty() || self.pids.contains(&sample.pid))
                 && (self.tids.is_empty() || self.tids.contains(&sample.tid))
                 && (self.modes.is_empty() || self.modes.contains(&sample.mode))
@@ -257,6 +292,15 @@ impl Filter {
         self.time_range(start_ns)
             .is_some_and(|(from, to)| from <= time_ns && time_ns < to)
     }
+}
+
+/// What the filter looks at of a sample.
+struct Taken {
+    pid: u32,
+    tid: u32,
+    mode: Mode,
+    time_ns: u64,
+    stack: u32,
 }
 
 struct NameMatcher<'a> {

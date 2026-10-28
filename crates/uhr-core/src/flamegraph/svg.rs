@@ -230,6 +230,8 @@ fn amount(value: u64, unit: Unit) -> String {
         (Unit::Ns, 1_000_000..) => format!("{:.2} ms", at / 1e6),
         (Unit::Ns, 1_000..) => format!("{:.0} µs", at / 1e3),
         (Unit::Ns, _) => format!("{value} ns"),
+        (Unit::Faults, 1) => "1 fault".into(),
+        (Unit::Faults, _) => format!("{value} faults"),
     }
 }
 
@@ -295,6 +297,8 @@ mod tests {
         assert_eq!(amount(12_500_000, Unit::Ns), "12.50 ms");
         assert_eq!(amount(125_000, Unit::Ns), "125 µs");
         assert_eq!(amount(125, Unit::Ns), "125 ns");
+        assert_eq!(amount(1, Unit::Faults), "1 fault");
+        assert_eq!(amount(125, Unit::Faults), "125 faults");
     }
 
     #[test]
