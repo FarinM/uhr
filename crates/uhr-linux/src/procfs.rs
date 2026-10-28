@@ -48,6 +48,50 @@ pub(crate) fn stat(stat: &[u8]) -> Option<Stat> {
     })
 }
 
+/// A line of a process's `maps`: a region of its memory.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct MapsLine {
+    pub(crate) start: u64,
+    /// Exclusive.
+    pub(crate) end: u64,
+    /// As in `r-xp`: whether it can be read, written and run, and `p` for
+    /// private or `s` for shared.
+    pub(crate) permissions: String,
+    pub(crate) file_offset: u64,
+    /// The file mapped, or the kernel's name for the region, as `[heap]`.
+    /// `None` for memory that maps no file. What is not UTF-8 in a path
+    /// keeps a replacement.
+    pub(crate) path: Option<String>,
+}
+
+/// The lines of a process's `maps`.
+pub(crate) fn maps(maps: &[u8]) -> impl Iterator<Item = MapsLine> + '_ {
+    maps.split(|&b| b == b'\n').filter_map(maps_line)
+}
+
+/// `start-end perms offset dev inode`, then the path after spaces, which
+/// can hold spaces of its own.
+fn maps_line(line: &[u8]) -> Option<MapsLine> {
+    let mut rest = line;
+    let mut fields: [&[u8]; 5] = [&[]; 5];
+    for field in &mut fields {
+        rest = rest.trim_ascii_start();
+        let end = rest.iter().position(|&b| b == b' ').unwrap_or(rest.len());
+        (*field, rest) = rest.split_at(end);
+    }
+    let text = |bytes| std::str::from_utf8(bytes).ok();
+    let hex = |bytes| u64::from_str_radix(text(bytes)?, 16).ok();
+    let (start, end) = text(fields[0])?.split_once('-')?;
+    let path = rest.trim_ascii_start();
+    Some(MapsLine {
+        start: u64::from_str_radix(start, 16).ok()?,
+        end: u64::from_str_radix(end, 16).ok()?,
+        permissions: text(fields[1])?.to_owned(),
+        file_offset: hex(fields[2])?,
+        path: (!path.is_empty()).then(|| String::from_utf8_lossy(path).into_owned()),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -83,5 +127,26 @@ mod tests {
                 start_ticks: 5555,
             })
         );
+    }
+
+    #[test]
+    fn reads_each_region_of_maps_with_its_path() {
+        let file = b"7f1c2a000000-7f1c2a1c3000 r-xp 00028000 08:01 393  /opt/my  app/lib\xc3.so\n\
+                     55d0e9a00000-55d0e9a21000 rw-p 00000000 00:00 0                          [heap]\n\
+                     7ffd1000-7ffd2000 rw-p 00000000 00:00 0 \n";
+        let lines: Vec<MapsLine> = maps(file).collect();
+        assert_eq!(
+            lines[0],
+            MapsLine {
+                start: 0x7f1c2a000000,
+                end: 0x7f1c2a1c3000,
+                permissions: "r-xp".into(),
+                file_offset: 0x28000,
+                path: Some("/opt/my  app/lib\u{fffd}.so".into()),
+            }
+        );
+        assert_eq!(lines[1].path.as_deref(), Some("[heap]"));
+        assert_eq!(lines[2].path, None);
+        assert_eq!(lines.len(), 3);
     }
 }

@@ -531,32 +531,20 @@ impl Process for LiveProcess {
 /// not UTF-8 keeps a replacement for what is not, so its file is read
 /// through `map_files`, as it is anyway.
 fn mappings(pid: u32, maps: &[u8]) -> Vec<Mapping> {
-    maps.split(|&b| b == b'\n')
-        .filter_map(|line| mapping(pid, &String::from_utf8_lossy(line)))
+    procfs::maps(maps)
+        .filter_map(|line| {
+            let path = line.path.filter(|path| path.starts_with('/'))?;
+            Some(Mapping {
+                pid: Some(pid),
+                start: line.start,
+                end: line.end,
+                file_offset: line.file_offset,
+                path,
+                build_id: None,
+                time_ns: None,
+            })
+        })
         .collect()
-}
-
-/// A line of `/proc/<pid>/maps` that maps a file: `start-end perms offset
-/// dev inode path`.
-fn mapping(pid: u32, line: &str) -> Option<Mapping> {
-    let mut fields = line.split_ascii_whitespace();
-    let (range, _perms, offset) = (fields.next()?, fields.next()?, fields.next()?);
-    let (_dev, _inode) = (fields.next()?, fields.next()?);
-    let path: Vec<&str> = fields.collect();
-    let path = path.join(" ");
-    if !path.starts_with('/') {
-        return None;
-    }
-    let (start, end) = range.split_once('-')?;
-    Some(Mapping {
-        pid: Some(pid),
-        start: u64::from_str_radix(start, 16).ok()?,
-        end: u64::from_str_radix(end, 16).ok()?,
-        file_offset: u64::from_str_radix(offset, 16).ok()?,
-        path,
-        build_id: None,
-        time_ns: None,
-    })
 }
 
 #[cfg(test)]
@@ -565,18 +553,17 @@ mod tests {
 
     #[test]
     fn reads_the_files_a_process_maps() {
-        let line =
-            "7f1c2a000000-7f1c2a1c3000 r-xp 00028000 08:01 393 /usr/lib/x86_64-linux-gnu/libc.so.6";
-        let libc = mapping(7, line).unwrap();
+        let maps = b"7f1c2a000000-7f1c2a1c3000 r-xp 00028000 08:01 393 /usr/lib/libc.so.6\n\
+                     7ffd1000-7ffd2000 rw-p 00000000 00:00 0 [stack]\n\
+                     7ffd3000-7ffd4000 rw-p 00000000 00:00 0\n";
+        let mapped = mappings(7, maps);
+        assert_eq!(mapped.len(), 1);
+        let libc = &mapped[0];
         assert_eq!(
             (libc.start, libc.end, libc.file_offset),
             (0x7f1c2a000000, 0x7f1c2a1c3000, 0x28000)
         );
-        assert_eq!(libc.path, "/usr/lib/x86_64-linux-gnu/libc.so.6");
-        let spaced = "1000-2000 r--p 00000000 08:01 7 /opt/my app/lib.so";
-        assert_eq!(mapping(7, spaced).unwrap().path, "/opt/my app/lib.so");
-        assert!(mapping(7, "7ffd1000-7ffd2000 rw-p 00000000 00:00 0 [stack]").is_none());
-        assert!(mapping(7, "7ffd1000-7ffd2000 rw-p 00000000 00:00 0").is_none());
+        assert_eq!(libc.path, "/usr/lib/libc.so.6");
     }
 
     #[test]
