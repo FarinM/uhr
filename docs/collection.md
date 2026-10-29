@@ -112,7 +112,12 @@ Debian and Ubuntu its package must match the running kernel.
   held its address then. A process's `maps` read at intervals would miss
   what it maps between two readings, which is most of a short program's
   growth: a Python program that grew its heap in its last 100 ms had 97% of
-  its faults in no region.
+  its faults in no region. The reports carry no name a process gave its
+  memory, so uhr names its regions from the readings of its `smaps` below,
+  and a region gone by the next reading, as at its process's exit, has
+  none: a PHP program that grew to 450 MiB, read twice, had 7% of its
+  faults in its own memory unnamed, and 92% in memory named
+  `[anon:zend_alloc]`.
   A fault is where a thread first touched memory, so they show the code that
   made the process grow, not what holds its memory: one fault can map many
   pages, as a huge page or a file's pages around the one touched, and

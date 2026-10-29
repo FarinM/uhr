@@ -331,14 +331,16 @@ pub struct MemoryRegion {
     /// private or `s` for shared.
     pub permissions: String,
     pub file_offset: u64,
-    /// The file mapped, or the kernel's name for the region, as `[heap]`.
-    /// `None` for memory that maps no file and has no name.
+    /// The file mapped, or the kernel's name for the region, as `[heap]`,
+    /// or the name its process gave it, as `[anon:name]`. `None` for memory
+    /// that maps no file and has no name.
     pub path: Option<String>,
     pub kind: RegionKind,
     /// When it was mapped. `None` if before the recording.
     pub time_ns: Option<u64>,
-    /// When a later region took its place, or its process exec'd. `None`
-    /// if it held its addresses still, as far as the recording knows.
+    /// When a later region took its place, its process changed or took
+    /// away its name, or its process exec'd. `None` if it held its addresses still, as far as the
+    /// recording knows.
     pub unmapped_ns: Option<u64>,
 }
 

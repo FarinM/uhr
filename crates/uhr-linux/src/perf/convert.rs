@@ -22,6 +22,7 @@ use super::unwind::{Unwinding as UserUnwinding, UserCopy};
 use super::{Error, Result, io_error};
 use crate::interpreters::{Interpreters, Program};
 use crate::kallsyms::{self, Kallsyms};
+use crate::memory::Naming;
 use crate::procfs;
 use uhr_core::recording::{
     Clock, Collector, Exit, FORMAT_VERSION, FaultSample, FaultSampling, Frame, Interpreted,
@@ -50,6 +51,8 @@ pub(super) struct Input<'a> {
     /// When the first and last memory readings were taken, on
     /// CLOCK_MONOTONIC.
     pub memory_span: Option<(u64, u64)>,
+    /// What the processes named of their memory, by reading, sorted by time.
+    pub naming: &'a [Naming],
     pub perf_version: String,
     pub requested_frequency_hz: u64,
     pub max_stack_depth: u32,
@@ -218,6 +221,7 @@ pub(super) fn convert(input: Input) -> Result<(Recording, Option<EbpfStacks>)> {
     let mut ebpf = input.ebpf_samples.map(EbpfReader::open).transpose()?;
     let mut held = input.launched_pid;
     let mut foreign = 0;
+    let mut naming = input.naming.iter().peekable();
     while let Some(record) = record_iter
         .next_record(&mut perf_file)
         .map_err(Error::PerfData)?
@@ -249,6 +253,10 @@ pub(super) fn convert(input: Input) -> Result<(Recording, Option<EbpfStacks>)> {
             // So a sample sees the mappings and threads of its time.
             if let Some(ebpf) = ebpf.as_mut() {
                 ebpf.add(&mut state, Some(time))?;
+            }
+            // So a region mapped later is not named from a reading before.
+            while let Some(reading) = naming.next_if(|n| n.time_ns <= time) {
+                state.name(reading);
             }
             state.seen_at(time);
         }
@@ -330,6 +338,7 @@ pub(super) fn convert(input: Input) -> Result<(Recording, Option<EbpfStacks>)> {
     if let Some(ebpf) = ebpf.as_mut() {
         ebpf.add(&mut state, None)?;
     }
+    naming.for_each(|reading| state.name(reading));
     if foreign > 0 {
         warn!(
             records = foreign,
@@ -405,6 +414,13 @@ pub(super) fn convert(input: Input) -> Result<(Recording, Option<EbpfStacks>)> {
              a region moved or grown with mremap, as realloc does with large blocks, so a page \
              fault there is in no region.",
         );
+        if input.memory_span.is_some() {
+            known_biases.push(
+                "A region has the name its process gave it from the next reading of the \
+                 process's smaps, so one gone by then, as when the process ended first, has \
+                 none.",
+            );
+        }
     }
     if faults.is_some() {
         known_biases.push(FAULTS_BIAS);
@@ -958,6 +974,9 @@ struct State {
     regions: Vec<MemoryRegion>,
     /// Each process's regions as mapped now, which don't overlap, by start.
     spaces: HashMap<u32, BTreeMap<u64, usize>>,
+    /// The end and name of each region each process had named at the last
+    /// reading of its `smaps`, by start.
+    named: HashMap<u32, BTreeMap<u64, (u64, String)>>,
     /// The stack perf took of a thread about to go off CPU, until its
     /// switch record comes.
     switch_stacks: HashMap<(u32, u32), u32>,
@@ -1043,6 +1062,7 @@ impl State {
             page_faults: Vec::new(),
             regions: Vec::new(),
             spaces: HashMap::new(),
+            named: HashMap::new(),
             off_cpu: Vec::new(),
             attached_ns: None,
             first_on_cpu: HashMap::new(),
@@ -1203,8 +1223,13 @@ impl State {
     /// regions there end.
     fn region(&mut self, pid: u32, m: &Mmap, permissions: &str) {
         let (start, end) = (m.start, m.start.saturating_add(m.len));
-        // The kernel names memory that maps no file `//anon` here.
-        let path = (m.path != "//anon").then(|| m.path.clone());
+        // The kernel names memory that maps no file `//anon` here. perf
+        // lists what was mapped before it started as `maps` does, with the
+        // names processes gave their memory.
+        let path = match m.path.as_str() {
+            "//anon" => None,
+            path => Some(procfs::memory_name(Some(path)).unwrap_or_else(|| path.to_owned())),
+        };
         if self.grow(pid, m, permissions, path.as_deref()) {
             return;
         }
@@ -1228,7 +1253,9 @@ impl State {
     /// heap or an arena grows, or down, as a stack does. Returns whether one
     /// grew. The kernel reports a heap's first `brk` unnamed, as it names
     /// the heap only once it has grown, so a heap that grows from there
-    /// names it.
+    /// names it. It reports none of the names processes give their memory,
+    /// so a region keeps its name as it grows while the last reading of its
+    /// process's `smaps` had it.
     fn grow(&mut self, pid: u32, m: &Mmap, permissions: &str, path: Option<&str>) -> bool {
         let (start, end, file_offset) = (m.start, m.start.saturating_add(m.len), m.file_offset);
         let Some(space) = self.spaces.get(&pid) else {
@@ -1245,7 +1272,11 @@ impl State {
         let grows = |row: usize, up: bool| {
             let region = &self.regions[row];
             let named = region.path.as_deref() == path
-                || up && region.path.is_none() && path == Some("[heap]");
+                || up && region.path.is_none() && path == Some("[heap]")
+                || path.is_none()
+                    && region.path.as_deref().is_some_and(|name| {
+                        self.named_at_last_reading(pid, region.start, region.end, name)
+                    });
             region.permissions == permissions
                 && named
                 && (anonymous || up && region.file_offset == file_offset)
@@ -1329,6 +1360,93 @@ impl State {
         self.regions[row] = piece(from, to);
     }
 
+    /// What a process had named of its memory at a reading of its `smaps`,
+    /// which the kernel's reports of mapping it don't say: its regions there
+    /// take the names. A process names memory right after mapping it, so a
+    /// region has its name from when it was mapped, but one whose name it
+    /// changed or took away is a new region from the reading.
+    fn name(&mut self, reading: &Naming) {
+        let pid = reading.pid;
+        let mut named = self.named.remove(&pid).unwrap_or_default();
+        for start in &reading.gone {
+            named.remove(start);
+        }
+        for (start, end, name) in &reading.named {
+            named.insert(*start, (*end, name.clone()));
+        }
+        // All of them, as a region mapped where one named alike was before
+        // reads the same in `smaps`.
+        for (&start, (end, name)) in &named {
+            let Some(space) = self.spaces.get(&pid) else {
+                break;
+            };
+            for row in overlapping(space, &self.regions, start, *end) {
+                match self.regions[row].path.as_deref() {
+                    None => {
+                        self.cut(pid, row, start, *end);
+                        self.regions[row].path = Some(name.clone());
+                    }
+                    Some(path) if path != name && procfs::memory_name(Some(path)).is_some() => {
+                        self.rename(pid, row, start, *end, reading.time_ns, Some(name.clone()));
+                    }
+                    // A file, the heap or a stack, which the reports said
+                    // was mapped there, or memory named so already.
+                    _ => {}
+                }
+            }
+        }
+        for &(start, end) in &reading.unnamed {
+            let Some(space) = self.spaces.get(&pid) else {
+                break;
+            };
+            for row in overlapping(space, &self.regions, start, end) {
+                let path = self.regions[row].path.as_deref();
+                if procfs::memory_name(path).is_some() {
+                    self.rename(pid, row, start, end, reading.time_ns, None);
+                }
+            }
+        }
+        self.named.insert(pid, named);
+    }
+
+    /// Ends the part in `start..end` of the region of `pid` at `row` at
+    /// `time`, and maps it again from then with the name `path`.
+    fn rename(
+        &mut self,
+        pid: u32,
+        row: usize,
+        start: u64,
+        end: u64,
+        time: u64,
+        path: Option<String>,
+    ) {
+        self.cut(pid, row, start, end);
+        let region = &mut self.regions[row];
+        region.unmapped_ns = Some(time);
+        let renamed = MemoryRegion {
+            path,
+            time_ns: Some(time),
+            unmapped_ns: None,
+            ..region.clone()
+        };
+        let space = self.spaces.entry(pid).or_default();
+        space.insert(renamed.start, self.regions.len());
+        self.regions.push(renamed);
+    }
+
+    /// Whether the last reading of the `smaps` of `pid` had memory in
+    /// `start..end` named `name`.
+    fn named_at_last_reading(&self, pid: u32, start: u64, end: u64, name: &str) -> bool {
+        let Some(named) = self.named.get(&pid) else {
+            return false;
+        };
+        named
+            .range(..end)
+            .rev()
+            .take_while(|(_, (to, _))| *to > start)
+            .any(|(_, (_, is))| is == name)
+    }
+
     /// A process's exec gave it new memory, so its regions end.
     fn exec_regions(&mut self, pid: u32, time: Option<u64>) {
         for (_, row) in self.spaces.remove(&pid).unwrap_or_default() {
@@ -1339,6 +1457,9 @@ impl State {
     /// A forked process starts with its parent's memory, so with copies of
     /// its regions.
     fn fork_regions(&mut self, pid: u32, parent: u32, time: Option<u64>) {
+        // Of an earlier process with its pid: the readings of this one say
+        // all it names.
+        self.named.remove(&pid);
         let Some(regions) = self.spaces.get(&parent).cloned() else {
             return;
         };
@@ -2301,6 +2422,208 @@ mod tests {
             [
                 (1, 0x100000, 0x103000, RegionKind::Anonymous, Some(20), None),
                 (1, 0x103000, 0x500000, RegionKind::Anonymous, Some(10), None),
+            ]
+        );
+    }
+
+    #[test]
+    fn names_the_regions_where_a_process_named_its_memory() {
+        let mut state = State::new(127);
+        let reading = |time_ns, named: &[(u64, u64, &str)], gone: &[u64]| Naming {
+            time_ns,
+            pid: 1,
+            named: named
+                .iter()
+                .map(|&(start, end, name)| (start, end, name.to_owned()))
+                .collect(),
+            gone: gone.to_vec(),
+            unnamed: Vec::new(),
+        };
+        state
+            .mmap(mapped(1, (0x10000, 0x50000), "//anon", "rw-p", 10))
+            .unwrap();
+        state
+            .mmap(mapped(1, (0x60000, 0x70000), "/data/table", "r--p", 10))
+            .unwrap();
+        state.name(&reading(
+            20,
+            &[
+                (0x20000, 0x30000, "[anon:a]"),
+                (0x60000, 0x70000, "[anon:a]"),
+            ],
+            &[],
+        ));
+        // Made read-only where it was named, which reads no differently.
+        state
+            .mmap(mapped(1, (0x20000, 0x30000), "//anon", "r--p", 30))
+            .unwrap();
+        state.name(&reading(40, &[], &[]));
+        state.name(&reading(50, &[(0x20000, 0x30000, "[anon:b]")], &[0x20000]));
+        let mut named: Vec<_> = state
+            .regions
+            .iter()
+            .map(|r| (r.start, r.end, r.path.as_deref(), r.time_ns, r.unmapped_ns))
+            .collect();
+        named.sort();
+        assert_eq!(
+            named,
+            [
+                (0x10000, 0x20000, None, Some(10), None),
+                (0x20000, 0x30000, Some("[anon:a]"), Some(10), Some(30)),
+                (0x20000, 0x30000, Some("[anon:a]"), Some(30), Some(50)),
+                (0x20000, 0x30000, Some("[anon:b]"), Some(50), None),
+                (0x30000, 0x50000, None, Some(10), None),
+                (0x60000, 0x70000, Some("/data/table"), Some(10), None),
+            ]
+        );
+    }
+
+    #[test]
+    fn names_no_region_as_an_earlier_process_with_its_pid_named_it() {
+        let mut state = State::new(127);
+        let reading = |time_ns, start, name: &str| Naming {
+            time_ns,
+            pid: 1,
+            named: vec![(start, start + 0x10000, name.to_owned())],
+            gone: Vec::new(),
+            unnamed: Vec::new(),
+        };
+        let anonymous = |time| mapped(1, (0x10000, 0x20000), "//anon", "rw-p", time);
+        state.mmap(anonymous(10)).unwrap();
+        state.name(&reading(20, 0x10000, "[anon:a]"));
+        state.fork(1, 1, Some((2, 2)), Some(30));
+        state.mmap(anonymous(40)).unwrap();
+        state.name(&reading(50, 0x30000, "[anon:b]"));
+        let current: Vec<_> = state
+            .regions
+            .iter()
+            .filter(|r| r.unmapped_ns.is_none())
+            .map(|r| (r.start, r.path.as_deref(), r.time_ns))
+            .collect();
+        assert_eq!(current, [(0x10000, None, Some(40))]);
+    }
+
+    #[test]
+    fn takes_the_name_of_a_region_away_as_its_process_did() {
+        let mut state = State::new(127);
+        let reading =
+            |time_ns, pid, named: &[(u64, u64, &str)], gone: &[u64], unnamed: &[(u64, u64)]| {
+                Naming {
+                    time_ns,
+                    pid,
+                    named: named
+                        .iter()
+                        .map(|&(start, end, name)| (start, end, name.to_owned()))
+                        .collect(),
+                    gone: gone.to_vec(),
+                    unnamed: unnamed.to_vec(),
+                }
+            };
+        state
+            .mmap(mapped(1, (0x10000, 0x30000), "//anon", "rw-p", 10))
+            .unwrap();
+        state.name(&reading(20, 1, &[(0x10000, 0x30000, "[anon:a]")], &[], &[]));
+        // With its parent's names, which it took away before it was read.
+        state.fork(2, 2, Some((1, 1)), Some(30));
+        state.name(&reading(40, 2, &[], &[], &[(0x10000, 0x30000)]));
+        state.name(&reading(
+            50,
+            1,
+            &[(0x10000, 0x20000, "[anon:a]")],
+            &[0x10000],
+            &[(0x20000, 0x30000)],
+        ));
+        let mut named: Vec<_> = state
+            .regions
+            .iter()
+            .map(|r| {
+                (
+                    r.pid,
+                    r.start,
+                    r.end,
+                    r.path.as_deref(),
+                    r.time_ns,
+                    r.unmapped_ns,
+                )
+            })
+            .collect();
+        named.sort();
+        assert_eq!(
+            named,
+            [
+                (1, 0x10000, 0x20000, Some("[anon:a]"), Some(10), None),
+                (1, 0x20000, 0x30000, None, Some(50), None),
+                (1, 0x20000, 0x30000, Some("[anon:a]"), Some(10), Some(50)),
+                (2, 0x10000, 0x30000, None, Some(40), None),
+                (2, 0x10000, 0x30000, Some("[anon:a]"), Some(30), Some(40)),
+            ]
+        );
+    }
+
+    #[test]
+    fn keeps_the_name_of_a_region_as_it_grows_while_the_last_reading_had_it() {
+        let mut state = State::new(127);
+        let reading = |time_ns, named: &[(u64, u64, &str)], gone: &[u64]| Naming {
+            time_ns,
+            pid: 1,
+            named: named
+                .iter()
+                .map(|&(start, end, name)| (start, end, name.to_owned()))
+                .collect(),
+            gone: gone.to_vec(),
+            unnamed: Vec::new(),
+        };
+        let anonymous = |range, permissions, time| mapped(1, range, "//anon", permissions, time);
+        // Reserved, and made usable in part, as a thread's malloc arena is.
+        state
+            .mmap(anonymous((0x100000, 0x500000), "---p", 10))
+            .unwrap();
+        state
+            .mmap(anonymous((0x100000, 0x200000), "rw-p", 20))
+            .unwrap();
+        state
+            .mmap(anonymous((0x600000, 0x700000), "rw-p", 10))
+            .unwrap();
+        state.name(&reading(
+            30,
+            &[
+                (0x100000, 0x200000, "[anon:arena]"),
+                (0x200000, 0x500000, "[anon:arena]"),
+                (0x600000, 0x700000, "[anon:b]"),
+            ],
+            &[],
+        ));
+        state
+            .mmap(anonymous((0x100000, 0x300000), "rw-p", 40))
+            .unwrap();
+        // The other unmapped, and what is mapped where it was then reported
+        // as if it grew.
+        state.name(&reading(
+            50,
+            &[
+                (0x100000, 0x300000, "[anon:arena]"),
+                (0x300000, 0x500000, "[anon:arena]"),
+            ],
+            &[0x100000, 0x200000, 0x600000],
+        ));
+        state
+            .mmap(anonymous((0x600000, 0x800000), "rw-p", 60))
+            .unwrap();
+        let mut named: Vec<_> = state
+            .regions
+            .iter()
+            .map(|r| (r.start, r.end, r.path.as_deref(), r.time_ns, r.unmapped_ns))
+            .collect();
+        named.sort();
+        assert_eq!(
+            named,
+            [
+                (0x100000, 0x200000, None, Some(10), Some(20)),
+                (0x100000, 0x300000, Some("[anon:arena]"), Some(20), None),
+                (0x200000, 0x300000, Some("[anon:arena]"), Some(10), Some(40)),
+                (0x300000, 0x500000, Some("[anon:arena]"), Some(10), None),
+                (0x600000, 0x700000, Some("[anon:b]"), Some(10), Some(60)),
+                (0x600000, 0x800000, None, Some(60), None),
             ]
         );
     }

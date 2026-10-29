@@ -292,16 +292,13 @@ pub fn record(options: &RecordOptions, interrupts: &Interrupts, out: &Path) -> R
         None => None,
     };
 
-    let memory_span = ended
-        .memory
-        .as_ref()
-        .and_then(|read| read.as_ref().ok())
-        .and_then(|read| {
-            Some((
-                read.readings.first()?.time_ns,
-                read.readings.last()?.time_ns,
-            ))
-        });
+    let memory = ended.memory.as_ref().and_then(|read| read.as_ref().ok());
+    let memory_span = memory.and_then(|read| {
+        Some((
+            read.readings.first()?.time_ns,
+            read.readings.last()?.time_ns,
+        ))
+    });
     let recording = convert::convert(convert::Input {
         perf_data: &perf_data,
         command: &command,
@@ -311,6 +308,7 @@ pub fn record(options: &RecordOptions, interrupts: &Interrupts, out: &Path) -> R
         stopped_ns: ended.stopped_ns,
         attached_ns: ended.attached_ns,
         memory_span,
+        naming: memory.map_or(&[], |read| &read.naming),
         perf_version,
         requested_frequency_hz: options.frequency_hz,
         max_stack_depth,

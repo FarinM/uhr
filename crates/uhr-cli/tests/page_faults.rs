@@ -11,7 +11,7 @@ use std::process::Command;
 
 use serde_json::Value;
 
-use common::{UHR, compile, scratch, uhr, uhr_as_root};
+use common::{UHR, compile, kernel_names_memory, scratch, uhr, uhr_as_root};
 
 const PROGRAMS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../test-programs");
 
@@ -269,6 +269,34 @@ fn tells_the_regions_a_program_grew_apart() {
             assert!(touch["self_share"].as_f64().unwrap() > 0.8, "{touch}");
         }
     }
+}
+
+#[test]
+fn names_the_regions_as_the_program_named_its_memory() {
+    if !kernel_names_memory() {
+        eprintln!("skipped: needs Linux 5.17 or later, built with CONFIG_ANON_VMA_NAME");
+        return;
+    }
+    let dir = scratch("page_faults_named");
+    let program = dir.join("named");
+    compile("named", &program, "-O2");
+    let recording = dir.join("rec");
+    let rec = recording.to_str().unwrap();
+    let program = program.to_str().unwrap();
+    uhr(&[
+        "record",
+        "--no-symbolize",
+        "-o",
+        rec,
+        "--",
+        program,
+        "32",
+        "300",
+    ]);
+    let result = faults_by_region(rec);
+    let named = row(&result, |row| row["path"] == "[anon:uhr test]");
+    assert_eq!(named["kind"], "anonymous");
+    assert!(named["share"].as_f64().unwrap() > 0.9, "{}", result["rows"]);
 }
 
 #[test]

@@ -46,6 +46,8 @@ pub(crate) struct Read {
     pub(crate) readings: Vec<MemoryReading>,
     /// Sorted by time.
     pub(crate) region_memory: Vec<RegionMemory>,
+    /// Sorted by time.
+    pub(crate) naming: Vec<Naming>,
     /// uhr's own CPU time reading `/proc`.
     pub(crate) cpu_ns: u64,
     /// The target's processes that could not be read, by why.
@@ -55,6 +57,24 @@ pub(crate) struct Read {
     /// New processes on the host that could not be checked for being the
     /// target's, by why.
     pub(crate) unchecked: BTreeMap<String, u64>,
+}
+
+/// The regions of its memory a process had named when its `smaps` was read,
+/// by what changed since the reading before. One for the first reading of
+/// each process, and for each later one of a process that had any named
+/// then, or at the reading before.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Naming {
+    pub(crate) time_ns: u64,
+    pub(crate) pid: u32,
+    /// The start, end and name of each named since.
+    pub(crate) named: Vec<(u64, u64, String)>,
+    /// The starts of those no longer named so.
+    pub(crate) gone: Vec<u64>,
+    /// The start and end of each region with no name where one was named
+    /// at the reading before. At the first, of each, as a forked process
+    /// can take away names it had from its parent.
+    pub(crate) unnamed: Vec<(u64, u64)>,
 }
 
 /// Reads the memory of a process and the processes it starts, from `begin`
@@ -82,6 +102,7 @@ impl Reader {
         let processes = Processes {
             tracked: BTreeMap::from([(pid, Tracked::new(start))]),
             region_memory: Vec::new(),
+            naming: Vec::new(),
             last_pid: last_pid().map_err(error(LOADAVG))?,
             pid_max: fs::read_to_string(PID_MAX)
                 .and_then(|max| max.trim().parse().map_err(io::Error::other))
@@ -129,6 +150,7 @@ impl Reader {
             Read {
                 readings,
                 region_memory: processes.region_memory,
+                naming: processes.naming,
                 cpu_ns: cpu.tv_sec as u64 * 1_000_000_000 + cpu.tv_nsec as u64,
                 unreadable: processes.unreadable,
                 no_regions: processes.no_regions,
@@ -151,6 +173,7 @@ impl Reader {
             None => Read {
                 readings: Vec::new(),
                 region_memory: Vec::new(),
+                naming: Vec::new(),
                 cpu_ns: 0,
                 unreadable: BTreeMap::new(),
                 no_regions: BTreeMap::new(),
@@ -166,6 +189,7 @@ struct Processes {
     /// can't use up uhr's files.
     tracked: BTreeMap<u32, Tracked>,
     region_memory: Vec<RegionMemory>,
+    naming: Vec<Naming>,
     /// The pid the kernel last gave out when new processes were looked for.
     last_pid: u32,
     /// Pids are below it.
@@ -212,7 +236,7 @@ impl Processes {
         if now < tracked.smaps_due_ns {
             return;
         }
-        match self.read_smaps(pid, dir, now) {
+        match self.read_smaps(pid, dir, now, &mut tracked.names) {
             Ok(due) => tracked.smaps_due_ns = due,
             // It, or the thread whose directory it was, ended since: the
             // next reading drops it or reads another thread's.
@@ -227,19 +251,61 @@ impl Processes {
     }
 
     /// Reads the `smaps` in `dir`, of the process `pid`, at `now`, and
-    /// returns when to read it next.
-    fn read_smaps(&mut self, pid: u32, dir: &Path, now: u64) -> io::Result<u64> {
+    /// returns when to read it next. `names` holds the regions it had named
+    /// at the reading before, by start, if there was one, and then those it
+    /// has named now.
+    fn read_smaps(
+        &mut self,
+        pid: u32,
+        dir: &Path,
+        now: u64,
+        names: &mut Option<Names>,
+    ) -> io::Result<u64> {
         let interval = INTERVAL.as_nanos() as u64;
         procfs::read(dir.join("smaps"), &mut self.bytes)?;
+        let first = names.is_none();
+        let before = names.take().unwrap_or_default();
+        let had_name = |start, end| {
+            let last = before.range(..end).next_back();
+            last.is_some_and(|(_, &(to, _))| to > start)
+        };
         let mut kinds: BTreeMap<(RegionKind, Option<String>), (u64, u64)> = BTreeMap::new();
+        let mut named = Names::new();
+        let mut unnamed = Vec::new();
         for region in procfs::smaps(&self.bytes) {
             let line = &region.line;
             let path = line.path.as_deref();
             let kind = procfs::region_kind(&line.permissions, path);
-            let (rss, swap) = kinds.entry((kind, procfs::memory_name(path))).or_default();
+            let name = procfs::memory_name(path);
+            if let Some(name) = &name {
+                named.insert(line.start, (line.end, name.clone()));
+            } else if path.is_none() && (first || had_name(line.start, line.end)) {
+                unnamed.push((line.start, line.end));
+            }
+            let (rss, swap) = kinds.entry((kind, name)).or_default();
             *rss += region.rss;
             *swap += region.swap;
         }
+        let gone: Vec<u64> = before
+            .iter()
+            .filter(|&(start, was)| named.get(start) != Some(was))
+            .map(|(&start, _)| start)
+            .collect();
+        // Memory named at the reading before and none now is in `gone`.
+        if first || !named.is_empty() || !gone.is_empty() {
+            self.naming.push(Naming {
+                time_ns: now,
+                pid,
+                named: named
+                    .iter()
+                    .filter(|&(start, is)| before.get(start) != Some(is))
+                    .map(|(&start, (end, name))| (start, *end, name.clone()))
+                    .collect(),
+                gone,
+                unnamed,
+            });
+        }
+        *names = Some(named);
         self.region_memory.extend(
             kinds
                 .into_iter()
@@ -435,6 +501,8 @@ struct Tracked {
     start: u64,
     /// When its `smaps` is next to be read.
     smaps_due_ns: u64,
+    /// The regions it had named when its `smaps` was last read, if it was.
+    names: Option<Names>,
 }
 
 impl Tracked {
@@ -442,9 +510,13 @@ impl Tracked {
         Self {
             start,
             smaps_due_ns: 0,
+            names: None,
         }
     }
 }
+
+/// The end and name of each region a process named, by start.
+type Names = BTreeMap<u64, (u64, String)>;
 
 /// Counts of a process's memory, in bytes.
 #[derive(Debug, PartialEq, Eq)]
@@ -676,7 +748,7 @@ mod tests {
         let mapped = vec![1u8; 64 << 20];
         let now = monotonic_ns();
         let due = processes
-            .read_smaps(pid, Path::new(&format!("/proc/{pid}")), now)
+            .read_smaps(pid, Path::new(&format!("/proc/{pid}")), now, &mut None)
             .unwrap();
         drop(mapped);
         assert!(due >= now + INTERVAL.as_nanos() as u64);
@@ -707,7 +779,9 @@ mod tests {
         fs::write(dir.path().join("smaps"), smaps).unwrap();
         let mut reader = Reader::start(std::process::id()).unwrap();
         let processes = reader.processes.as_mut().unwrap();
-        processes.read_smaps(7, dir.path(), 1_000).unwrap();
+        processes
+            .read_smaps(7, dir.path(), 1_000, &mut None)
+            .unwrap();
         let read: Vec<_> = processes
             .region_memory
             .iter()
@@ -724,6 +798,63 @@ mod tests {
                     Some("[anon: glibc: pthread stack]"),
                     24
                 ),
+            ]
+        );
+    }
+
+    #[test]
+    fn says_what_a_process_named_of_its_memory_since_the_reading_before() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut reader = Reader::start(std::process::id()).unwrap();
+        let processes = reader.processes.as_mut().unwrap();
+        let mut names = None;
+        let mut read = |time_ns, regions: &[(&str, &str)]| {
+            let smaps: String = regions
+                .iter()
+                .map(|(range, path)| format!("{range} rw-p 00000000 00:00 0  {path}\n"))
+                .collect();
+            fs::write(dir.path().join("smaps"), smaps).unwrap();
+            processes
+                .read_smaps(7, dir.path(), time_ns, &mut names)
+                .unwrap();
+        };
+        read(1, &[("1000-2000", ""), ("3000-4000", "")]);
+        read(2, &[("1000-2000", "[anon:a]"), ("3000-4000", "[anon:b]")]);
+        read(3, &[("1000-2000", "[anon:a]"), ("3000-4000", "[anon:b]")]);
+        // Renamed in part, its name taken from the rest, and the other
+        // unmapped.
+        read(4, &[("1000-1800", "[anon:c]"), ("1800-2000", "")]);
+        read(5, &[("5000-6000", "")]);
+        read(6, &[("5000-6000", "")]);
+        let naming =
+            |time_ns, named: &[(u64, u64, &str)], gone: &[u64], unnamed: &[(u64, u64)]| Naming {
+                time_ns,
+                pid: 7,
+                named: named
+                    .iter()
+                    .map(|&(start, end, name)| (start, end, name.to_owned()))
+                    .collect(),
+                gone: gone.to_vec(),
+                unnamed: unnamed.to_vec(),
+            };
+        assert_eq!(
+            processes.naming,
+            [
+                naming(1, &[], &[], &[(0x1000, 0x2000), (0x3000, 0x4000)]),
+                naming(
+                    2,
+                    &[(0x1000, 0x2000, "[anon:a]"), (0x3000, 0x4000, "[anon:b]")],
+                    &[],
+                    &[]
+                ),
+                naming(3, &[], &[], &[]),
+                naming(
+                    4,
+                    &[(0x1000, 0x1800, "[anon:c]")],
+                    &[0x1000, 0x3000],
+                    &[(0x1800, 0x2000)]
+                ),
+                naming(5, &[], &[0x1000], &[]),
             ]
         );
     }

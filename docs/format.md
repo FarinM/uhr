@@ -273,16 +273,25 @@ does. A forked process starts with copies of its parent's regions, mapped as
 it forked. The kernel reports no region moved or grown with `mremap`, as
 `realloc` does with large blocks.
 
+The kernel's reports don't name the memory a process named, so at each
+reading of `region_memory` the regions in what the process had named then
+take its names. A process names memory right after mapping it, so a region
+has its name from when it was mapped. One whose name the process changed or
+took away ends at the reading, and a region with the new name, or none,
+starts there. A region keeps its name as it grows if the last reading had
+it. A region gone before the next reading, as when its process ended first,
+has no name.
+
 | Column | Type | Meaning |
 |---|---|---|
 | `pid` | uint32 | |
 | `start`, `end` | uint64 | Address range, end exclusive |
 | `permissions` | string | As `/proc/<pid>/maps` lists them, as in `r-xp`: whether it can be read, written and run, and `p` for private or `s` for shared |
 | `file_offset` | uint64 | Offset in the file of `start` |
-| `path` | string, nullable | The file mapped, or the kernel's name for the region, as `[heap]` or `[vdso]`. Null for memory that maps no file and has no name |
+| `path` | string, nullable | The file mapped, or the kernel's name for the region, as `[heap]` or `[vdso]`, or the name its process gave it, as in `region_memory`. Null for memory that maps no file and has no name |
 | `kind` | string | `heap` (grown with `brk`, where malloc starts), `stack` (the main thread's: other threads' are `anonymous`), `anonymous` (the process's own memory that maps no file, as what malloc maps for large or per-thread allocations, or a runtime's garbage-collected heap), `anonymous_code` (anonymous memory that can run code, as what a JIT compiles into), `shared` (memory shared with other processes, as shared memory and files in memory), `code` (a file's code), `file` (the rest of a file mapped), `kernel` (what the kernel maps into every process, as `[vdso]`) |
 | `time_ns` | uint64, nullable | When it was mapped. Null if before the recording |
-| `unmapped_ns` | uint64, nullable | When a region mapped over it, or its process's exec, ended it. 0 if before the recording. Null if it was still mapped at the end, as far as the kernel's reports tell |
+| `unmapped_ns` | uint64, nullable | When a region mapped over it, its process's changing or taking away its name, or its process's exec, ended it. 0 if before the recording. Null if it was still mapped at the end, as far as the kernel's reports tell |
 
 A page fault was in the region of its process that held its address when it
 faulted, if one did: mapped at or before then, and not yet unmapped. In none
