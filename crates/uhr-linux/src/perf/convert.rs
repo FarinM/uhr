@@ -1292,31 +1292,41 @@ impl State {
     /// as a region mapped there took their place. The parts of them outside
     /// it are still mapped, and become regions of their own.
     fn unmap(&mut self, pid: u32, start: u64, end: u64, time: Option<u64>, except: Option<usize>) {
-        let Some(space) = self.spaces.get_mut(&pid) else {
+        let Some(space) = self.spaces.get(&pid) else {
             return;
         };
         let over = overlapping(space, &self.regions, start, end);
         for row in over.into_iter().filter(|&row| Some(row) != except) {
-            let region = self.regions[row].clone();
-            space.remove(&region.start);
-            let piece = |from: u64, to: u64| MemoryRegion {
-                start: from,
-                end: to,
-                file_offset: region.file_offset + (from - region.start),
-                ..region.clone()
-            };
-            for (from, to) in [(region.start, start), (end, region.end)] {
-                if from < to {
-                    space.insert(from, self.regions.len());
-                    self.regions.push(piece(from, to));
-                }
+            self.cut(pid, row, start, end);
+            let region = &mut self.regions[row];
+            region.unmapped_ns = Some(time.unwrap_or(0));
+            if let Some(space) = self.spaces.get_mut(&pid) {
+                space.remove(&region.start);
             }
-            let (from, to) = (region.start.max(start), region.end.min(end));
-            self.regions[row] = MemoryRegion {
-                unmapped_ns: Some(time.unwrap_or(0)),
-                ..piece(from, to)
-            };
         }
+    }
+
+    /// Cuts the region of `pid` at `row` down to its part in `start..end`.
+    /// Its parts outside become regions of their own, mapped as it was.
+    fn cut(&mut self, pid: u32, row: usize, start: u64, end: u64) {
+        let region = self.regions[row].clone();
+        let space = self.spaces.entry(pid).or_default();
+        space.remove(&region.start);
+        let piece = |from: u64, to: u64| MemoryRegion {
+            start: from,
+            end: to,
+            file_offset: region.file_offset + (from - region.start),
+            ..region.clone()
+        };
+        for (from, to) in [(region.start, start), (end, region.end)] {
+            if from < to {
+                space.insert(from, self.regions.len());
+                self.regions.push(piece(from, to));
+            }
+        }
+        let (from, to) = (region.start.max(start), region.end.min(end));
+        space.insert(from, row);
+        self.regions[row] = piece(from, to);
     }
 
     /// A process's exec gave it new memory, so its regions end.
