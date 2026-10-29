@@ -12,7 +12,9 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use common::{compile, kernel_names_memory, scratch, uhr};
+use common::{
+    compile, glibc_names_memory, kernel_names_memory, scratch, uhr, uhr_with_glibc_tunables,
+};
 
 const MIB: u64 = 1 << 20;
 
@@ -306,29 +308,36 @@ fn says_how_much_of_each_kind_of_region_is_resident() {
     let program = dir.join("grow");
     compile("grow", &program, "-O2");
     let program = program.to_str().unwrap();
-    // Blocks of 8 MiB, which malloc maps on its own, and of 4 KiB, which
-    // it takes from the heap, kept a while.
-    for (block, kind) in [("8192", "anonymous"), ("4", "heap")] {
-        let recording = dir.join(format!("rec-{block}"));
+    // Blocks of 8 MiB, which malloc maps on its own, and names when told
+    // to, unless the caller told it not to, and of 4 KiB, which it takes
+    // from the heap, kept a while.
+    let malloc = glibc_names_memory().then_some("[anon: glibc: malloc]");
+    let unnamed = Some("glibc.mem.decorate_maps=0");
+    let cases = [
+        ("8192", None, None, "anonymous", malloc),
+        (
+            "8192",
+            Some("--no-runtime-support"),
+            None,
+            "anonymous",
+            None,
+        ),
+        ("8192", None, unnamed, "anonymous", None),
+        ("4", None, None, "heap", None),
+    ];
+    for (case, (block, flag, tunables, kind, name)) in cases.into_iter().enumerate() {
+        let recording = dir.join(format!("rec-{case}"));
         let rec = recording.to_str().unwrap();
-        uhr(&[
-            "record",
-            "--no-symbolize",
-            "-o",
-            rec,
-            "--",
-            program,
-            "64",
-            "0",
-            "1000",
-            block,
-        ]);
+        let mut args = vec!["record", "--no-symbolize", "-o", rec];
+        args.extend(flag);
+        args.extend(["--", program, "64", "0", "1000", block]);
+        uhr_with_glibc_tunables(&args, tunables);
         let overview = overview(rec);
         let process = &rows(&overview)[0];
         let kinds = process["regions"]["kinds"].as_array().unwrap();
         let resident = kinds
             .iter()
-            .find(|k| k["kind"] == kind)
+            .find(|k| k["kind"] == kind && k["name"].as_str() == name)
             .map_or(0, |k| number(&k["rss_bytes"]));
         assert!(resident >= 60 * MIB, "{}", process["regions"]);
     }

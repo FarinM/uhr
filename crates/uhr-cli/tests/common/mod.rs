@@ -10,9 +10,18 @@ pub const UHR: &str = env!("CARGO_BIN_EXE_uhr");
 
 const PROGRAMS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../test-programs");
 
-/// Runs uhr and fails the test if it fails.
+/// Runs uhr and fails the test if it fails. Without the caller's glibc
+/// tunables, as uhr keeps one's setting of whether glibc names memory.
 pub fn uhr(args: &[&str]) -> Output {
-    let output = Command::new(UHR).args(args).output().unwrap();
+    uhr_with_glibc_tunables(args, None)
+}
+
+/// Runs uhr as `uhr` does, with `tunables` as the glibc tunables.
+pub fn uhr_with_glibc_tunables(args: &[&str], tunables: Option<&str>) -> Output {
+    let mut command = Command::new(UHR);
+    command.args(args).env_remove("GLIBC_TUNABLES");
+    command.envs(tunables.map(|tunables| ("GLIBC_TUNABLES", tunables)));
+    let output = command.output().unwrap();
     assert!(
         output.status.success(),
         "uhr {args:?} failed:\n{}",
@@ -71,6 +80,17 @@ pub fn kernel_names_memory() -> bool {
         libc::munmap(page, length);
         named == 0
     }
+}
+
+/// Whether glibc names the memory it maps when told to, as glibc 2.39 and
+/// later do on Linux 5.17 and later, so that uhr has it do so at launch.
+pub fn glibc_names_memory() -> bool {
+    let maps = Command::new("cat")
+        .arg("/proc/self/maps")
+        .env("GLIBC_TUNABLES", "glibc.mem.decorate_maps=1")
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&maps.stdout).contains("[anon: glibc:")
 }
 
 /// The CPU samples of a recording's manifest, whichever stream took them.

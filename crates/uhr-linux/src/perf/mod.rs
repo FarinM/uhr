@@ -372,7 +372,7 @@ pub fn record(options: &RecordOptions, interrupts: &Interrupts, out: &Path) -> R
         options.syscalls,
         matches!(ready, Ready::Attach { .. }),
     );
-    add_memory(&mut recording, ended.memory);
+    add_memory(&mut recording, ended.memory, ended.glibc_names);
 
     // uhr made the runtimes it launched write them, so it cleans them up
     // once the recording holds the names.
@@ -412,8 +412,12 @@ pub fn record(options: &RecordOptions, interrupts: &Interrupts, out: &Path) -> R
 }
 
 /// Adds the memory readings as a stream of their own, or says why there
-/// are none.
-fn add_memory(recording: &mut Recording, read: Option<Result<memory::Read, memory::Error>>) {
+/// are none, and whether uhr had glibc name the memory it maps.
+fn add_memory(
+    recording: &mut Recording,
+    read: Option<Result<memory::Read, memory::Error>>,
+    glibc_names: bool,
+) {
     let read = match read {
         None => return,
         Some(Err(error)) => {
@@ -450,6 +454,15 @@ fn add_memory(recording: &mut Recording, read: Option<Result<memory::Read, memor
          process's page tables, at most every {interval_ms} ms, and after a read that took a \
          while, a hundred times as long later: a large process's is read less often."
     ));
+    if glibc_names {
+        known_biases.push(
+            "uhr set glibc.mem.decorate_maps=1 in the target's GLIBC_TUNABLES, so that glibc \
+             2.39 and later name the memory malloc maps and threads' stacks. The kernel merges \
+             no memory named apart with its neighbors, so the target can have more regions \
+             than it would."
+                .to_owned(),
+        );
+    }
     known_biases.extend(read.unreadable.iter().map(|(reason, processes)| {
         format!("{processes} of the target's processes could not be read: {reason}.")
     }));
@@ -863,6 +876,9 @@ fn remove_staging(staging: &Path) {
 struct Ended {
     /// The runtimes whose perf maps were on in a target uhr launched.
     runtime_support: Option<Vec<String>>,
+    /// Whether uhr had glibc name the memory it maps, in a target it
+    /// launched.
+    glibc_names: bool,
     /// The process uhr started, when it launched the target.
     launched_pid: Option<u32>,
     exit: Option<Exit>,
@@ -908,8 +924,14 @@ fn run(
         // Held until perf samples, so perf sees it from its first
         // instruction.
         Ready::Launch(command) => {
-            let (environment, runtimes) =
+            let (mut environment, runtimes) =
                 uhr_core::runtimes::environment(|v| env::var_os(v), options.runtime_support);
+            // Only `smaps` says what glibc named.
+            let tunables = (options.memory && options.runtime_support)
+                .then(|| memory::glibc_names(|v| env::var_os(v)))
+                .flatten();
+            let glibc_names = tunables.is_some();
+            environment.extend(tunables);
             let held = Held::spawn(command, &environment)?;
             let pid = held.pid();
             let mut ebpf = start_ebpf(pid, true, options, tick, fault_period, samples)?;
@@ -934,6 +956,7 @@ fn run(
             sampling.finish_relay();
             Ok(Ended {
                 runtime_support: Some(runtimes),
+                glibc_names,
                 launched_pid: Some(pid),
                 exit: exit(target),
                 perf,
@@ -988,6 +1011,7 @@ fn run(
             });
             Ok(Ended {
                 runtime_support: None,
+                glibc_names: false,
                 launched_pid: None,
                 exit,
                 perf,

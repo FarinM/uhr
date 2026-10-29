@@ -11,7 +11,7 @@ use std::process::Command;
 
 use serde_json::Value;
 
-use common::{UHR, compile, kernel_names_memory, scratch, uhr, uhr_as_root};
+use common::{UHR, compile, glibc_names_memory, kernel_names_memory, scratch, uhr, uhr_as_root};
 
 const PROGRAMS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../test-programs");
 
@@ -238,14 +238,18 @@ fn tells_the_regions_a_program_grew_apart() {
     compile("grow", &program, "-O2");
     let program = program.to_str().unwrap();
     // Blocks of 8 MiB, which malloc maps on its own, and of 4 KiB, which
-    // it takes from the heap.
+    // it takes from the heap, kept past a reading of what glibc named.
     for (block, kind) in [("8192", "anonymous"), ("4", "heap")] {
         let recording = dir.join(format!("rec-{block}"));
         let rec = recording.to_str().unwrap();
-        uhr(&["record", "-o", rec, "--", program, "32", "0", "0", block]);
+        uhr(&["record", "-o", rec, "--", program, "32", "0", "300", block]);
         let result = faults_by_region(rec);
         let share = share_in(&result, kind);
         assert!(share > 0.9, "{}", result["rows"]);
+        if kind == "anonymous" && glibc_names_memory() {
+            let named = row(&result, |row| row["path"] == "[anon: glibc: malloc]");
+            assert!(named["share"].as_f64().unwrap() > 0.9, "{named}");
+        }
 
         let under = json(&[
             "query",

@@ -165,8 +165,9 @@ struct RecordArgs {
     #[arg(long)]
     no_off_cpu: bool,
     /// Don't set the variables that make runtimes, such as Python 3.12
-    /// and later and Node, name the code they compile. That costs them
-    /// a little time, and without it their functions have no names
+    /// and later and Node, name the code they compile, and glibc the
+    /// memory it maps. That costs them a little time, and without it
+    /// their functions, and glibc's memory, have no names
     #[arg(long, conflicts_with = "pid")]
     no_runtime_support: bool,
     /// Don't count and time the target's syscalls. uhr does that with its

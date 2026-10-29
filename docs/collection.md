@@ -188,6 +188,14 @@ Debian and Ubuntu its package must match the running kernel.
   option in its environment can move. uhr removes those it finds in the
   directory the target started in, and says when a Node process left its
   log elsewhere.
+- Unless `--no-runtime-support` or `--no-memory`, uhr also adds
+  `glibc.mem.decorate_maps=1` to a launched target's `GLIBC_TUNABLES`,
+  unless that says whether to already, so that glibc 2.39 and later name
+  the memory malloc maps, threads' stacks and what its loader allocates,
+  which each process's `smaps` then says. That costs a syscall each time
+  malloc maps memory or a thread starts. The kernel merges no memory named
+  apart with its neighbors, so a process can have more regions than it
+  would, against the kernel's limit of 65530 by default.
 - With `--pid`, uhr attaches perf the same way to a running process, and
   follows the threads and processes it starts. It never signals the
   process: the capture ends at an interrupt, at the end of `--duration`, or
@@ -329,9 +337,10 @@ which takes the process's memory lock and costs by its size.
   processes.
 - `smaps` also says how much each process has resident under each name it
   gave its memory, since Linux 5.17, as PHP names its heap
-  `[anon:zend_alloc]`. A number that ends a name, as the id of the thread
-  whose stack glibc names, is dropped, so that memory used alike has one
-  name.
+  `[anon:zend_alloc]`, and glibc, which uhr has do so at launch, what malloc
+  maps `[anon: glibc: malloc]`. A number that ends a name, as the id of the
+  thread whose stack glibc names, is dropped, so that memory used alike has
+  one name.
 - The stream's overhead is uhr's own CPU time reading `/proc`, which the
   kernel spends on the target's counts but not in the target.
 

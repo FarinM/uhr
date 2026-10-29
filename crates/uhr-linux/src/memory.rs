@@ -2,6 +2,7 @@
 //! intervals while the capture runs.
 
 use std::collections::{BTreeMap, HashSet};
+use std::ffi::OsString;
 use std::fs;
 use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
@@ -30,8 +31,33 @@ const SMAPS_BACKOFF: u64 = 100;
 /// listing `/proc` costs less.
 const MAX_PROBES: u32 = 128;
 
+/// The tunable that has glibc 2.39 and later name the memory it maps: what
+/// malloc maps, threads' stacks and what its loader allocates.
+const DECORATE_MAPS: &str = "glibc.mem.decorate_maps";
+
 const LOADAVG: &str = "/proc/loadavg";
 const PID_MAX: &str = "/proc/sys/kernel/pid_max";
+
+/// What to set `GLIBC_TUNABLES`, read with `get`, to in a target's
+/// environment, so that glibc names the memory it maps, which `smaps` then
+/// says. `None` if it says whether to already.
+pub(crate) fn glibc_names(
+    get: impl Fn(&str) -> Option<OsString>,
+) -> Option<(&'static str, OsString)> {
+    let mut tunables = get("GLIBC_TUNABLES").unwrap_or_default();
+    let set = tunables
+        .to_string_lossy()
+        .split(':')
+        .any(|tunable| tunable.split('=').next() == Some(DECORATE_MAPS));
+    if set {
+        return None;
+    }
+    if !tunables.is_empty() {
+        tunables.push(":");
+    }
+    tunables.push(format!("{DECORATE_MAPS}=1"));
+    Some(("GLIBC_TUNABLES", tunables))
+}
 
 /// Why the target's memory could not be read.
 #[derive(Debug, thiserror::Error)]
@@ -630,6 +656,24 @@ mod tests {
     fn needs_the_counts_split_by_kind() {
         let old = b"Name:\tapp\nVmHWM:\t5120 kB\nVmRSS:\t4096 kB\nVmSwap:\t0 kB\n";
         assert!(counts(old).is_err());
+    }
+
+    #[test]
+    fn has_glibc_name_its_memory_unless_told_whether_to() {
+        let set = |tunables: Option<&str>| {
+            glibc_names(|name| {
+                assert_eq!(name, "GLIBC_TUNABLES");
+                tunables.map(OsString::from)
+            })
+            .map(|(_, value)| value.into_string().unwrap())
+        };
+        assert_eq!(set(None).as_deref(), Some("glibc.mem.decorate_maps=1"));
+        assert_eq!(
+            set(Some("glibc.malloc.arena_max=2")).as_deref(),
+            Some("glibc.malloc.arena_max=2:glibc.mem.decorate_maps=1")
+        );
+        assert_eq!(set(Some("glibc.mem.decorate_maps=0")), None);
+        assert_eq!(set(Some("a=1:glibc.mem.decorate_maps=1")), None);
     }
 
     #[test]
