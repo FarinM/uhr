@@ -134,6 +134,20 @@ pub(crate) fn smaps(smaps: &[u8]) -> Vec<SmapsRegion> {
     regions
 }
 
+/// The name a process gave memory of its own that maps no file, from its
+/// path in `maps`, as `[anon:name]`. Without a number that ends it, as the
+/// id of the thread whose stack glibc names, so that memory used alike has
+/// one name. `None` for memory it gave none.
+pub(crate) fn memory_name(path: Option<&str>) -> Option<String> {
+    let name = path?.strip_prefix("[anon:")?.strip_suffix(']')?;
+    let numbered = name
+        .trim_end_matches(|c: char| c.is_ascii_digit())
+        .trim_end()
+        .strip_suffix(':')
+        .filter(|_| name.ends_with(|c: char| c.is_ascii_digit()));
+    Some(format!("[anon:{}]", numbered.unwrap_or(name)))
+}
+
 /// What a region of memory is, from its permissions and its path in
 /// `maps`, `None` for memory that maps no file and has no name.
 pub(crate) fn region_kind(permissions: &str, path: Option<&str>) -> RegionKind {
@@ -247,6 +261,30 @@ mod tests {
             counts,
             [(Some("[heap]"), 84 << 10, 8 << 10), (None, 4 << 10, 0)]
         );
+    }
+
+    #[test]
+    fn reads_the_name_a_process_gave_its_memory_without_a_number() {
+        let cases = [
+            (Some("[anon: glibc: malloc]"), Some("[anon: glibc: malloc]")),
+            (
+                Some("[anon: glibc: pthread stack: 2130147]"),
+                Some("[anon: glibc: pthread stack]"),
+            ),
+            (
+                Some("[anon:stack_and_tls:22379]"),
+                Some("[anon:stack_and_tls]"),
+            ),
+            (Some("[anon:v8]"), Some("[anon:v8]")),
+            (Some("[anon:ends:]"), Some("[anon:ends:]")),
+            (Some("[anon_shmem:queue]"), None),
+            (Some("[heap]"), None),
+            (Some("/usr/lib/libc.so.6"), None),
+            (None, None),
+        ];
+        for (path, expected) in cases {
+            assert_eq!(memory_name(path).as_deref(), expected, "{path:?}");
+        }
     }
 
     #[test]

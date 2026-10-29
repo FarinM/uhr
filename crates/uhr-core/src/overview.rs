@@ -78,7 +78,8 @@ pub struct MemoryRow {
     pub regions: Option<RegionsUsage>,
 }
 
-/// How much of a process's memory was in each kind of region when read.
+/// How much of a process's memory was in each kind of region, and under
+/// each name it gave its memory, when read.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RegionsUsage {
     pub time_ns: u64,
@@ -89,6 +90,8 @@ pub struct RegionsUsage {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct KindUsage {
     pub kind: RegionKind,
+    /// As `[anon:name]`. `None` for memory the process gave no name.
+    pub name: Option<String>,
     pub rss_bytes: u64,
     pub swap_bytes: u64,
 }
@@ -469,14 +472,18 @@ fn memory(
         }
         usage.kinds.push(KindUsage {
             kind: reading.kind,
+            name: reading.name.clone(),
             rss_bytes: reading.rss_bytes,
             swap_bytes: reading.swap_bytes,
         });
     }
     for usage in regions.values_mut() {
-        usage
-            .kinds
-            .sort_by(|a, b| b.rss_bytes.cmp(&a.rss_bytes).then(a.kind.cmp(&b.kind)));
+        usage.kinds.sort_by(|a, b| {
+            b.rss_bytes
+                .cmp(&a.rss_bytes)
+                .then(a.kind.cmp(&b.kind))
+                .then_with(|| a.name.cmp(&b.name))
+        });
     }
     let usage = |reading: &MemoryReading| MemoryUsage {
         time_ns: reading.time_ns.saturating_sub(base),

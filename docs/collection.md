@@ -322,6 +322,11 @@ which takes the process's memory lock and costs by its size.
   setuid program. Once reading a process's `smaps` fails other than by the
   process ending, uhr stops reading it, and the recording counts those
   processes.
+- `smaps` also says how much each process has resident under each name it
+  gave its memory, since Linux 5.17, as PHP names its heap
+  `[anon:zend_alloc]`. A number that ends a name, as the id of the thread
+  whose stack glibc names, is dropped, so that memory used alike has one
+  name.
 - The stream's overhead is uhr's own CPU time reading `/proc`, which the
   kernel spends on the target's counts but not in the target.
 

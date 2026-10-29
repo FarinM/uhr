@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use common::{compile, scratch, uhr};
+use common::{compile, kernel_names_memory, scratch, uhr};
 
 const MIB: u64 = 1 << 20;
 
@@ -332,4 +332,37 @@ fn says_how_much_of_each_kind_of_region_is_resident() {
             .map_or(0, |k| number(&k["rss_bytes"]));
         assert!(resident >= 60 * MIB, "{}", process["regions"]);
     }
+}
+
+#[test]
+fn says_how_much_is_resident_under_each_name_a_process_gave_its_memory() {
+    if !kernel_names_memory() {
+        eprintln!("skipped: needs Linux 5.17 or later, built with CONFIG_ANON_VMA_NAME");
+        return;
+    }
+    let dir = scratch("memory_by_name");
+    let program = dir.join("named");
+    compile("named", &program, "-O2");
+    let recording = dir.join("rec");
+    let rec = recording.to_str().unwrap();
+    uhr(&[
+        "record",
+        "--no-symbolize",
+        "-o",
+        rec,
+        "--",
+        program.to_str().unwrap(),
+        "32",
+        "300",
+    ]);
+    let overview = overview(rec);
+    let process = &rows(&overview)[0];
+    let kinds = process["regions"]["kinds"].as_array().unwrap();
+    // Without the number its name ends in.
+    let named = kinds
+        .iter()
+        .find(|k| k["name"] == "[anon:uhr test]")
+        .unwrap_or_else(|| panic!("{}", process["regions"]));
+    assert_eq!(named["kind"], "anonymous");
+    assert!(number(&named["rss_bytes"]) >= 32 * MIB, "{named}");
 }

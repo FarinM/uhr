@@ -288,8 +288,8 @@ A page fault was in the region of its process that held its address when it
 faulted, if one did: mapped at or before then, and not yet unmapped. In none
 if the region was moved or grown with `mremap`, or perf lost its record.
 
-`region_memory`, one row per reading of a process and kind of region with
-memory resident or in swap, sorted by `time_ns`, from uhr reading
+`region_memory`, one row per reading of a process, kind of region and name
+with memory resident or in swap, sorted by `time_ns`, from uhr reading
 `/proc/<pid>/smaps`. It walks the process's page tables, so after a read
 that took a while uhr waits a hundred times as long, and at least as long
 as between readings of `memory`: a large process's is read less often.
@@ -299,7 +299,8 @@ as between readings of `memory`: a large process's is read less often.
 | `time_ns` | uint64 | When it was read |
 | `pid` | uint32 | |
 | `kind` | string | As in `regions` |
-| `rss_bytes` | uint64 | Resident in the process's regions of that kind |
+| `name` | string, nullable | The name the process gave the memory, as `[anon:name]` in its `maps`, without a number that ends it, as the id of the thread whose stack glibc names. Null for memory it gave none |
+| `rss_bytes` | uint64 | Resident in the process's regions of that kind and name |
 | `swap_bytes` | uint64 | In swap, of those regions |
 
 ## Symbols

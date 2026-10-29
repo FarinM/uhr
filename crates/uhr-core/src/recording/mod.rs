@@ -343,12 +343,15 @@ pub struct MemoryRegion {
 }
 
 /// How much memory a process had resident, and in swap, in its regions of
-/// one kind, when read.
+/// one kind and name, when read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegionMemory {
     pub time_ns: u64,
     pub pid: u32,
     pub kind: RegionKind,
+    /// The name the process gave the memory, as `[anon:name]`. `None` for
+    /// memory it gave none.
+    pub name: Option<String>,
     pub rss_bytes: u64,
     pub swap_bytes: u64,
 }
@@ -893,6 +896,10 @@ impl Recording {
                 Column::u64("time_ns", readings.iter().map(|r| r.time_ns).collect()),
                 Column::u32("pid", readings.iter().map(|r| r.pid).collect()),
                 Column::string("kind", readings.iter().map(|r| r.kind.as_str()).collect()),
+                Column::optional_string(
+                    "name",
+                    readings.iter().map(|r| r.name.as_deref()).collect(),
+                ),
                 Column::u64("rss_bytes", readings.iter().map(|r| r.rss_bytes).collect()),
                 Column::u64(
                     "swap_bytes",
@@ -1357,6 +1364,7 @@ fn read_region_memory(dir: &Path) -> Result<Vec<RegionMemory>> {
     let time_ns = table.u64("time_ns")?;
     let pid = table.u32("pid")?;
     let kind = table.string("kind")?;
+    let mut name = table.optional_string("name")?;
     let rss_bytes = table.u64("rss_bytes")?;
     let swap_bytes = table.u64("swap_bytes")?;
     (0..table.len())
@@ -1365,6 +1373,7 @@ fn read_region_memory(dir: &Path) -> Result<Vec<RegionMemory>> {
                 time_ns: time_ns[i],
                 pid: pid[i],
                 kind: RegionKind::parse(&kind[i]).map_err(|reason| table.invalid(reason))?,
+                name: name[i].take(),
                 rss_bytes: rss_bytes[i],
                 swap_bytes: swap_bytes[i],
             })

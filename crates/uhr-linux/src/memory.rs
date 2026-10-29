@@ -231,11 +231,12 @@ impl Processes {
     fn read_smaps(&mut self, pid: u32, dir: &Path, now: u64) -> io::Result<u64> {
         let interval = INTERVAL.as_nanos() as u64;
         procfs::read(dir.join("smaps"), &mut self.bytes)?;
-        let mut kinds: BTreeMap<RegionKind, (u64, u64)> = BTreeMap::new();
+        let mut kinds: BTreeMap<(RegionKind, Option<String>), (u64, u64)> = BTreeMap::new();
         for region in procfs::smaps(&self.bytes) {
             let line = &region.line;
-            let kind = procfs::region_kind(&line.permissions, line.path.as_deref());
-            let (rss, swap) = kinds.entry(kind).or_default();
+            let path = line.path.as_deref();
+            let kind = procfs::region_kind(&line.permissions, path);
+            let (rss, swap) = kinds.entry((kind, procfs::memory_name(path))).or_default();
             *rss += region.rss;
             *swap += region.swap;
         }
@@ -243,10 +244,11 @@ impl Processes {
             kinds
                 .into_iter()
                 .filter(|&(_, (rss, swap))| rss > 0 || swap > 0)
-                .map(|(kind, (rss_bytes, swap_bytes))| RegionMemory {
+                .map(|((kind, name), (rss_bytes, swap_bytes))| RegionMemory {
                     time_ns: now,
                     pid,
                     kind,
+                    name,
                     rss_bytes,
                     swap_bytes,
                 }),
@@ -686,6 +688,44 @@ mod tests {
         assert!(anonymous >= Some(64 << 20), "{read:?}");
         assert!(read.iter().any(|r| r.kind == RegionKind::Code), "{read:?}");
         assert!(read.iter().all(|r| (r.pid, r.time_ns) == (pid, now)));
+    }
+
+    #[test]
+    fn reads_how_much_is_resident_under_each_name_a_process_gave_its_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let region = |range: &str, path: &str, kb: u64| {
+            format!("{range} rw-p 00000000 00:00 0  {path}\nRss:  {kb} kB\n")
+        };
+        let smaps = [
+            region("1000-2000", "", 4),
+            region("3000-4000", "[anon: glibc: pthread stack: 41]", 8),
+            region("5000-6000", "[anon: glibc: pthread stack: 42]", 16),
+            region("7000-8000", "[anon: glibc: malloc]", 32),
+            region("9000-a000", "[heap]", 64),
+        ]
+        .concat();
+        fs::write(dir.path().join("smaps"), smaps).unwrap();
+        let mut reader = Reader::start(std::process::id()).unwrap();
+        let processes = reader.processes.as_mut().unwrap();
+        processes.read_smaps(7, dir.path(), 1_000).unwrap();
+        let read: Vec<_> = processes
+            .region_memory
+            .iter()
+            .map(|r| (r.kind, r.name.as_deref(), r.rss_bytes >> 10))
+            .collect();
+        assert_eq!(
+            read,
+            [
+                (RegionKind::Heap, None, 64),
+                (RegionKind::Anonymous, None, 4),
+                (RegionKind::Anonymous, Some("[anon: glibc: malloc]"), 32),
+                (
+                    RegionKind::Anonymous,
+                    Some("[anon: glibc: pthread stack]"),
+                    24
+                ),
+            ]
+        );
     }
 
     #[test]

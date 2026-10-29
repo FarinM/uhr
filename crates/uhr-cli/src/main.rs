@@ -793,7 +793,7 @@ fn write_memory(out: &mut impl Write, memory: &Memory) -> io::Result<()> {
     if !by_kind.is_empty() {
         writeln!(
             out,
-            "\nresident by kind of region, as read last, less often for large processes"
+            "\nresident by kind of region, and name a process gave it, as read last, less often for large processes"
         )?;
     }
     for (process, regions) in by_kind {
@@ -801,7 +801,10 @@ fn write_memory(out: &mut impl Write, memory: &Memory) -> io::Result<()> {
             .kinds
             .iter()
             .filter(|k| k.rss_bytes > 0)
-            .map(|k| format!("{} {}", k.kind.as_str(), bytes(k.rss_bytes)))
+            .map(|k| match &k.name {
+                Some(name) => format!("{} {name} {}", k.kind.as_str(), bytes(k.rss_bytes)),
+                None => format!("{} {}", k.kind.as_str(), bytes(k.rss_bytes)),
+            })
             .collect();
         writeln!(
             out,

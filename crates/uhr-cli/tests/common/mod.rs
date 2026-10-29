@@ -4,6 +4,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::ptr;
 
 pub const UHR: &str = env!("CARGO_BIN_EXE_uhr");
 
@@ -48,6 +49,28 @@ pub fn as_root(command: &[&str], recording: &Path) -> Option<()> {
         String::from_utf8_lossy(&ran.stderr)
     );
     Some(())
+}
+
+/// Whether processes can name their memory, as on Linux 5.17 and later
+/// built with CONFIG_ANON_VMA_NAME.
+pub fn kernel_names_memory() -> bool {
+    let length: libc::size_t = 4096;
+    let protection = libc::PROT_READ | libc::PROT_WRITE;
+    let flags = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS;
+    unsafe {
+        let page = libc::mmap(ptr::null_mut(), length, protection, flags, -1, 0);
+        assert_ne!(page, libc::MAP_FAILED);
+        let name = c"uhr probe".as_ptr();
+        let named = libc::prctl(
+            libc::PR_SET_VMA,
+            libc::PR_SET_VMA_ANON_NAME,
+            page,
+            length,
+            name,
+        );
+        libc::munmap(page, length);
+        named == 0
+    }
 }
 
 /// The CPU samples of a recording's manifest, whichever stream took them.
