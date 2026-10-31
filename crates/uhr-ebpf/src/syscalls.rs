@@ -3,16 +3,18 @@
 
 use aya_ebpf::helpers::bpf_ktime_get_ns;
 use aya_ebpf::macros::{map, raw_tracepoint};
-use aya_ebpf::maps::{HashMap, LruHashMap, PerCpuArray};
+use aya_ebpf::maps::{HashMap, PerCpuArray};
 use aya_ebpf::programs::RawTracePointContext;
 use uhr_ebpf::{BUCKETS, CallKey, Calls, Start};
 
 use crate::targets::{active, current, running};
 
-/// The syscall each thread is in, by thread id. A thread that exits in one
-/// leaves it behind, so the oldest make room.
+/// The syscall each of the target's threads is in, or was in last, by
+/// thread id. A thread keeps its entry and writes each call over it, as
+/// inserting and removing one at every call costs more than the rest of
+/// the counting. It lets go of it as it exits.
 #[map]
-static STARTS: LruHashMap<u32, Start> = LruHashMap::with_max_entries(65536, 0);
+static STARTS: HashMap<u32, Start> = HashMap::with_max_entries(65536, 0);
 
 #[map]
 static CALLS: HashMap<CallKey, Calls> = HashMap::with_max_entries(65536, 0);
@@ -21,7 +23,7 @@ static CALLS: HashMap<CallKey, Calls> = HashMap::with_max_entries(65536, 0);
 #[map]
 static EMPTY: PerCpuArray<Calls> = PerCpuArray::with_max_entries(1, 0);
 
-/// Calls that found `CALLS` full.
+/// Calls that found `CALLS` or `STARTS` full.
 #[map]
 static LOST: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
 
@@ -41,7 +43,15 @@ pub fn sys_enter(ctx: RawTracePointContext) -> i32 {
         tgid,
         nr: nr as u32,
     };
-    let _ = STARTS.insert(tid, start, 0);
+    match STARTS.get_ptr_mut(tid) {
+        // Only this thread writes it.
+        Some(slot) => unsafe { *slot = start },
+        None => {
+            if STARTS.insert(tid, start, 0).is_err() {
+                lose();
+            }
+        }
+    }
     0
 }
 
@@ -51,18 +61,24 @@ pub fn sys_exit(_ctx: RawTracePointContext) -> i32 {
     if !running() {
         return 0;
     }
-    let (_, tid) = current();
-    let Some(&start) = (unsafe { STARTS.get(tid) }) else {
+    let (tgid, tid) = current();
+    let Some(start) = STARTS.get_ptr_mut(tid) else {
         return 0;
     };
-    let _ = STARTS.remove(tid);
+    let start = unsafe { &mut *start };
+    // A new thread's first exit, from the clone, has no entry of its own,
+    // but can find that of a thread whose id it took.
+    if start.ns == 0 || start.tgid != tgid {
+        return 0;
+    }
     let ns = unsafe { bpf_ktime_get_ns() }.saturating_sub(start.ns);
     let key = CallKey {
-        tgid: start.tgid,
+        tgid,
         tid,
         nr: start.nr,
         pad: 0,
     };
+    start.ns = 0;
     let calls = match CALLS.get_ptr_mut(key) {
         Some(calls) => calls,
         None => {
@@ -70,9 +86,7 @@ pub fn sys_exit(_ctx: RawTracePointContext) -> i32 {
                 return 0;
             };
             if CALLS.insert(key, empty, 0).is_err() {
-                if let Some(lost) = LOST.get_ptr_mut(0) {
-                    unsafe { *lost += 1 };
-                }
+                lose();
                 return 0;
             }
             let Some(calls) = CALLS.get_ptr_mut(key) else {
@@ -89,6 +103,31 @@ pub fn sys_exit(_ctx: RawTracePointContext) -> i32 {
         *bucket += 1;
     }
     0
+}
+
+/// Lets go of the entry of the thread `tid`, which exits.
+pub(crate) fn forget(tid: u32) {
+    let _ = STARTS.remove(tid);
+}
+
+/// Moves the entry of a thread that exec'd from `from` to `to`, the id
+/// of the process's main thread, which it takes then.
+pub(crate) fn exec(from: u32, to: u32) {
+    if from == to {
+        return;
+    }
+    if let Some(&start) = unsafe { STARTS.get(from) } {
+        let _ = STARTS.remove(from);
+        if STARTS.insert(to, start, 0).is_err() {
+            lose();
+        }
+    }
+}
+
+fn lose() {
+    if let Some(lost) = LOST.get_ptr_mut(0) {
+        unsafe { *lost += 1 };
+    }
 }
 
 /// The base 2 log of `ns`, up to the last bucket.

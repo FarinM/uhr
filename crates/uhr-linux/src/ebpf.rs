@@ -665,10 +665,11 @@ fn counted(ebpf: &mut Ebpf, now: u64) -> Result<Counted, Error> {
         HashMap::try_from(starts).map_err(|e| Error::Map("STARTS", e))?;
     for entry in starts.iter() {
         let (tid, start) = entry.map_err(|e| Error::Map("STARTS", e))?;
-        // A thread that exited in a syscall, or in exit, leaves it there.
+        // A thread that exits lets go of its entry, but where the programs
+        // see only its task freed, it can be there until then.
         let ends = [Sysno::exit, Sysno::exit_group].map(|s| s as u32);
         let alive = Path::new(&format!("/proc/{}/task/{tid}", start.tgid)).exists();
-        if !alive || ends.contains(&start.nr) {
+        if start.ns == 0 || !alive || ends.contains(&start.nr) {
             continue;
         }
         rows.entry((start.tgid, tid, start.nr))

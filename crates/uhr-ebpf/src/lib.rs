@@ -13,6 +13,7 @@ pub const ACTIVE: u8 = 1;
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct Start {
+    /// When it started, or 0 once it returned.
     pub ns: u64,
     pub tgid: u32,
     pub nr: u32,

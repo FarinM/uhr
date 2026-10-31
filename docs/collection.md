@@ -280,9 +280,11 @@ from tracepoints, such as wakeups and syscall latency.
   The kernel's run-time stats measure each program's time, but they make
   every traced syscall slower again, so uhr leaves them off. With them on,
   on x86-64, a sample took about half a microsecond, frame walks included,
-  which at 999 a second is about 0.05% of a CPU, and a syscall's two
-  programs about 100 ns, which is 10% of a CPU at a million syscalls a
-  second.
+  which at 999 a second is about 0.05% of a CPU. Counting made each call of
+  16 threads calling getppid in a loop 144 ns slower, in a virtual machine
+  with 32 CPUs, which is 14% of a CPU at a million syscalls a second. A
+  third of that is reading the kernel's clock as each call enters and
+  leaves, which takes 23 ns a read with the virtual machine's kvm-clock.
 - Building them needs nightly Rust with `rust-src`, and `bpf-linker`.
   Without those uhr builds without them.
 

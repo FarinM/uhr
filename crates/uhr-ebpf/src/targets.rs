@@ -8,7 +8,7 @@ use aya_ebpf::maps::{Array, HashMap, PerCpuArray};
 use aya_ebpf::programs::TracePointContext;
 use uhr_ebpf::{ACTIVE, HELD};
 
-use crate::{mappings, walk};
+use crate::{mappings, syscalls, walk};
 
 const CLONE_THREAD: u64 = 0x10000;
 
@@ -77,10 +77,11 @@ static SIGNAL_LIVE: Global<u32> = Global::new(u32::MAX);
 /// once the process is reaped.
 #[tracepoint]
 pub fn sched_process_exit(_ctx: TracePointContext) -> u32 {
-    let (tgid, _) = current();
+    let (tgid, tid) = current();
     if unsafe { TARGETS.get(tgid) }.is_none() {
         return 0;
     }
+    syscalls::forget(tid);
     let task = unsafe { bpf_get_current_task() } as *const u8;
     let signal = task.wrapping_add(TASK_SIGNAL.load() as usize);
     let Ok(signal) = (unsafe { bpf_probe_read_kernel(signal.cast::<u64>()) }) else {
@@ -106,6 +107,8 @@ pub fn sched_process_free(ctx: TracePointContext) -> u32 {
     let Ok(pid) = (unsafe { ctx.read_at::<i32>(24) }) else {
         return 0;
     };
+    // Each thread's task is freed, the main thread's last.
+    syscalls::forget(pid as u32);
     let _ = TARGETS.remove(pid as u32);
     walk::forget(pid as u32);
     mappings::forget(pid as u32);
@@ -113,11 +116,16 @@ pub fn sched_process_free(ctx: TracePointContext) -> u32 {
 }
 
 #[tracepoint]
-pub fn sched_process_exec(_ctx: TracePointContext) -> u32 {
+pub fn sched_process_exec(ctx: TracePointContext) -> u32 {
     // A target held before its exec runs uhr's code until then.
-    let (tgid, _) = current();
+    let (tgid, tid) = current();
     if unsafe { TARGETS.get(tgid) } == Some(&HELD) {
         let _ = TARGETS.insert(tgid, ACTIVE, 0);
+    }
+    // sched:sched_process_exec has the thread's id from before the exec at
+    // 16, another when a thread other than the main one exec'd.
+    if let Ok(before) = unsafe { ctx.read_at::<i32>(16) } {
+        syscalls::exec(before as u32, tid);
     }
     walk::forget(tgid);
     0
