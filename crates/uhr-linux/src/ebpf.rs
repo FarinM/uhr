@@ -156,6 +156,8 @@ const READ_EVERY: Duration = Duration::from_millis(20);
 
 pub(crate) struct Options {
     pub(crate) syscalls: bool,
+    /// Syscalls not to count, of those `syscalls` counts.
+    pub(crate) skipped: Vec<Sysno>,
     pub(crate) sampling: Option<Sampling>,
 }
 
@@ -291,6 +293,7 @@ impl Programs {
         }
         let mut syscalls = None;
         if options.syscalls {
+            skip(&mut ebpf, &options.skipped)?;
             let links = syscalls.insert(Vec::new());
             for program in SYSCALLS {
                 let tracepoint = raw_tracepoint(&mut ebpf, program)?;
@@ -650,6 +653,17 @@ impl Programs {
             programs: ebpf,
         })
     }
+}
+
+/// Has the syscall programs leave the calls of `skipped` uncounted.
+fn skip(ebpf: &mut Ebpf, skipped: &[Sysno]) -> Result<(), Error> {
+    let map = ebpf.map_mut("SKIPPED").ok_or(Error::Missing("SKIPPED"))?;
+    let mut map: Array<_, u8> = Array::try_from(map).map_err(|e| Error::Map("SKIPPED", e))?;
+    for &syscall in skipped {
+        map.set(syscall as u32, 1, 0)
+            .map_err(|e| Error::Map("SKIPPED", e))?;
+    }
+    Ok(())
 }
 
 fn counted(ebpf: &mut Ebpf, now: u64) -> Result<Counted, Error> {

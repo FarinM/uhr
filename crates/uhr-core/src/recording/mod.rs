@@ -606,6 +606,21 @@ impl Recording {
         self.in_programs(tags).filter(|_| sampled)
     }
 
+    /// The syscalls uhr's eBPF programs were asked not to count.
+    pub(crate) fn skipped_syscalls(&self) -> Vec<&str> {
+        let streams = &self.manifest.streams;
+        streams
+            .iter()
+            .flat_map(|s| match &s.collector {
+                Collector::Ebpf {
+                    skipped_syscalls, ..
+                } => &skipped_syscalls[..],
+                Collector::Perf { .. } | Collector::Procfs { .. } => &[],
+            })
+            .map(String::as_str)
+            .collect()
+    }
+
     /// Which stacks run one of the eBPF programs with these tags, if they
     /// are in the kernel stacks. `None` without the names of kernel frames
     /// to find them by.

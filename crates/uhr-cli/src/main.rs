@@ -175,6 +175,12 @@ struct RecordArgs {
     /// CAP_PERFMON
     #[arg(long)]
     no_syscalls: bool,
+    /// Don't count or time the calls of this syscall, as one the target
+    /// makes so often that counting them slows it. They still run part of
+    /// the counting, and their time still shows in the stacks. Can be
+    /// given more than once
+    #[arg(long, value_name = "NAME", conflicts_with = "no_syscalls")]
+    skip_syscall: Vec<String>,
     /// Don't read how much memory the target's processes have, which uhr
     /// does from /proc every 100 ms
     #[arg(long)]
@@ -549,6 +555,14 @@ fn run_record(args: RecordArgs) -> Result<ExitCode> {
         },
         None => Target::Launch(args.command),
     };
+    let skipped_syscalls = args
+        .skip_syscall
+        .iter()
+        .map(|name| {
+            name.parse()
+                .map_err(|()| anyhow::anyhow!("no syscall is named {name:?} on this system"))
+        })
+        .collect::<Result<_>>()?;
     let options = RecordOptions {
         target,
         frequency_hz: args.frequency,
@@ -556,6 +570,7 @@ fn run_record(args: RecordArgs) -> Result<ExitCode> {
         off_cpu: !args.no_off_cpu,
         runtime_support: !args.no_runtime_support,
         syscalls: !args.no_syscalls,
+        skipped_syscalls,
         memory: !args.no_memory,
         page_faults: !args.no_page_faults,
         sampler: args.sampler.map(|sampler| match sampler {

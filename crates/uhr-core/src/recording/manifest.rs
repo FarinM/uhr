@@ -97,6 +97,10 @@ pub enum Collector {
         sampling: Option<Sampling>,
         /// How they sampled page faults, if they did.
         page_faults: Option<FaultSampling>,
+        /// The syscalls they were asked not to count, by name. None in a
+        /// recording from before they could be, which has no such field.
+        #[serde(default)]
+        skipped_syscalls: Vec<String>,
     },
     /// uhr reading the processes' files in `/proc`.
     Procfs {

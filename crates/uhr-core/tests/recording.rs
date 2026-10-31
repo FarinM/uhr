@@ -350,6 +350,43 @@ fn round_trips() {
 }
 
 #[test]
+fn reads_a_recording_from_before_syscalls_could_be_skipped() {
+    let dir = scratch("before_skipped_syscalls");
+    let mut recording = example();
+    recording.manifest.streams.push(Stream {
+        id: "ebpf".into(),
+        collector: Collector::Ebpf {
+            programs: Vec::new(),
+            sampling: None,
+            page_faults: None,
+            skipped_syscalls: Vec::new(),
+        },
+        signals: vec![Signal::SyscallCalls],
+        missing_signals: Vec::new(),
+        coverage: StreamCoverage {
+            lost_events: 0,
+            stacks: None,
+            overhead_ns: None,
+            known_biases: Vec::new(),
+        },
+    });
+    recording.write(&dir).unwrap();
+    let path = dir.join("manifest.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let collector = &mut manifest["streams"][2]["collector"];
+    assert!(
+        collector
+            .as_object_mut()
+            .unwrap()
+            .remove("skipped_syscalls")
+            .is_some()
+    );
+    fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    assert_eq!(Recording::read(&dir).unwrap(), recording);
+}
+
+#[test]
 fn will_not_write_calls_its_latency_does_not_count() {
     let dir = scratch("uncounted_calls");
     let mut recording = example();

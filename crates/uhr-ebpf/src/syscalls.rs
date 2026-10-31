@@ -3,9 +3,9 @@
 
 use aya_ebpf::helpers::bpf_ktime_get_ns;
 use aya_ebpf::macros::{map, raw_tracepoint};
-use aya_ebpf::maps::{HashMap, PerCpuArray};
+use aya_ebpf::maps::{Array, HashMap, PerCpuArray};
 use aya_ebpf::programs::RawTracePointContext;
-use uhr_ebpf::{BUCKETS, CallKey, Calls, Start};
+use uhr_ebpf::{BUCKETS, CallKey, Calls, SYSCALL_NUMBERS, Start};
 
 use crate::targets::{active, current, running};
 
@@ -23,6 +23,10 @@ static CALLS: HashMap<CallKey, Calls> = HashMap::with_max_entries(65536, 0);
 #[map]
 static EMPTY: PerCpuArray<Calls> = PerCpuArray::with_max_entries(1, 0);
 
+/// 1 for each syscall, by number, that uhr was asked not to count.
+#[map]
+static SKIPPED: Array<u8> = Array::with_max_entries(SYSCALL_NUMBERS, 0);
+
 /// Calls that found `CALLS` or `STARTS` full.
 #[map]
 static LOST: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
@@ -33,11 +37,13 @@ static LOST: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
 #[raw_tracepoint(tracepoint = "sys_enter")]
 pub fn sys_enter(ctx: RawTracePointContext) -> i32 {
     let (tgid, tid) = current();
-    if !running() || !active(tgid) {
-        return 0;
-    }
     // The registers, then the syscall's number.
     let nr: i64 = ctx.arg(1);
+    // A skipped call leaves the thread's entry as its last call's return
+    // left it, so its own return counts nothing.
+    if !running() || SKIPPED.get(nr as u32) == Some(&1) || !active(tgid) {
+        return 0;
+    }
     let start = Start {
         ns: unsafe { bpf_ktime_get_ns() },
         tgid,

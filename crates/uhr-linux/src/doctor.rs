@@ -259,6 +259,7 @@ fn probe_recording(perf: &Path) -> Result<bool, String> {
         off_cpu: true,
         runtime_support: false,
         syscalls: false,
+        skipped_syscalls: Vec::new(),
         memory: false,
         page_faults: false,
         sampler: Some(Sampler::Perf),

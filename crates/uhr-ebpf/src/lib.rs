@@ -5,6 +5,10 @@
 /// than `2^(i + 1)`, and the last one also every longer call.
 pub const BUCKETS: usize = 36;
 
+/// The syscall numbers `SKIPPED` has room for, past the last of the tables
+/// of the architectures uhr samples on.
+pub const SYSCALL_NUMBERS: u32 = 1024;
+
 /// A process's state in `TARGETS`.
 pub const HELD: u8 = 0;
 pub const ACTIVE: u8 = 1;

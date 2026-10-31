@@ -20,6 +20,7 @@ use std::time::{Duration, Instant, SystemTime};
 use rustix::io::{Errno, FdFlags, fcntl_setfd};
 use rustix::pipe::{PipeFlags, pipe_with};
 use rustix::process::{Pid, Signal, geteuid, kill_process, set_parent_process_death_signal};
+pub use syscalls::Sysno;
 use tracing::{debug, info, warn};
 
 use crate::doctor;
@@ -127,6 +128,8 @@ pub struct RecordOptions {
     /// Count and time the target's syscalls with uhr's eBPF programs, if
     /// this host lets uhr load them.
     pub syscalls: bool,
+    /// Syscalls that `syscalls` leaves uncounted.
+    pub skipped_syscalls: Vec<Sysno>,
     /// Read how much memory the target's processes have, at intervals.
     pub memory: bool,
     /// Sample the page faults the target's threads take, with their
@@ -369,7 +372,7 @@ pub fn record(options: &RecordOptions, interrupts: &Interrupts, out: &Path) -> R
         &mut recording,
         found,
         ebpf_stacks.zip(sampling),
-        options.syscalls,
+        options.syscalls.then_some(&options.skipped_syscalls[..]),
         matches!(ready, Ready::Attach { .. }),
     );
     add_memory(&mut recording, ended.memory, ended.glibc_names);
@@ -507,17 +510,18 @@ fn add_memory(
 
 /// Adds what uhr's eBPF programs found as a stream of their own, or says
 /// why the syscalls were not counted. `sampled` is the coverage of the
-/// stacks they sampled, and how they sampled.
+/// stacks they sampled, and how they sampled. `syscalls` is the syscalls
+/// they were to leave uncounted, if they were to count.
 fn add_ebpf(
     recording: &mut Recording,
     found: Option<Result<ebpf::Found, ebpf::Error>>,
     sampled: Option<(convert::EbpfStacks, recording::Sampling)>,
-    syscalls: bool,
+    syscalls: Option<&[Sysno]>,
     attached: bool,
 ) {
     let found = match found {
         Some(Ok(found)) => found,
-        Some(Err(error)) if syscalls => {
+        Some(Err(error)) if syscalls.is_some() => {
             recording.manifest.missing_signals.push(MissingSignal {
                 signal: recording::Signal::SyscallCalls,
                 reason: error.reason(),
@@ -583,6 +587,16 @@ fn add_ebpf(
         ));
         lost_events += stacks.untracked;
     }
+    let skipped: Vec<String> = match (&found.syscalls, syscalls) {
+        (Some(_), Some(skipped)) => skipped
+            .iter()
+            .map(|s| s.name())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+        _ => Vec::new(),
+    };
     if let Some(counted) = &found.syscalls {
         signals.push(recording::Signal::SyscallCalls);
         known_biases.extend(
@@ -597,6 +611,13 @@ fn add_ebpf(
         if attached {
             known_biases
                 .push("Calls a thread was already in when uhr attached are left out.".to_owned());
+        }
+        if !skipped.is_empty() {
+            known_biases.push(format!(
+                "uhr was asked not to count the calls of {}, so their time is in the stacks \
+                 only.",
+                skipped.join(", ")
+            ));
         }
         lost_events += counted.lost;
     }
@@ -680,6 +701,7 @@ fn add_ebpf(
             programs: found.programs,
             sampling,
             page_faults,
+            skipped_syscalls: skipped,
         },
         signals,
         missing_signals: Vec::new(),
@@ -1048,6 +1070,7 @@ fn start_ebpf(
     }
     let ebpf_options = ebpf::Options {
         syscalls: options.syscalls,
+        skipped: options.skipped_syscalls.clone(),
         sampling,
     };
     let programs = Programs::start(pid, held, &ebpf_options);

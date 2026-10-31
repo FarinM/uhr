@@ -424,6 +424,7 @@ fn syscall_rows(
     share: &impl Fn(u64) -> f64,
 ) -> Vec<SyscallRow> {
     let in_syscall = syscalls::of_stacks(recording, functions);
+    let skipped = recording.skipped_syscalls();
     let mut by_syscall: HashMap<InSyscall, u64> = HashMap::new();
     let mut add = |syscall, weight| {
         if weight > 0 {
@@ -450,10 +451,12 @@ fn syscall_rows(
                 InSyscall::Outside => (Some(false), None),
                 InSyscall::Unknown => (None, None),
             };
-            // Counted, a syscall with no calls has zero of them.
+            // Counted, a syscall with no calls has zero of them, unless
+            // uhr was asked not to count it.
             let calls = syscall.as_ref().and_then(|name| {
                 let counted = counted.as_mut()?;
-                Some(counted.remove(name).unwrap_or_default())
+                let skipped = skipped.contains(&name.as_str());
+                (!skipped).then(|| counted.remove(name).unwrap_or_default())
             });
             SyscallRow {
                 in_syscall,

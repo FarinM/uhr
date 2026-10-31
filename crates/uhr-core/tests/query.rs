@@ -459,6 +459,7 @@ fn with_own_programs() -> (Recording, Symbols) {
             programs: vec!["8782325c7cb17f7f".into()],
             sampling: None,
             page_faults: None,
+            skipped_syscalls: Vec::new(),
         },
         signals: vec![Signal::SyscallCalls],
         missing_signals: Vec::new(),
@@ -1233,6 +1234,7 @@ fn with_counted_calls() -> (Recording, Symbols) {
             programs: Vec::new(),
             sampling: None,
             page_faults: None,
+            skipped_syscalls: Vec::new(),
         },
         signals: vec![Signal::SyscallCalls],
         missing_signals: Vec::new(),
@@ -1321,6 +1323,28 @@ fn joins_the_counted_calls_to_the_syscalls_on_stacks() {
     let rows = counted_rows(&result);
     assert_eq!(rows.len(), 1, "{rows:?}");
     assert_eq!(rows[0].2.as_ref().unwrap().calls, 1000);
+}
+
+#[test]
+fn has_no_calls_of_a_syscall_uhr_was_asked_not_to_count() {
+    let (mut recording, symbols) = with_counted_calls();
+    let Collector::Ebpf {
+        skipped_syscalls, ..
+    } = &mut recording.manifest.streams.last_mut().unwrap().collector
+    else {
+        unreachable!()
+    };
+    skipped_syscalls.push("futex".into());
+    let query = Query {
+        group_by: GroupBy::Syscall,
+        ..query(20)
+    };
+    let result = run(&recording, Some(&symbols), &query).unwrap();
+    let rows = counted_rows(&result);
+    let futex = rows.iter().find(|r| r.0 == Some("futex")).unwrap();
+    assert!(futex.1 > 0 && futex.2.is_none(), "{futex:?}");
+    let read = rows.iter().find(|r| r.0 == Some("read")).unwrap();
+    assert_eq!(read.2.as_ref().unwrap().calls, 4);
 }
 
 fn in_syscalls(syscalls: &[&str], under: &[&str]) -> Query {

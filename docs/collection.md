@@ -275,7 +275,8 @@ from tracepoints, such as wakeups and syscall latency.
   CAP_PERFMON. They know processes by their ids in the kernel's first PID
   namespace, so uhr also has to run there, not in a container's own.
   Otherwise perf samples, and the recording says why it has no syscall
-  counts. `--no-syscalls` leaves the counting out.
+  counts. `--no-syscalls` leaves the counting out, and `--skip-syscall`
+  that of the syscalls it names, whose time is then in the stacks only.
 - Their overhead in a recording is the target's CPU time in them, from its
   samples, and a query gives the share of its own time in them. That leaves
   out the sampling program itself, as no sample lands in the program that
@@ -288,7 +289,9 @@ from tracepoints, such as wakeups and syscall latency.
   with 32 CPUs, which is 11% of a CPU at a million syscalls a second. Nearly
   half of that is reading the kernel's clock as each call enters and
   leaves, which takes 23 ns a read with the virtual machine's kvm-clock.
-  Without counting, syscalls take no longer.
+  A skipped syscall's calls took 38 ns longer, as they still run the
+  programs, which then return at once. Without counting, syscalls take no
+  longer.
 - Building them needs nightly Rust with `rust-src`, and `bpf-linker`.
   Without those uhr builds without them.
 

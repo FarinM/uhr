@@ -232,6 +232,76 @@ fn counts_every_call_of_each_syscall() {
 }
 
 #[test]
+fn leaves_out_the_syscalls_it_is_asked_to() {
+    let _turn = one_at_a_time();
+    let dir = scratch("syscalls_skipped");
+    let program = dir.join("syscalls");
+    compile("syscalls", &program, "-O2");
+    let recording = dir.join("rec");
+    let rec = recording.to_str().unwrap();
+    let args = [
+        "record",
+        "-o",
+        rec,
+        "--skip-syscall",
+        "read",
+        "--",
+        program.to_str().unwrap(),
+        "20000",
+    ];
+    if uhr_as_root(&args, &recording).is_none() {
+        eprintln!("skipped: needs root through sudo without a password");
+        return;
+    }
+    let manifest: Value =
+        serde_json::from_slice(&fs::read(recording.join("manifest.json")).unwrap()).unwrap();
+    let streams = manifest["streams"].as_array().unwrap();
+    let Some(ebpf) = streams.iter().find(|s| s["id"] == "ebpf") else {
+        eprintln!("skipped: no syscall counts: {manifest}");
+        return;
+    };
+    assert_eq!(
+        ebpf["collector"]["skipped_syscalls"],
+        serde_json::json!(["read"])
+    );
+    let result = json(&["query", rec, "--group-by", "syscall", "--top", "100"]);
+    let rows = result["rows"].as_array().unwrap();
+    // Its time is still in the stacks, but none of its calls counted.
+    let read = rows.iter().find(|r| r["syscall"] == "read").unwrap();
+    assert!(read["share"].as_f64().unwrap() > 0.5, "{read}");
+    assert!(read["calls"].is_null(), "{read}");
+    let mmap = rows.iter().find(|r| r["syscall"] == "mmap").unwrap();
+    assert!(mmap["calls"]["calls"].as_u64().unwrap() > 0, "{mmap}");
+    let biases = result["coverage"]["known_biases"].as_array().unwrap();
+    assert!(
+        biases.iter().any(|b| b
+            .as_str()
+            .unwrap()
+            .contains("not to count the calls of read")),
+        "{biases:?}"
+    );
+}
+
+#[test]
+fn refuses_to_skip_a_syscall_it_does_not_know() {
+    let dir = scratch("syscalls_skip_unknown");
+    let recording = dir.join("rec");
+    let output = Command::new(UHR)
+        .args(["record", "--skip-syscall", "nosuch", "-o"])
+        .arg(&recording)
+        .args(["--", "true"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("no syscall is named \"nosuch\""),
+        "{stderr}"
+    );
+    assert!(!recording.exists());
+}
+
+#[test]
 fn tells_its_own_programs_apart() {
     let _turn = one_at_a_time();
     let dir = scratch("syscalls_own_programs");

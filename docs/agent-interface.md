@@ -94,9 +94,10 @@ syscall entered, such as `__x64_sys_read` for `read`. That needs no tracing,
 but gives the time in each syscall, not how often it was called or how long
 each call took. Where uhr's eBPF programs ran, each syscall's row also has
 its `calls`: how many returned, their time, the ranges the median and the
-99th percentile call fall in, and the calls still running at the end. They
-count whole threads over the whole capture, so a filter by time, mode,
-stack, thread name or region leaves them out. Where only the code every syscall
+99th percentile call fall in, and the calls still running at the end. A
+syscall `uhr record --skip-syscall` left out has none. They count whole
+threads over the whole capture, so a filter by time, mode, stack, thread
+name or region leaves them out. Where only the code every syscall
 passes through is on the stack, as on the way back to user space, where
 threads are often preempted, the time is in a syscall, but which one is
 unknown. Time in uhr's own eBPF programs, which run as syscalls enter and
