@@ -14,14 +14,15 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use aya::maps::{Array, HashMap, MapData, PerCpuArray, ProgramArray, RingBuf};
+use aya::programs::fexit::FExitLinkId;
 use aya::programs::perf_event::{
     PerfEventConfig, PerfEventLinkId, PerfEventScope, SamplePolicy, SoftwareEvent,
 };
 use aya::programs::raw_trace_point::RawTracePointLinkId;
 use aya::programs::trace_point::TracePointLinkId;
-use aya::programs::{PerfEvent, RawTracePoint, TracePoint};
+use aya::programs::{FExit, PerfEvent, RawTracePoint, TracePoint};
 use aya::util::{nr_cpus, online_cpus};
-use aya::{Ebpf, EbpfLoader};
+use aya::{Btf, Ebpf, EbpfLoader};
 use syscalls::Sysno;
 use tracing::warn;
 use uhr_core::recording::SyscallCalls;
@@ -47,6 +48,8 @@ pub enum Error {
     Program(&'static str, #[source] aya::programs::ProgramError),
     #[error("the eBPF map {0}")]
     Map(&'static str, #[source] aya::maps::MapError),
+    #[error("reading the kernel's BTF")]
+    Btf(#[source] aya::BtfError),
     #[error("uhr's eBPF programs have no {0}")]
     Missing(&'static str),
     #[error(
@@ -130,12 +133,9 @@ const WALKERS: [&str; 3] = ["walk_frames", "walk_native", "walk_memory"];
 /// runs at.
 const HOTPLUG: (&str, &str, &str) = ("cpuhp_enter", "cpuhp", "cpuhp_enter");
 
-/// The programs that count the times each process maps a file's code, and
-/// the tracepoints they run at.
-const MAPPINGS: [(&str, &str, &str); 2] = [
-    ("sys_enter_mmap", "syscalls", "sys_enter_mmap"),
-    ("sys_exit_mmap", "syscalls", "sys_exit_mmap"),
-];
+/// The program that counts the times each process maps a file's code, and
+/// the kernel function it runs at the return of.
+const MAPPING: (&str, &str) = ("mmap_return", "ksys_mmap_pgoff");
 
 /// Whether the programs can sample here: the sampler reads the registers
 /// of these architectures only.
@@ -218,6 +218,7 @@ pub(crate) struct Programs {
     ebpf: Ebpf,
     tracepoints: Vec<(&'static str, TracePointLinkId)>,
     syscalls: Option<Vec<(&'static str, RawTracePointLinkId)>>,
+    mapping: Option<FExitLinkId>,
     /// By CPU, with when each was attached.
     sampler: BTreeMap<u32, (Links, u64)>,
     period_ns: u64,
@@ -304,6 +305,7 @@ impl Programs {
             ebpf,
             tracepoints,
             syscalls,
+            mapping: None,
             sampler: BTreeMap::new(),
             period_ns: 0,
             fault_period: None,
@@ -365,20 +367,14 @@ impl Programs {
             .and_then(|()| hotplug.attach(category, name))
             .map_err(|e| Error::Program(program, e).or_not_permitted())?;
         self.tracepoints.push((program, link));
-        for (program, category, name) in MAPPINGS {
-            let tracepoint = tracepoint(&mut self.ebpf, program)?;
-            tracepoint
-                .load()
-                .map_err(|e| Error::Program(program, e).or_not_permitted())?;
-            // A kernel can be built without the tracepoints of syscalls.
-            match tracepoint.attach(category, name) {
-                Ok(link) => self.tracepoints.push((program, link)),
-                Err(error) => warn!(
-                    program,
-                    %error,
-                    "a runtime loaded after the exec gets its frames read only a while later"
-                ),
-            }
+        // A kernel can be built without BTF, or without the trampolines
+        // that fexit programs run from, as arm64 before Linux 6.0.
+        match self.count_mappings() {
+            Ok(link) => self.mapping = Some(link),
+            Err(error) => warn!(
+                error = error.reason(),
+                "a runtime loaded after the exec gets its frames read only a while later"
+            ),
         }
         for cpu in online_cpus().map_err(|(_, e)| Error::Cpus(e))? {
             // Before the event opens, so a CPU that goes offline and back in
@@ -401,6 +397,12 @@ impl Programs {
         self.reader = Some(Reader::start(ring, &sampling.path, finder.sender())?);
         self.finder = Some(finder);
         Ok(())
+    }
+
+    fn count_mappings(&mut self) -> Result<FExitLinkId, Error> {
+        load_mapping(&mut self.ebpf)?
+            .attach()
+            .map_err(|e| Error::Program(MAPPING.0, e))
     }
 
     fn attach(&mut self, cpu: u32) -> Result<Links, Error> {
@@ -547,6 +549,7 @@ impl Programs {
             mut ebpf,
             tracepoints,
             syscalls,
+            mapping,
             sampler,
             fault_period,
             late_cpus,
@@ -595,6 +598,14 @@ impl Programs {
                 .detach(link)
                 .map_err(|e| Error::Program(program, e))?;
             let info = tracepoint.info().map_err(|e| Error::Program(program, e))?;
+            programs.push(format!("{:016x}", info.tag()));
+        }
+        if let Some(link) = mapping {
+            let program = fexit(&mut ebpf, MAPPING.0)?;
+            program
+                .detach(link)
+                .map_err(|e| Error::Program(MAPPING.0, e))?;
+            let info = program.info().map_err(|e| Error::Program(MAPPING.0, e))?;
             programs.push(format!("{:016x}", info.tag()));
         }
         let counting = syscalls.is_some();
@@ -799,8 +810,10 @@ fn walked_frames(sample: &[u8]) -> Option<Walked> {
     })
 }
 
-/// Loads every program without running them, as recording would.
-pub fn check() -> Result<(), Error> {
+/// Loads every program without running them, as recording would. Recording
+/// goes on without the one that counts the times processes map code, so
+/// why that can't load, if it can't, comes apart.
+pub fn check() -> Result<Option<Error>, Error> {
     let mut ebpf = load(None, Layout::default())?;
     for (program, ..) in FOLLOWERS.into_iter().chain([LET_GO, LET_GO_LATE]) {
         tracepoint(&mut ebpf, program)?
@@ -813,19 +826,30 @@ pub fn check() -> Result<(), Error> {
             .map_err(|e| Error::Program(program, e).or_not_permitted())?;
     }
     if !CAN_SAMPLE {
-        return Ok(());
+        return Ok(None);
     }
-    for (program, ..) in [HOTPLUG].into_iter().chain(MAPPINGS) {
-        tracepoint(&mut ebpf, program)?
-            .load()
-            .map_err(|e| Error::Program(program, e).or_not_permitted())?;
-    }
+    let (program, ..) = HOTPLUG;
+    tracepoint(&mut ebpf, program)?
+        .load()
+        .map_err(|e| Error::Program(program, e).or_not_permitted())?;
     for program in [SAMPLER].into_iter().chain(WALKERS) {
         perf_event(&mut ebpf, program)?
             .load()
             .map_err(|e| Error::Program(program, e).or_not_permitted())?;
     }
-    Ok(())
+    Ok(load_mapping(&mut ebpf).err())
+}
+
+/// Loads the program that counts the times each process maps a file's
+/// code, which needs the kernel's BTF.
+fn load_mapping(ebpf: &mut Ebpf) -> Result<&mut FExit, Error> {
+    let (program, function) = MAPPING;
+    let btf = Btf::from_sys_fs().map_err(Error::Btf)?;
+    let fexit = fexit(ebpf, program)?;
+    fexit
+        .load(function, &btf)
+        .map_err(|e| Error::Program(program, e))?;
+    Ok(fexit)
 }
 
 fn tracepoint<'a>(ebpf: &'a mut Ebpf, program: &'static str) -> Result<&'a mut TracePoint, Error> {
@@ -839,6 +863,13 @@ fn raw_tracepoint<'a>(
     ebpf: &'a mut Ebpf,
     program: &'static str,
 ) -> Result<&'a mut RawTracePoint, Error> {
+    ebpf.program_mut(program)
+        .ok_or(Error::Missing(program))?
+        .try_into()
+        .map_err(|e| Error::Program(program, e))
+}
+
+fn fexit<'a>(ebpf: &'a mut Ebpf, program: &'static str) -> Result<&'a mut FExit, Error> {
     ebpf.program_mut(program)
         .ok_or(Error::Missing(program))?
         .try_into()

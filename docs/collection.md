@@ -256,7 +256,10 @@ from tracepoints, such as wakeups and syscall latency.
   so its faults lose more of them than its CPU time does.
 - They walk the frames of the interpreters uhr finds in the target's
   processes, and count the times each maps a file's code, so uhr knows when
-  to look for one again, see [runtimes](#runtimes).
+  to look for one again, see [runtimes](#runtimes). They count at the
+  return of the kernel's function behind mmap, which runs them at its calls
+  only, where a tracepoint of the syscall would make every syscall of every
+  process take the kernel's slower path for traced ones.
 - They count and time the target's syscalls. At each syscall's entry and
   exit they add, per thread and syscall, the call, its time and a log2
   histogram of times in the kernel, so nothing is written per call. Each
@@ -281,10 +284,11 @@ from tracepoints, such as wakeups and syscall latency.
   every traced syscall slower again, so uhr leaves them off. With them on,
   on x86-64, a sample took about half a microsecond, frame walks included,
   which at 999 a second is about 0.05% of a CPU. Counting made each call of
-  16 threads calling getppid in a loop 144 ns slower, in a virtual machine
-  with 32 CPUs, which is 14% of a CPU at a million syscalls a second. A
-  third of that is reading the kernel's clock as each call enters and
+  16 threads calling getppid in a loop 107 ns slower, in a virtual machine
+  with 32 CPUs, which is 11% of a CPU at a million syscalls a second. Nearly
+  half of that is reading the kernel's clock as each call enters and
   leaves, which takes 23 ns a read with the virtual machine's kvm-clock.
+  Without counting, syscalls take no longer.
 - Building them needs nightly Rust with `rust-src`, and `bpf-linker`.
   Without those uhr builds without them.
 
@@ -488,10 +492,12 @@ looks again later.
 uhr looks for a process's runtime at its first sample, and again each time
 the process maps more code, as a runtime's library can be mapped after the
 exec, as by `dlopen`. The programs count the times each process maps a
-file's code, at the syscall's return, and each sample says the count. uhr
-also looks again a while later until it finds one, for code they don't see
-mapped, as where a mapping is made executable after, or the kernel has no
-tracepoints for syscalls. Samples taken before have only the interpreter's
+file's code, at the return of the kernel's function behind mmap, and each
+sample says the count. uhr also looks again a while later until it finds
+one, for code they don't see mapped, as where a mapping is made executable
+after, or where they can't count, without the kernel's BTF or the
+trampolines that programs at a kernel function's return run from, as on
+arm64 before Linux 6.0. Samples taken before have only the interpreter's
 native frames, and coverage counts them. Each sample says how many times its
 process had exec'd, as the kernel counts in its task, so each program a
 process runs is looked at and counted apart. While the process runs, uhr

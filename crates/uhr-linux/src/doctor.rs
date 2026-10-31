@@ -22,11 +22,21 @@ pub fn check() -> Report {
 /// recordings still have everything perf records.
 pub fn check_ebpf() -> Check {
     match ebpf::check() {
-        Ok(()) => Check {
+        Ok(None) => Check {
             status: Status::Ok,
             detail: "uhr can load its eBPF programs: they sample the target's stacks, and \
                      count and time its syscalls"
                 .into(),
+            fix: None,
+        },
+        Ok(Some(error)) => Check {
+            status: Status::Limited,
+            detail: format!(
+                "uhr can load its eBPF programs, but not the one that sees processes map \
+                 code: {}, so a runtime loaded after the exec gets its frames read only a \
+                 while later",
+                error.reason()
+            ),
             fix: None,
         },
         Err(error) => Check {
