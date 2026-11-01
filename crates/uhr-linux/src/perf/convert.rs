@@ -1802,7 +1802,14 @@ impl State {
             kernel_frames: header.kernel_frames - own as u32,
             ..*header
         };
-        let stack = self.ebpf_frames(header, frames.into_iter(), copy).stack;
+        let EbpfFrames { stack, unwound, .. } = self.ebpf_frames(header, frames.into_iter(), copy);
+        if let Some((cut, not_unwound)) = unwound {
+            self.ebpf_cut_at_copy += u64::from(cut);
+            self.ebpf_not_unwound += u64::from(not_unwound);
+        }
+        if stack.len() + own >= ebpf_depth(self.max_stack_depth) as usize {
+            self.ebpf_at_limit += 1;
+        }
         let stack =
             (!stack.is_empty()).then(|| intern(&mut self.stacks, &mut self.stack_ids, stack));
         self.woken.insert(
@@ -3615,6 +3622,23 @@ mod tests {
         state.wakeup(&header, &wakeup_of(3, None), frames.into_iter(), None);
         let addresses: Vec<u64> = waker_stack(&state).iter().map(|f| f.address).collect();
         assert_eq!(addresses, [0x1000, 0x2010, 0x3010]);
+    }
+
+    #[test]
+    fn counts_wakers_stacks_cut_at_the_limit() {
+        let mut state = State::new(4);
+        state.interrupt_entries = vec![(0x3000, 0x3100)];
+        state.wake_functions = vec![(0x2000, 0x2100)];
+        // Dropping the frame before the function leaves it short of the limit.
+        let frames = [0x1000, 0x2010, 0x4010, 0x4020].map(|address| (address, None));
+        let header = woken_by(15, Some(9), 4);
+        state.wakeup(&header, &wakeup_of(3, Some(9)), frames.into_iter(), None);
+        assert_eq!(state.ebpf_at_limit, 1);
+        // It ended at the interrupt's entry, past which the rest did not count.
+        let frames = [0x2010, 0x3010, 0x4010, 0x4020].map(|address| (address, None));
+        let header = woken_by(16, None, 4);
+        state.wakeup(&header, &wakeup_of(3, None), frames.into_iter(), None);
+        assert_eq!(state.ebpf_at_limit, 1);
     }
 
     #[test]

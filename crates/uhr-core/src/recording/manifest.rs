@@ -227,7 +227,7 @@ pub struct StreamCoverage {
 }
 
 /// The stack counts cover every stack recorded: one per CPU sample, one per
-/// page-fault sample, and one per thread going off CPU.
+/// page-fault sample, one per thread going off CPU, and one per wakeup.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StackCoverage {
     pub unwinding: Unwinding,

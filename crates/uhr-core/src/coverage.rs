@@ -10,8 +10,8 @@ use crate::symbols::{Source, SourceStatus, Symbols};
 #[derive(Debug, Clone, Serialize)]
 pub struct Coverage {
     /// This and the next four count the whole recording, whatever the
-    /// filter. The stack counts cover every stack: one per CPU sample, and
-    /// one per thread going off CPU.
+    /// filter. The stack counts cover every stack: one per CPU sample, one
+    /// per thread going off CPU, and one per wakeup.
     pub lost_events: u64,
     /// `None` if a stream does not see them.
     pub throttle_events: Option<u64>,
