@@ -129,23 +129,21 @@ fn sees_what_woke_each_waiting_thread() {
     assert!(0 < woken && woken < runnable, "{time}");
 }
 
-#[test]
-fn an_interrupt_wakes_a_thread_rather_than_the_one_it_interrupts() {
-    let _turn = one_at_a_time();
-    let dir = scratch("wakeups_interrupted");
-    let program = dir.join("naps");
-    compile("naps", &program, "-O2");
-    // On one CPU, the timer that wakes the sleeping main thread interrupts
-    // the computing one.
+/// Records `program`, run on `cpus` with `arg`, by attaching to it as root
+/// for a second, with its process id. `None` where uhr can't be root.
+fn record_attached(name: &str, program: &str, cpus: &str, arg: &str) -> Option<(u32, Recording)> {
+    let dir = scratch(name);
+    let binary = dir.join(program);
+    compile(program, &binary, "-O2");
     let Ok(mut target) = Command::new("taskset")
-        .args(["-c", "0"])
-        .arg(&program)
-        .arg("20")
+        .args(["-c", cpus])
+        .arg(&binary)
+        .arg(arg)
         .stdout(Stdio::null())
         .spawn()
     else {
         eprintln!("skipped: needs taskset");
-        return;
+        return None;
     };
     thread::sleep(Duration::from_millis(100));
     let recording = dir.join("rec");
@@ -157,10 +155,19 @@ fn an_interrupt_wakes_a_thread_rather_than_the_one_it_interrupts() {
     target.wait().unwrap();
     if recorded.is_none() {
         eprintln!("skipped: needs root through sudo without a password");
-        return;
+        return None;
     }
-    let recording = Recording::read(Path::new(rec)).unwrap();
-    let main = target.id();
+    Some((target.id(), Recording::read(&recording).unwrap()))
+}
+
+#[test]
+fn an_interrupt_wakes_a_thread_rather_than_the_one_it_interrupts() {
+    let _turn = one_at_a_time();
+    // On one CPU, the timer that wakes the sleeping main thread interrupts
+    // the computing one.
+    let Some((main, recording)) = record_attached("wakeups_interrupted", "naps", "0", "20") else {
+        return;
+    };
     let woken: Vec<_> = recording
         .off_cpu
         .iter()
@@ -171,6 +178,36 @@ fn an_interrupt_wakes_a_thread_rather_than_the_one_it_interrupts() {
     assert!(
         woken.iter().all(|w| w.waker == Waker::Interrupt),
         "{woken:?}"
+    );
+}
+
+#[test]
+fn sees_threads_woken_on_their_way_off_the_cpu() {
+    let _turn = one_at_a_time();
+    // With more threads than CPUs after a lock held only briefly, its holder
+    // often lets go of it as a waiter is still going to sleep.
+    let Some((_, recording)) = record_attached("wakeups_contended", "locks", "0-3", "16") else {
+        return;
+    };
+    let blocked = recording.off_cpu.iter();
+    let blocked: Vec<_> = blocked
+        .filter(|i| i.state == ThreadState::Blocked)
+        .collect();
+    assert!(blocked.len() > 1_000, "{}", blocked.len());
+    // perf starts before uhr's programs and stops after them.
+    let woken = || blocked.iter().filter_map(|i| i.wakeup.as_ref());
+    let first = woken().map(|w| w.time_ns).min().unwrap();
+    let last = woken().map(|w| w.time_ns).max().unwrap();
+    let watched = blocked
+        .iter()
+        .filter(|i| (first..last).contains(&i.start_ns));
+    let unwoken = watched.filter(|i| i.wakeup.is_none()).count() as u64;
+    let streams = recording.manifest.streams.iter();
+    let lost: u64 = streams.map(|s| s.coverage.lost_events).sum();
+    assert!(
+        unwoken <= lost + blocked.len() as u64 / 1_000,
+        "{unwoken} of {} waits had no wakeup, with {lost} events lost",
+        blocked.len()
     );
 }
 

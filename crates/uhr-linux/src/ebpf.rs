@@ -987,9 +987,8 @@ struct Layout {
     /// Where a `task_struct` keeps the user thread pointer, which
     /// thread-locals are found from.
     thread_pointer: Option<u32>,
-    /// `task_struct.tgid`, `pid` and `on_rq`: whose a woken thread is, and
-    /// whether it slept.
-    woken: Option<(u32, u32, u32)>,
+    /// `task_struct.tgid` and `pid`: whose a woken thread is.
+    woken: Option<(u32, u32)>,
     preempt_count: Option<PreemptCount>,
 }
 
@@ -1016,7 +1015,6 @@ impl Layout {
             thread_pointer,
             tgid,
             pid,
-            on_rq,
             in_task,
             in_cpu,
         ] = btf::kernel_member_offsets([
@@ -1027,7 +1025,6 @@ impl Layout {
             ("task_struct", btf::THREAD_POINTER),
             ("task_struct", "tgid"),
             ("task_struct", "pid"),
-            ("task_struct", "on_rq"),
             ("task_struct", "thread_info.preempt_count"),
             ("pcpu_hot", "preempt_count"),
         ]);
@@ -1036,7 +1033,7 @@ impl Layout {
             exits: signal.zip(live),
             exec_id,
             thread_pointer,
-            woken: tgid.zip(pid).zip(on_rq).map(|((t, p), o)| (t, p, o)),
+            woken: tgid.zip(pid),
             preempt_count: wakeups.then(|| preempt_count(in_task, in_cpu)).flatten(),
         }
     }
@@ -1110,7 +1107,7 @@ fn load(sampling: Option<&Sampling>, wakeups: bool, layout: Layout) -> Result<Eb
     let exec_id = layout.exec_id.unwrap_or(u32::MAX);
     let thread_pointer = layout.thread_pointer.unwrap_or(u32::MAX);
     let (signal, live) = layout.exits.unwrap_or((u32::MAX, u32::MAX));
-    let (tgid, pid, on_rq) = layout.woken.unwrap_or((u32::MAX, u32::MAX, u32::MAX));
+    let (tgid, pid) = layout.woken.unwrap_or((u32::MAX, u32::MAX));
     let (per_cpu_offsets, preempt_count) = layout
         .preempt_count
         .map_or((0, u64::MAX), |p| (p.per_cpu_offsets, p.at));
@@ -1129,7 +1126,6 @@ fn load(sampling: Option<&Sampling>, wakeups: bool, layout: Layout) -> Result<Eb
             .override_global("TASK_THREAD_POINTER", &thread_pointer, CAN_SAMPLE)
             .override_global("TASK_TGID", &tgid, CAN_SAMPLE)
             .override_global("TASK_PID", &pid, CAN_SAMPLE)
-            .override_global("TASK_ON_RQ", &on_rq, CAN_SAMPLE)
             .override_global("PER_CPU_OFFSETS", &per_cpu_offsets, CAN_SAMPLE)
             .override_global("PREEMPT_COUNT", &preempt_count, CAN_SAMPLE)
             .override_global("TASK_SIGNAL", &signal, true)
@@ -1150,7 +1146,6 @@ fn load(sampling: Option<&Sampling>, wakeups: bool, layout: Layout) -> Result<Eb
             thread_pointer,
             tgid,
             pid,
-            on_rq,
             per_cpu_offsets,
             preempt_count,
         );

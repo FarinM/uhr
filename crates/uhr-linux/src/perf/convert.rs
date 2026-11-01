@@ -882,10 +882,20 @@ fn interrupt_entry(name: &str) -> bool {
     name.starts_with("asm_") || name.starts_with("el1h_64_")
 }
 
+/// How long before a thread's switch out a wakeup can still be the one that
+/// ends the wait. The kernel reports a wakeup before it locks the run queue,
+/// so a thread on its way off the CPU can be woken before its switch out
+/// shows, nearly always by under 16 us under contended locks on Linux 6.8.
+/// One earlier than this is one the thread ran on from.
+const WOKEN_BEFORE_OUT_NS: u64 = 1_000_000;
+
 /// The wakeup that ended a blocked thread's wait, `woken`, from no earlier
 /// than its switch out.
 fn woken_after(out: &SwitchedOut, woken: Option<Wakeup>) -> Option<Wakeup> {
-    let woken = woken.filter(|_| out.state == ThreadState::Blocked)?;
+    let woken = woken.filter(|w| {
+        out.state == ThreadState::Blocked
+            && w.time_ns.saturating_add(WOKEN_BEFORE_OUT_NS) >= out.time_ns
+    })?;
     Some(Wakeup {
         time_ns: woken.time_ns.max(out.time_ns),
         ..woken
@@ -1733,10 +1743,10 @@ impl State {
         }
     }
 
-    /// The kernel waking a thread of the target's that slept, as uhr's eBPF
-    /// programs saw it, with the stack of what the CPU ran: an interrupt,
-    /// or the thread that woke it. It ends the thread's time off CPU once
-    /// it is switched back in.
+    /// The kernel waking a thread of the target's, as uhr's eBPF programs
+    /// saw it, with the stack of what the CPU ran: an interrupt, or the
+    /// thread that woke it. It ends the thread's time off CPU once it is
+    /// switched back in, if `woken_after` takes it.
     fn wakeup(
         &mut self,
         header: &SampleHeader,
@@ -2082,9 +2092,7 @@ impl State {
     }
 
     /// The last wakeup of the thread `key` after `since`, when it was last
-    /// switched in, until `until`. A wakeup can come just before the
-    /// thread's switch out, as the kernel can wake a thread it took off the
-    /// run queue before it is off the CPU.
+    /// switched in, until `until`.
     fn woken_since(&mut self, key: (u32, u32), since: Option<u64>, until: u64) -> Option<Wakeup> {
         self.woken
             .remove(&key)
@@ -3495,6 +3503,28 @@ mod tests {
         // The waker's stack.
         let stack = state.off_cpu[0].wakeup.as_ref().unwrap().stack.unwrap();
         assert_eq!(state.stacks[stack as usize].len(), 1);
+    }
+
+    #[test]
+    fn takes_a_wakeup_only_shortly_before_a_switch_out() {
+        let mut state = State::new(127);
+        state.switch_in(1, 2, 5);
+        wake(&mut state, 2, 10, Some(9));
+        let out = 10 + WOKEN_BEFORE_OUT_NS;
+        state.switch_out(1, 2, out, TaskWasPreempted::No);
+        state.switch_in(1, 2, out + 10);
+        wake(&mut state, 2, out + 20, Some(9));
+        let late = out + 21 + WOKEN_BEFORE_OUT_NS;
+        state.switch_out(1, 2, late, TaskWasPreempted::No);
+        state.switch_in(1, 2, late + 10);
+        state.finish_off_cpu();
+        assert_eq!(
+            woken(&state),
+            [
+                (2, out, out + 10, ThreadState::Blocked, Some((out, 9))),
+                (2, late, late + 10, ThreadState::Blocked, None),
+            ]
+        );
     }
 
     #[test]

@@ -1,5 +1,5 @@
-//! Sees the kernel wake the target's threads that slept: when, and what
-//! woke them, with its stack.
+//! Sees the kernel wake the target's threads: when, and what woke them, with
+//! its stack.
 
 use core::mem::size_of;
 
@@ -30,14 +30,12 @@ static WAKEUPS: RingBuf = RingBuf::with_byte_size(16 << 20, 0);
 #[map]
 static WAKEUPS_DROPPED: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
 
-/// Where a `task_struct` keeps its process's id, its own, and whether it is
-/// on a run queue, which uhr sets at load from the kernel's BTF.
+/// Where a `task_struct` keeps its process's id and its own, which uhr sets
+/// at load from the kernel's BTF.
 #[unsafe(no_mangle)]
 static TASK_TGID: Global<u32> = Global::new(u32::MAX);
 #[unsafe(no_mangle)]
 static TASK_PID: Global<u32> = Global::new(u32::MAX);
-#[unsafe(no_mangle)]
-static TASK_ON_RQ: Global<u32> = Global::new(u32::MAX);
 
 /// Where the kernel keeps the preempt count, which says whether the CPU
 /// runs an interrupt: this far into each CPU's area, whose addresses the
@@ -83,9 +81,11 @@ pub fn sched_waking(ctx: RawTracePointContext) -> i32 {
     if !running() {
         return 0;
     }
-    // The task woken.
+    // The task woken. Not only those off a run queue: this runs before the
+    // kernel locks the queue, so one still on it is often just about to sleep,
+    // and uhr tells them apart by its switch out.
     let task: u64 = ctx.arg(0);
-    let Some((tgid, tid)) = asleep(task as *const u8) else {
+    let Some((tgid, tid)) = ids(task as *const u8) else {
         return 0;
     };
     if !active(tgid) {
@@ -113,20 +113,12 @@ pub fn sched_waking(ctx: RawTracePointContext) -> i32 {
     0
 }
 
-/// The process and thread ids of `task`, if it slept. The kernel also wakes
-/// a thread that is about to sleep but still on a run queue, which then
-/// runs on without sleeping.
-fn asleep(task: *const u8) -> Option<(u32, u32)> {
+/// The process and thread ids of `task`.
+fn ids(task: *const u8) -> Option<(u32, u32)> {
     let read = |offset: u32| unsafe {
-        bpf_probe_read_kernel(task.wrapping_add(offset as usize).cast::<i32>()).ok()
+        bpf_probe_read_kernel(task.wrapping_add(offset as usize).cast::<u32>()).ok()
     };
-    if read(TASK_ON_RQ.load())? != 0 {
-        return None;
-    }
-    Some((
-        read(TASK_TGID.load())? as u32,
-        read(TASK_PID.load())? as u32,
-    ))
+    Some((read(TASK_TGID.load())?, read(TASK_PID.load())?))
 }
 
 /// Whether the CPU runs an interrupt: a hard one, an NMI, or the kernel's
