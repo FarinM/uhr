@@ -2164,11 +2164,13 @@ impl State {
                 };
                 let until = until.min(thread.end_ns.unwrap_or(end_ns));
                 if start_ns < until {
-                    // A wakeup says it had blocked.
-                    let wakeup = self
-                        .woken_first
-                        .remove(&key)
-                        .filter(|w| (start_ns..=until).contains(&w.time_ns));
+                    // A wakeup says it had blocked, and one never scheduled
+                    // since still has its own.
+                    let wakeup = match back {
+                        Some(_) => self.woken_first.remove(&key),
+                        None => self.woken.remove(&key),
+                    };
+                    let wakeup = wakeup.filter(|w| (start_ns..=until).contains(&w.time_ns));
                     let state = match wakeup {
                         Some(_) => ThreadState::Blocked,
                         None => ThreadState::Unknown,
@@ -3582,12 +3584,14 @@ mod tests {
     fn a_wakeup_says_a_thread_off_cpu_when_uhr_attached_had_blocked() {
         let mut state = State::new(127);
         (state.start_ns, state.end_ns) = (Some(100), Some(1_000));
-        for tid in [1, 2] {
+        for tid in [1, 2, 3, 4] {
             state.comm(1, tid, "t".into(), false, None);
         }
         wake(&mut state, 1, 250, None);
         state.switch_in(1, 1, 300);
         state.switch_in(1, 2, 400);
+        // Woken, but still waiting for a CPU at the end.
+        wake(&mut state, 3, 500, Some(1));
         state.attached_ns = Some(100);
         state.finish_off_cpu();
         assert_eq!(
@@ -3595,6 +3599,8 @@ mod tests {
             [
                 (1, 100, 300, ThreadState::Blocked, Some((250, 0))),
                 (2, 100, 400, ThreadState::Unknown, None),
+                (3, 100, 1_000, ThreadState::Blocked, Some((500, 1))),
+                (4, 100, 1_000, ThreadState::Unknown, None),
             ]
         );
     }
