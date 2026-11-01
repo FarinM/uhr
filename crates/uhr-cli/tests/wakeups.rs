@@ -212,6 +212,66 @@ fn sees_threads_woken_on_their_way_off_the_cpu() {
 }
 
 #[test]
+fn a_softirq_wakes_a_thread_rather_than_the_one_it_ran_on() {
+    let _turn = one_at_a_time();
+    // Its sender delivers each packet itself, in a softirq run as its send
+    // enables them.
+    let Some((sender, recording)) = record_attached("wakeups_softirq", "udp", "0-3", "") else {
+        return;
+    };
+    let received = recording.off_cpu.iter().filter(|i| i.tid != sender);
+    let woken: Vec<_> = received.filter_map(|i| i.wakeup.as_ref()).collect();
+    assert!(woken.len() >= 100, "{}", woken.len());
+    if recording.manifest.kernel_symbols != uhr_core::recording::KernelSymbols::Saved {
+        return;
+    }
+    let in_softirq = |stack: &[&str]| {
+        let last = stack.last().copied();
+        last == Some("handle_softirqs") || last == Some("__do_softirq")
+    };
+    let mut softirqs = 0;
+    for wakeup in woken.iter().filter(|w| w.waker == Waker::Interrupt) {
+        let stack = kernel_functions(&recording, wakeup.stack.unwrap());
+        softirqs += u32::from(in_softirq(&stack));
+        assert!(!stack.iter().any(|f| f.contains("sendto")), "{stack:?}");
+    }
+    assert!(softirqs >= 100, "{softirqs}");
+}
+
+#[test]
+fn another_probe_leaves_wakers_stacks_as_they_are() {
+    let _turn = one_at_a_time();
+    // With a second probe, the kernel gets to each through one more function.
+    let probe = Command::new("sudo")
+        .args(["-n", "perf", "stat", "-a", "-e", "sched:sched_waking"])
+        .args(["--", "sleep", "5"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+    let Ok(mut probe) = probe else {
+        eprintln!("skipped: needs sudo");
+        return;
+    };
+    thread::sleep(Duration::from_secs(1));
+    let recorded = record_waits("wakeups_other_probe", &[]);
+    let probed = probe.wait().unwrap().success();
+    let (Some((_, recording)), true) = (recorded, probed) else {
+        eprintln!("skipped: needs root through sudo without a password, and perf's tracepoints");
+        return;
+    };
+    if recording.manifest.kernel_symbols != uhr_core::recording::KernelSymbols::Saved {
+        return;
+    }
+    let woken = recording.off_cpu.iter();
+    let woken: Vec<_> = woken.filter_map(|i| i.wakeup.as_ref()).collect();
+    assert!(!woken.is_empty());
+    for wakeup in woken {
+        let stack = kernel_functions(&recording, wakeup.stack.unwrap());
+        assert_eq!(stack.first(), Some(&"try_to_wake_up"), "{stack:?}");
+    }
+}
+
+#[test]
 fn sees_no_wakeups_when_asked_not_to() {
     let _turn = one_at_a_time();
     let Some((path, recording)) = record_waits("no_wakeups", &["--no-wakeups"]) else {

@@ -218,6 +218,7 @@ pub(super) fn convert(input: Input) -> Result<(Recording, Option<EbpfStacks>)> {
     let mut state = State::new(input.max_stack_depth);
     if let Ok(kallsyms) = input.kallsyms {
         state.interrupt_entries = kallsyms.kernel_functions(interrupt_entry);
+        state.wake_functions = kallsyms.kernel_functions(|name| name == "try_to_wake_up");
     }
     let ebpf_copies = input.ebpf_samples.and_then(|s| s.stack_bytes);
     if stack_copy_bytes.is_some() || ebpf_copies.is_some() {
@@ -877,9 +878,26 @@ impl<'a> EbpfReader<'a> {
 /// Whether the kernel function `name` is where it enters an interrupt or
 /// an exception, past which a stack taken in the interrupt goes on into the
 /// code it interrupted: on x86-64 each has an `asm_` stub, and on arm64 one
-/// for those taken in the kernel.
+/// for those taken in the kernel. A softirq can run on the stack of the
+/// thread that enabled them, with no entry, from `handle_softirqs`, or
+/// `__do_softirq` on older kernels.
 fn interrupt_entry(name: &str) -> bool {
-    name.starts_with("asm_") || name.starts_with("el1h_64_")
+    name.starts_with("asm_")
+        || name.starts_with("el1h_64_")
+        || name == "handle_softirqs"
+        || name == "__do_softirq"
+}
+
+/// The first of `frames`, leaf first, in one of the sorted `functions`.
+fn first_in(functions: &[(u64, u64)], frames: &[(u64, Option<u64>)]) -> Option<usize> {
+    frames.iter().enumerate().position(|(i, &(address, _))| {
+        // All but the leaf are return addresses.
+        let address = address.saturating_sub(u64::from(i > 0));
+        let after = functions.partition_point(|&(start, _)| start <= address);
+        after
+            .checked_sub(1)
+            .is_some_and(|i| address < functions[i].1)
+    })
 }
 
 /// How long before a thread's switch out a wakeup can still be the one that
@@ -1041,6 +1059,8 @@ struct State {
     woken_first: HashMap<(u32, u32), Wakeup>,
     /// Where the kernel's functions that enter interrupts are, sorted.
     interrupt_entries: Vec<(u64, u64)>,
+    /// Where the kernel's function that reports wakeups is.
+    wake_functions: Vec<(u64, u64)>,
     off_cpu: Vec<OffCPUInterval>,
     /// When perf started sampling a process uhr attached to.
     attached_ns: Option<u64>,
@@ -1132,6 +1152,7 @@ impl State {
             last_in: HashMap::new(),
             woken_first: HashMap::new(),
             interrupt_entries: Vec::new(),
+            wake_functions: Vec::new(),
             page_faults: Vec::new(),
             regions: Vec::new(),
             spaces: HashMap::new(),
@@ -1767,20 +1788,19 @@ impl State {
             }
             _ => {
                 // The code the interrupt interrupted had no part in it.
-                let entry = frames.iter().enumerate().position(|(i, &(address, _))| {
-                    let address = address.saturating_sub(u64::from(i > 0));
-                    let after = self
-                        .interrupt_entries
-                        .partition_point(|&(start, _)| start <= address);
-                    after
-                        .checked_sub(1)
-                        .is_some_and(|i| address < self.interrupt_entries[i].1)
-                });
-                if let Some(entry) = entry {
+                if let Some(entry) = first_in(&self.interrupt_entries, &frames) {
                     frames.truncate(entry + 1);
                 }
                 Waker::Interrupt
             }
+        };
+        // Frames before it are the kernel's way to the program, which is
+        // longer on arm64, or with another probe on the tracepoint.
+        let own = first_in(&self.wake_functions, &frames).unwrap_or(0);
+        frames.drain(..own);
+        let header = &SampleHeader {
+            kernel_frames: header.kernel_frames - own as u32,
+            ..*header
         };
         let stack = self.ebpf_frames(header, frames.into_iter(), copy).stack;
         let stack =
@@ -3406,10 +3426,10 @@ mod tests {
         );
     }
 
-    /// Has the thread `woken` of process 1 woken at `time_ns`, by the
-    /// thread `by` of process 1, or by an interrupt.
-    fn wake(state: &mut State, woken: u32, time_ns: u64, by: Option<u32>) {
-        let header = SampleHeader {
+    /// A wakeup at `time_ns` by the thread `by` of process 1, or by an
+    /// interrupt, with `kernel_frames` of the kernel's frames.
+    fn woken_by(time_ns: u64, by: Option<u32>, kernel_frames: u32) -> SampleHeader {
+        SampleHeader {
             time_ns,
             ip: 0,
             period: 0,
@@ -3419,7 +3439,7 @@ mod tests {
             tid: by.unwrap_or(0),
             cpu: 0,
             mode: mode::KERNEL,
-            kernel_frames: 1,
+            kernel_frames,
             user_frames: 0,
             stack_bytes: 0,
             copy: 0,
@@ -3429,16 +3449,34 @@ mod tests {
             frame_ends: 0,
             exec: 0,
             mapped: 0,
-        };
-        let wakeup = uhr_ebpf::Wakeup {
+        }
+    }
+
+    /// What the eBPF programs say of the thread `woken` of process 1 woken,
+    /// by the thread `by` of process 1, or by an interrupt.
+    fn wakeup_of(woken: u32, by: Option<u32>) -> uhr_ebpf::Wakeup {
+        uhr_ebpf::Wakeup {
             tgid: 1,
             tid: woken,
             interrupt: u32::from(by.is_none()),
             pad: 0,
             comm: *b"waker\0\0\0\0\0\0\0\0\0\0\0",
-        };
+        }
+    }
+
+    /// Has the thread `woken` of process 1 woken at `time_ns`, by the
+    /// thread `by` of process 1, or by an interrupt.
+    fn wake(state: &mut State, woken: u32, time_ns: u64, by: Option<u32>) {
         let frames = [(0xffff_0000_1000, None)].into_iter();
-        state.wakeup(&header, &wakeup, frames, None);
+        let header = woken_by(time_ns, by, 1);
+        state.wakeup(&header, &wakeup_of(woken, by), frames, None);
+    }
+
+    /// The frames of the stack the thread 3 of process 1 was woken with.
+    fn waker_stack(state: &State) -> Vec<&Frame> {
+        let stack = state.woken[&(1, 3)].stack.unwrap();
+        let frames = state.stacks[stack as usize].iter();
+        frames.map(|&frame| &state.frames[frame as usize]).collect()
     }
 
     /// An interval's thread, times and state, and when it was woken and by
@@ -3565,43 +3603,42 @@ mod tests {
     fn cuts_an_interrupts_stack_where_the_kernel_entered_it() {
         let mut state = State::new(127);
         state.interrupt_entries = vec![(0x3000, 0x3100)];
-        let header = SampleHeader {
-            time_ns: 15,
-            ip: 0,
-            period: 0,
-            address: 0,
-            event: event::WAKEUP,
-            tgid: 1,
-            tid: 2,
-            cpu: 0,
-            mode: mode::KERNEL,
-            kernel_frames: 4,
-            user_frames: 0,
-            stack_bytes: 0,
-            copy: 0,
-            walk: walk::NONE,
-            walked_frames: 0,
-            walked_bytes: 0,
-            frame_ends: 0,
-            exec: 0,
-            mapped: 0,
-        };
-        let wakeup = uhr_ebpf::Wakeup {
-            tgid: 1,
-            tid: 3,
-            interrupt: 1,
-            pad: 0,
-            comm: [0; 16],
-        };
         // The entry returns to what the interrupt interrupted.
         let frames = [0x1000, 0x2010, 0x3010, 0x4010].map(|address| (address, None));
-        state.wakeup(&header, &wakeup, frames.into_iter(), None);
-        let stack = state.woken[&(1, 3)].stack.unwrap();
-        let addresses: Vec<u64> = state.stacks[stack as usize]
-            .iter()
-            .map(|&frame| state.frames[frame as usize].address)
-            .collect();
+        let header = woken_by(15, None, 4);
+        state.wakeup(&header, &wakeup_of(3, None), frames.into_iter(), None);
+        let addresses: Vec<u64> = waker_stack(&state).iter().map(|f| f.address).collect();
         assert_eq!(addresses, [0x1000, 0x2010, 0x3010]);
+    }
+
+    #[test]
+    fn takes_softirq_functions_for_entries() {
+        for name in [
+            "handle_softirqs",
+            "__do_softirq",
+            "asm_sysvec_apic_timer_interrupt",
+        ] {
+            assert!(interrupt_entry(name), "{name}");
+        }
+        for name in ["__local_bh_enable_ip", "do_softirq", "irq_exit_rcu"] {
+            assert!(!interrupt_entry(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn starts_a_wakers_stack_where_the_kernel_reports_the_wakeup() {
+        let mut state = State::new(127);
+        state.wake_functions = vec![(0x2000, 0x2100)];
+        // A `__traceiter_*` frame, the function, its caller and a user frame.
+        let frames = [0x1000, 0x2010, 0x3010, 0x7000].map(|address| (address, None));
+        let mut header = woken_by(15, Some(9), 3);
+        header.user_frames = 1;
+        state.wakeup(&header, &wakeup_of(3, Some(9)), frames.into_iter(), None);
+        let stack = waker_stack(&state);
+        let addresses: Vec<u64> = stack.iter().map(|f| f.address).collect();
+        assert_eq!(addresses, [0x2010, 0x3010, 0x7000]);
+        let kernel: Vec<bool> = stack.iter().map(|f| f.origin == Origin::Kernel).collect();
+        assert_eq!(kernel, [true, true, false]);
     }
 
     #[test]
