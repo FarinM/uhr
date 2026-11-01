@@ -37,6 +37,12 @@ static TASK_TGID: Global<u32> = Global::new(u32::MAX);
 #[unsafe(no_mangle)]
 static TASK_PID: Global<u32> = Global::new(u32::MAX);
 
+/// Where a `task_struct` keeps its softirq count, which only `PREEMPT_RT` has
+/// and where it counts them instead of in the preempt count. uhr sets it at
+/// load from the kernel's BTF.
+#[unsafe(no_mangle)]
+static TASK_SOFTIRQS: Global<u32> = Global::new(u32::MAX);
+
 /// Where the kernel keeps the preempt count, which says whether the CPU
 /// runs an interrupt: this far into each CPU's area, whose addresses the
 /// array at `PER_CPU_OFFSETS` holds by CPU, or into the current task where
@@ -124,11 +130,14 @@ fn ids(task: *const u8) -> Option<(u32, u32)> {
 /// Whether the CPU runs an interrupt: a hard one, an NMI, or the kernel's
 /// work deferred from one, a softirq.
 fn in_interrupt() -> Option<bool> {
-    // The kernel's `NMI_MASK`, `HARDIRQ_MASK` and `SOFTIRQ_OFFSET`, which
-    // only serving a softirq sets, not holding them off.
-    const INTERRUPT: u32 = 0x00f0_0000 | 0x000f_0000 | 0x100;
+    // The kernel's `SOFTIRQ_OFFSET`, which only serving a softirq sets, not
+    // holding them off.
+    const SOFTIRQ: u32 = 0x100;
+    // And its `NMI_MASK` and `HARDIRQ_MASK`.
+    const INTERRUPT: u32 = 0x00f0_0000 | 0x000f_0000 | SOFTIRQ;
+    let task = unsafe { bpf_get_current_task() };
     let base = match PER_CPU_OFFSETS.load() {
-        0 => unsafe { bpf_get_current_task() },
+        0 => task,
         offsets => {
             let cpu = u64::from(unsafe { bpf_get_smp_processor_id() });
             let at = offsets.wrapping_add(cpu * 8) as *const u64;
@@ -137,7 +146,14 @@ fn in_interrupt() -> Option<bool> {
     };
     let at = base.wrapping_add(PREEMPT_COUNT.load()) as *const u32;
     let count = unsafe { bpf_probe_read_kernel(at) }.ok()?;
-    Some(count & INTERRUPT != 0)
+    let softirqs = match TASK_SOFTIRQS.load() {
+        u32::MAX => 0,
+        at => {
+            let at = task.wrapping_add(u64::from(at)) as *const u32;
+            unsafe { bpf_probe_read_kernel(at) }.ok()?
+        }
+    };
+    Some(count & INTERRUPT != 0 || softirqs & SOFTIRQ != 0)
 }
 
 /// Writes a wakeup with the kernel's frames, and the user's if `user`.
