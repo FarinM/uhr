@@ -24,7 +24,8 @@ one of two samplers:
 
 - **perf**, without root, or with `--sampler perf`.
 - **uhr's eBPF sampler**, as root (or with CAP_BPF and CAP_PERFMON). It also
-  counts and times syscalls, and reads the frames of CPython 3.11 to 3.14,
+  counts and times syscalls, sees what woke each thread that waited, and
+  reads the frames of CPython 3.11 to 3.14,
   Node 20 to 24, Bun 1.4.3, Ruby 3.2, PHP 8.3, Lua 5.4 and Java's interpreter
   ([limits](docs/collection.md#runtimes)).
 

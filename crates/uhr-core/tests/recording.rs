@@ -1,6 +1,9 @@
-use std::fs;
+use std::fs::{self, File};
 use std::path::PathBuf;
 
+use arrow_array::RecordBatch;
+use parquet::arrow::ArrowWriter;
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use uhr_core::recording::*;
 
 fn scratch(name: &str) -> PathBuf {
@@ -196,6 +199,15 @@ fn example() -> Recording {
                 tid: 7,
                 state: ThreadState::Blocked,
                 stack: Some(1),
+                wakeup: Some(Wakeup {
+                    time_ns: 2_800,
+                    waker: Waker::Thread {
+                        pid: 7,
+                        tid: 8,
+                        name: "worker".into(),
+                    },
+                    stack: Some(0),
+                }),
             },
             OffCPUInterval {
                 start_ns: 4_000,
@@ -204,6 +216,20 @@ fn example() -> Recording {
                 tid: 8,
                 state: ThreadState::Runnable,
                 stack: None,
+                wakeup: None,
+            },
+            OffCPUInterval {
+                start_ns: 4_200,
+                end_ns: 4_600,
+                pid: 7,
+                tid: 8,
+                state: ThreadState::Blocked,
+                stack: None,
+                wakeup: Some(Wakeup {
+                    time_ns: 4_500,
+                    waker: Waker::Interrupt,
+                    stack: None,
+                }),
             },
         ],
         kernel_symbols: vec![
@@ -387,6 +413,31 @@ fn reads_a_recording_from_before_syscalls_could_be_skipped() {
 }
 
 #[test]
+fn reads_a_recording_from_before_wakeups() {
+    let dir = scratch("before_wakeups");
+    let mut recording = example();
+    recording.write(&dir).unwrap();
+    let path = dir.join("off_cpu.parquet");
+    let file = File::open(&path).unwrap();
+    let batches: Vec<RecordBatch> = ParquetRecordBatchReaderBuilder::try_new(file)
+        .unwrap()
+        .build()
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    // Its columns then: times, ids, state and stack.
+    let batch = batches[0].project(&[0, 1, 2, 3, 4, 5]).unwrap();
+    let file = File::create(&path).unwrap();
+    let mut writer = ArrowWriter::try_new(file, batch.schema(), None).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+    for interval in &mut recording.off_cpu {
+        interval.wakeup = None;
+    }
+    assert_eq!(Recording::read(&dir).unwrap(), recording);
+}
+
+#[test]
 fn will_not_write_calls_its_latency_does_not_count() {
     let dir = scratch("uncounted_calls");
     let mut recording = example();
@@ -471,6 +522,28 @@ fn rejects_off_cpu_intervals_that_end_before_they_start() {
         }
         error => panic!("{error}"),
     }
+}
+
+#[test]
+fn rejects_wakeups_outside_the_time_off_cpu_they_end() {
+    let mut recording = example();
+    recording.off_cpu[0].wakeup.as_mut().unwrap().time_ns = 2_901;
+    let error = recording.write(&scratch("late_wakeup")).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("off-CPU interval 0 was woken outside its time off CPU"),
+        "{error}"
+    );
+    let mut recording = example();
+    recording.off_cpu[0].state = ThreadState::Runnable;
+    let error = recording.write(&scratch("woken_runnable")).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("off-CPU interval 0 was woken, but did not block"),
+        "{error}"
+    );
 }
 
 #[test]

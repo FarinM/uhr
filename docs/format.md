@@ -64,7 +64,7 @@ Each stream has:
 | `collector` | `name` plus the collector's version and settings. For perf: `version`, `sampling`, `page_faults`, `context_switches` (whether perf recorded every context switch). uhr's eBPF programs are `ebpf`, with `programs`, their tags in hex, as in the kernel's names for their code: `bpf_prog_<tag>_<name>`, `sampling`, `page_faults` and `skipped_syscalls`, the names of the syscalls `uhr record --skip-syscall` had them leave uncounted. uhr reading `/proc` is `procfs`, with `interval_ns`, how often it read |
 | `collector.page_faults` | How the collector sampled page faults: `event` and `period`, one fault in every that many, which each sample stands for. Null for one that did not |
 | `collector.sampling` | How the collector sampled CPU time: `event`, `frequency_hz` (what it sampled at), `requested_frequency_hz`. Null for one that did not |
-| `signals` | What was captured: `user_cpu_samples`, `kernel_cpu_samples`, `user_stacks`, `kernel_stacks`, `off_cpu_time` (when threads went off CPU and came back, and whether they were preempted), `off_cpu_stacks` (where they went off CPU), `syscall_calls` (how often threads called each syscall and how long the calls took), `resident_memory` (how much memory each process had resident and in swap, over time), `memory_regions` (the regions of each process's memory, as it mapped them), `region_memory` (how much each process had resident and in swap in each kind of region, over time), `page_faults` (samples of the page faults threads took, with their stacks) |
+| `signals` | What was captured: `user_cpu_samples`, `kernel_cpu_samples`, `user_stacks`, `kernel_stacks`, `off_cpu_time` (when threads went off CPU and came back, and whether they were preempted), `off_cpu_stacks` (where they went off CPU), `wakeups` (when each thread that blocked was woken, and what woke it), `syscall_calls` (how often threads called each syscall and how long the calls took), `resident_memory` (how much memory each process had resident and in swap, over time), `memory_regions` (the regions of each process's memory, as it mapped them), `region_memory` (how much each process had resident and in swap in each kind of region, over time), `page_faults` (samples of the page faults threads took, with their stacks) |
 | `missing_signals` | Signals requested but not captured, each with a `reason`. Without `kernel_cpu_samples`, CPU time spent in the kernel is not in the samples at all, not merely unnamed. Threads go off CPU in the kernel, so without kernel sampling `off_cpu_stacks` is missing too |
 | `coverage.lost_events` | Events the kernel dropped |
 | `coverage.stacks` | For a collector that takes stacks, the counts below. Null for one that takes none |
@@ -164,14 +164,20 @@ takes the thread's stack at it.
 then. One already off CPU when an attached capture starts is off from then
 until it first runs, or all along if it never does. A new thread's wait for
 its first run is not included, nor is a time off CPU whose switch back in
-the kernel dropped, since when it ended is unknown.
+the kernel dropped, since when it ended is unknown. With the `wakeups`
+signal, each time a blocked thread was woken comes with when and by what.
 
 | Column | Type | Meaning |
 |---|---|---|
 | `start_ns`, `end_ns` | uint64 | When it was switched out and back in |
 | `pid`, `tid` | uint32 | |
-| `state` | string | `runnable` if it was preempted and waited for a CPU, `blocked` if it gave up the CPU to wait, for a lock, I/O, a timer or another thread. Only switches are recorded, not wakeups, so the time a woken thread then waits for a CPU counts as `blocked`. `unknown` if it was off CPU already when an attached capture started, so its switch out was not seen |
+| `state` | string | `runnable` if it was preempted and waited for a CPU, `blocked` if it gave up the CPU to wait, for a lock, I/O, a timer or another thread. Once woken, a blocked thread waits for a CPU too, from `woken_ns` where that is known. `unknown` if it was off CPU already when an attached capture started, so its switch out was not seen, unless a wakeup ended it, which says it was `blocked` |
 | `stack_id` | uint32, nullable | The stack it was switched out at. Null if the stack was not recorded: without kernel sampling, when the kernel dropped it, or when the switch out came before the capture |
+| `woken_ns` | uint64, nullable | When a `blocked` thread was woken: from then on it waited for a CPU. Never before `start_ns`, as the kernel can wake a thread it has taken off its run queue just before the switch out shows. Null without its wakeup: without the `wakeups` signal, where uhr's eBPF programs dropped it, or for a thread still asleep at the end |
+| `woken_by` | string, nullable | `thread` if a thread woke it, as by releasing a lock it waited for or writing to a pipe it read, or `interrupt` if an interrupt did, as a timer's at the end of a sleep or a timeout, or a device's. Null without `woken_ns` |
+| `waker_pid`, `waker_tid` | uint32, nullable | The thread that woke it, the target's or another process's. Null unless `woken_by` is `thread` |
+| `waker_name` | string, nullable | That thread's name then |
+| `waker_stack_id` | uint32, nullable | Where it was woken: the kernel's frames, leaf first from `try_to_wake_up`, then the waking thread's user frames if it is one of the target's. An interrupt's end at the kernel's entry for it, as the code it interrupted had no part in it. Null if not recorded |
 
 `kernel_symbols`, sorted by `start`, with ranges that don't overlap. The
 kernel moves to a random address on every boot, and modules come and go, so

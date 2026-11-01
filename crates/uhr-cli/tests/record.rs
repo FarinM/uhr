@@ -677,7 +677,7 @@ fn says_why_perf_could_not_record() {
 }
 
 /// Without the privileges to load eBPF, a recording says why it has no
-/// syscall counts. Asked for none, it says nothing.
+/// syscall counts, nor wakeups. Asked for neither, it says nothing.
 #[test]
 fn says_why_syscalls_were_not_counted() {
     if unsafe { libc::geteuid() } == 0 {
@@ -689,6 +689,7 @@ fn says_why_syscalls_were_not_counted() {
     assert!(record(&recording, &[], &["true"]).status.success());
     let missing = &manifest(&recording)["missing_signals"];
     assert_eq!(missing[0]["signal"], "syscall_calls", "{missing}");
+    assert_eq!(missing[1]["signal"], "wakeups", "{missing}");
     let reason = missing[0]["reason"].as_str().unwrap();
     assert!(
         reason.contains("needs root") || reason.contains("built without its eBPF programs"),
@@ -697,7 +698,7 @@ fn says_why_syscalls_were_not_counted() {
 
     let recording = dir.join("none");
     assert!(
-        record(&recording, &["--no-syscalls"], &["true"])
+        record(&recording, &["--no-syscalls", "--no-wakeups"], &["true"])
             .status
             .success()
     );

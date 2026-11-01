@@ -422,6 +422,7 @@ fn follows_off_cpu_time_through_the_paths() {
         tid: 1,
         state: ThreadState::Blocked,
         stack,
+        wakeup: None,
     };
     // Under spin b main, under main alone, and without a stack.
     recording.off_cpu = vec![

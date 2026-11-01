@@ -29,7 +29,7 @@ use uhr_core::recording::{
     InterpretedCode, InterpreterCoverage, KERNEL, KernelSymbols, Manifest, Mapping, MemoryRegion,
     MissingSignal, Mode, OffCPUInterval, Origin, Platform, Recording, RegionKind, Sample, Sampling,
     Signal, StackCoverage, Stream, StreamCoverage, Target, Thread, ThreadName, ThreadState,
-    Unwinding,
+    Unwinding, Waker, Wakeup,
 };
 use uhr_core::runtimes::{Frames, Interpreter, WalkedFrame};
 use uhr_ebpf::{MAX_FRAMES, SampleHeader, UserRegisters, event, mode, walk};
@@ -72,6 +72,8 @@ pub(super) struct EbpfSamples<'a> {
     pub interpreters: &'a Interpreters,
     /// Whether they sampled page faults too.
     pub page_faults: bool,
+    /// Whether they saw the target's threads woken.
+    pub wakeups: bool,
 }
 
 pub(super) const TIMER_BIAS: &str = "cpu-clock samples come from a timer interrupt, so code \
@@ -214,6 +216,9 @@ pub(super) fn convert(input: Input) -> Result<(Recording, Option<EbpfStacks>)> {
         .collect();
 
     let mut state = State::new(input.max_stack_depth);
+    if let Ok(kallsyms) = input.kallsyms {
+        state.interrupt_entries = kallsyms.kernel_functions(interrupt_entry);
+    }
     let ebpf_copies = input.ebpf_samples.and_then(|s| s.stack_bytes);
     if stack_copy_bytes.is_some() || ebpf_copies.is_some() {
         state.unwinding = Some(UserUnwinding::new());
@@ -437,7 +442,7 @@ pub(super) fn convert(input: Input) -> Result<(Recording, Option<EbpfStacks>)> {
             None => FRAME_POINTER_BIAS,
         });
     }
-    if switches.is_some() {
+    if switches.is_some() && !input.ebpf_samples.is_some_and(|s| s.wakeups) {
         known_biases.push(OFF_CPU_BIAS);
     }
     let stream = Stream {
@@ -794,7 +799,22 @@ impl<'a> EbpfReader<'a> {
             // numbers, any bits of which are valid.
             let header: SampleHeader =
                 unsafe { std::ptr::read_unaligned(self.buffer.as_ptr().cast()) };
-            let rest = &self.buffer[size_of::<SampleHeader>()..];
+            let mut rest = &self.buffer[size_of::<SampleHeader>()..];
+            let wakeup = match header.event {
+                event::WAKEUP if rest.len() >= size_of::<uhr_ebpf::Wakeup>() => {
+                    let wakeup: uhr_ebpf::Wakeup;
+                    (wakeup, rest) = (
+                        // SAFETY: as for the header.
+                        unsafe { std::ptr::read_unaligned(rest.as_ptr().cast()) },
+                        &rest[size_of::<uhr_ebpf::Wakeup>()..],
+                    );
+                    Some(wakeup)
+                }
+                event::WAKEUP => {
+                    return Err(unexpected(format!("a wakeup of {len} bytes")));
+                }
+                _ => None,
+            };
             let (kernel, user) = (header.kernel_frames as usize, header.user_frames as usize);
             let ends = header.frame_ends != 0;
             let count = kernel + user * (1 + usize::from(ends));
@@ -838,18 +858,38 @@ impl<'a> EbpfReader<'a> {
                     full: Some(header.stack_bytes) == self.stack_bytes,
                 }
             });
-            let walked = (self.interpreters, walked);
-            state.ebpf_sample(
-                &header,
-                frames.into_iter(),
-                copy,
-                Some(walked),
-                self.period_ns,
-            );
+            match wakeup {
+                Some(wakeup) => state.wakeup(&header, &wakeup, frames.into_iter(), copy),
+                None => state.ebpf_sample(
+                    &header,
+                    frames.into_iter(),
+                    copy,
+                    Some((self.interpreters, walked)),
+                    self.period_ns,
+                ),
+            }
             self.next += 1;
         }
         Ok(())
     }
+}
+
+/// Whether the kernel function `name` is where it enters an interrupt or
+/// an exception, past which a stack taken in the interrupt goes on into the
+/// code it interrupted: on x86-64 each has an `asm_` stub, and on arm64 one
+/// for those taken in the kernel.
+fn interrupt_entry(name: &str) -> bool {
+    name.starts_with("asm_") || name.starts_with("el1h_64_")
+}
+
+/// The wakeup that ended a blocked thread's wait, `woken`, from no earlier
+/// than its switch out.
+fn woken_after(out: &SwitchedOut, woken: Option<Wakeup>) -> Option<Wakeup> {
+    let woken = woken.filter(|_| out.state == ThreadState::Blocked)?;
+    Some(Wakeup {
+        time_ns: woken.time_ns.max(out.time_ns),
+        ..woken
+    })
 }
 
 pub(crate) fn is_dummy(attr: &PerfEventAttr) -> bool {
@@ -982,6 +1022,15 @@ struct State {
     switch_stacks: HashMap<(u32, u32), u32>,
     /// Threads off CPU, until their switch back in.
     switched_out: HashMap<(u32, u32), SwitchedOut>,
+    /// The last wakeup of each thread, until its switch back in.
+    woken: HashMap<(u32, u32), Wakeup>,
+    /// When each thread was last switched in.
+    last_in: HashMap<(u32, u32), u64>,
+    /// The wakeup that ended the time off CPU a thread was in when an
+    /// attached capture started, which says it had blocked.
+    woken_first: HashMap<(u32, u32), Wakeup>,
+    /// Where the kernel's functions that enter interrupts are, sorted.
+    interrupt_entries: Vec<(u64, u64)>,
     off_cpu: Vec<OffCPUInterval>,
     /// When perf started sampling a process uhr attached to.
     attached_ns: Option<u64>,
@@ -1032,6 +1081,16 @@ struct Taken {
     period: u64,
 }
 
+/// A sample's frames, leaf first, and where each ends on the stack, where
+/// known.
+struct EbpfFrames {
+    stack: Vec<u32>,
+    ends: Vec<Option<u64>>,
+    /// With a stack copy, whether unwinding it was cut at its end, and
+    /// whether it could not be unwound.
+    unwound: Option<(bool, bool)>,
+}
+
 struct SwitchedOut {
     time_ns: u64,
     state: ThreadState,
@@ -1059,6 +1118,10 @@ impl State {
             samples: Vec::new(),
             switch_stacks: HashMap::new(),
             switched_out: HashMap::new(),
+            woken: HashMap::new(),
+            last_in: HashMap::new(),
+            woken_first: HashMap::new(),
+            interrupt_entries: Vec::new(),
             page_faults: Vec::new(),
             regions: Vec::new(),
             spaces: HashMap::new(),
@@ -1573,34 +1636,18 @@ impl State {
         self.seen_at(time_ns);
         self.thread(pid, tid);
         self.seen_on_cpu(pid, tid, time_ns);
-        let kernel = header.kernel_frames as usize;
-        let mut stack = Vec::new();
-        // Where each frame of `stack` ends on the stack, where known.
-        let mut ends = Vec::new();
-        for (i, (address, end)) in frames.enumerate() {
-            let context = if i < kernel {
-                ChainContext::Kernel
-            } else {
-                ChainContext::User
-            };
-            let first = i == 0 || i == kernel;
-            stack.push(self.frame(pid, context, address, !first));
-            ends.push(end);
-        }
+        let EbpfFrames {
+            mut stack,
+            mut ends,
+            unwound,
+        } = self.ebpf_frames(header, frames, copy);
         let limit = ebpf_depth(self.max_stack_depth) as usize;
         // Whether the native stack lost its outer end.
         let mut cut_short = false;
-        if let (Some(copy), Some(unwinding)) = (copy, self.unwinding.as_mut()) {
-            let ids = self.processes.get(&pid).map_or(&[][..], Vec::as_slice);
-            let room = limit.saturating_sub(stack.len());
-            let user = unwinding.unwind(&copy, pid, ids, &self.mappings, room);
-            cut_short |= user.cut;
-            self.ebpf_cut_at_copy += u64::from(user.cut);
-            self.ebpf_not_unwound += u64::from(user.not_unwound);
-            for (address, return_address, end) in user.frames {
-                stack.push(self.frame(pid, ChainContext::User, address, return_address));
-                ends.push(end);
-            }
+        if let Some((cut, not_unwound)) = unwound {
+            cut_short |= cut;
+            self.ebpf_cut_at_copy += u64::from(cut);
+            self.ebpf_not_unwound += u64::from(not_unwound);
         }
         let (mode, context) = match header.mode {
             mode::KERNEL => (Mode::Kernel, ChainContext::Kernel),
@@ -1643,6 +1690,99 @@ impl State {
             stack,
             cpu_ns: period_ns,
         });
+    }
+
+    /// The frames of a sample of uhr's eBPF programs, its kernel frames and
+    /// then its user frames, or with the user frames unwound from `copy`.
+    fn ebpf_frames(
+        &mut self,
+        header: &SampleHeader,
+        frames: impl Iterator<Item = (u64, Option<u64>)>,
+        copy: Option<UserCopy>,
+    ) -> EbpfFrames {
+        let pid = header.tgid;
+        let kernel = header.kernel_frames as usize;
+        let mut stack = Vec::new();
+        let mut ends = Vec::new();
+        for (i, (address, end)) in frames.enumerate() {
+            let context = if i < kernel {
+                ChainContext::Kernel
+            } else {
+                ChainContext::User
+            };
+            let first = i == 0 || i == kernel;
+            stack.push(self.frame(pid, context, address, !first));
+            ends.push(end);
+        }
+        let mut unwound = None;
+        if let (Some(copy), Some(unwinding)) = (copy, self.unwinding.as_mut()) {
+            let ids = self.processes.get(&pid).map_or(&[][..], Vec::as_slice);
+            let limit = ebpf_depth(self.max_stack_depth) as usize;
+            let room = limit.saturating_sub(stack.len());
+            let user = unwinding.unwind(&copy, pid, ids, &self.mappings, room);
+            unwound = Some((user.cut, user.not_unwound));
+            for (address, return_address, end) in user.frames {
+                stack.push(self.frame(pid, ChainContext::User, address, return_address));
+                ends.push(end);
+            }
+        }
+        EbpfFrames {
+            stack,
+            ends,
+            unwound,
+        }
+    }
+
+    /// The kernel waking a thread of the target's that slept, as uhr's eBPF
+    /// programs saw it, with the stack of what the CPU ran: an interrupt,
+    /// or the thread that woke it. It ends the thread's time off CPU once
+    /// it is switched back in.
+    fn wakeup(
+        &mut self,
+        header: &SampleHeader,
+        wakeup: &uhr_ebpf::Wakeup,
+        frames: impl Iterator<Item = (u64, Option<u64>)>,
+        copy: Option<UserCopy>,
+    ) {
+        self.seen_at(header.time_ns);
+        let mut frames: Vec<_> = frames.collect();
+        let waker = match wakeup.interrupt {
+            0 => {
+                let name = wakeup.comm.split(|&b| b == 0).next().unwrap_or_default();
+                Waker::Thread {
+                    pid: header.tgid,
+                    tid: header.tid,
+                    name: lossy(name),
+                }
+            }
+            _ => {
+                // The code the interrupt interrupted had no part in it.
+                let entry = frames.iter().enumerate().position(|(i, &(address, _))| {
+                    let address = address.saturating_sub(u64::from(i > 0));
+                    let after = self
+                        .interrupt_entries
+                        .partition_point(|&(start, _)| start <= address);
+                    after
+                        .checked_sub(1)
+                        .is_some_and(|i| address < self.interrupt_entries[i].1)
+                });
+                if let Some(entry) = entry {
+                    frames.truncate(entry + 1);
+                }
+                Waker::Interrupt
+            }
+        };
+        let stack = self.ebpf_frames(header, frames.into_iter(), copy).stack;
+        let stack =
+            (!stack.is_empty()).then(|| intern(&mut self.stacks, &mut self.stack_ids, stack));
+        self.woken.insert(
+            (wakeup.tgid, wakeup.tid),
+            Wakeup {
+                time_ns: header.time_ns,
+                waker,
+                stack,
+            },
+        );
     }
 
     /// Puts the interpreter frames a sample walked into its native stack,
@@ -1916,19 +2056,39 @@ impl State {
     }
 
     fn switch_in(&mut self, pid: u32, tid: u32, time_ns: u64) {
-        first(&mut self.first_in, (pid, tid), time_ns);
+        let key = (pid, tid);
+        first(&mut self.first_in, key, time_ns);
         // A stack left from before belongs to a switch out that was lost.
-        self.switch_stacks.remove(&(pid, tid));
-        if let Some(out) = self.switched_out.remove(&(pid, tid)) {
-            self.off_cpu.push(OffCPUInterval {
+        self.switch_stacks.remove(&key);
+        let since = self.last_in.insert(key, time_ns);
+        let woken = self.woken_since(key, since, time_ns);
+        match self.switched_out.remove(&key) {
+            Some(out) => self.off_cpu.push(OffCPUInterval {
                 start_ns: out.time_ns,
                 end_ns: time_ns,
                 pid,
                 tid,
                 state: out.state,
                 stack: out.stack,
-            });
+                wakeup: woken_after(&out, woken),
+            }),
+            None if since.is_none() => {
+                if let Some(woken) = woken {
+                    self.woken_first.insert(key, woken);
+                }
+            }
+            None => {}
         }
+    }
+
+    /// The last wakeup of the thread `key` after `since`, when it was last
+    /// switched in, until `until`. A wakeup can come just before the
+    /// thread's switch out, as the kernel can wake a thread it took off the
+    /// run queue before it is off the CPU.
+    fn woken_since(&mut self, key: (u32, u32), since: Option<u64>, until: u64) -> Option<Wakeup> {
+        self.woken
+            .remove(&key)
+            .filter(|w| since.is_none_or(|since| w.time_ns > since) && w.time_ns <= until)
     }
 
     /// A thread seen on CPU after it went off lost its switch back in, so
@@ -1941,6 +2101,7 @@ impl State {
             .is_some_and(|out| out.time_ns < time_ns)
         {
             self.switched_out.remove(&(pid, tid));
+            self.woken.remove(&(pid, tid));
         }
     }
 
@@ -1949,6 +2110,8 @@ impl State {
         // A thread runs to exit, so these lost their switch back in.
         self.switched_out.remove(&(pid, tid));
         self.switch_stacks.remove(&(pid, tid));
+        self.woken.remove(&(pid, tid));
+        self.last_in.remove(&(pid, tid));
     }
 
     /// Threads still off CPU stay off until the capture ends. Attached,
@@ -1973,19 +2136,32 @@ impl State {
                 };
                 let until = until.min(thread.end_ns.unwrap_or(end_ns));
                 if start_ns < until {
+                    // A wakeup says it had blocked.
+                    let wakeup = self
+                        .woken_first
+                        .remove(&key)
+                        .filter(|w| (start_ns..=until).contains(&w.time_ns));
+                    let state = match wakeup {
+                        Some(_) => ThreadState::Blocked,
+                        None => ThreadState::Unknown,
+                    };
                     self.off_cpu.push(OffCPUInterval {
                         start_ns,
                         end_ns: until,
                         pid: thread.pid,
                         tid: thread.tid,
-                        state: ThreadState::Unknown,
+                        state,
                         stack: None,
+                        wakeup,
                     });
                 }
             }
         }
         if let Some(end_ns) = self.end_ns {
-            for ((pid, tid), out) in self.switched_out.drain() {
+            let out: Vec<_> = self.switched_out.drain().collect();
+            for ((pid, tid), out) in out {
+                let since = self.last_in.get(&(pid, tid)).copied();
+                let woken = self.woken_since((pid, tid), since, end_ns);
                 self.off_cpu.push(OffCPUInterval {
                     start_ns: out.time_ns,
                     end_ns,
@@ -1993,6 +2169,7 @@ impl State {
                     tid,
                     state: out.state,
                     stack: out.stack,
+                    wakeup: woken_after(&out, woken),
                 });
             }
         }
@@ -3219,6 +3396,182 @@ mod tests {
                 (2, 45, 60, ThreadState::Blocked, None),
             ]
         );
+    }
+
+    /// Has the thread `woken` of process 1 woken at `time_ns`, by the
+    /// thread `by` of process 1, or by an interrupt.
+    fn wake(state: &mut State, woken: u32, time_ns: u64, by: Option<u32>) {
+        let header = SampleHeader {
+            time_ns,
+            ip: 0,
+            period: 0,
+            address: 0,
+            event: event::WAKEUP,
+            tgid: 1,
+            tid: by.unwrap_or(0),
+            cpu: 0,
+            mode: mode::KERNEL,
+            kernel_frames: 1,
+            user_frames: 0,
+            stack_bytes: 0,
+            copy: 0,
+            walk: walk::NONE,
+            walked_frames: 0,
+            walked_bytes: 0,
+            frame_ends: 0,
+            exec: 0,
+            mapped: 0,
+        };
+        let wakeup = uhr_ebpf::Wakeup {
+            tgid: 1,
+            tid: woken,
+            interrupt: u32::from(by.is_none()),
+            pad: 0,
+            comm: *b"waker\0\0\0\0\0\0\0\0\0\0\0",
+        };
+        let frames = [(0xffff_0000_1000, None)].into_iter();
+        state.wakeup(&header, &wakeup, frames, None);
+    }
+
+    /// An interval's thread, times and state, and when it was woken and by
+    /// which thread, 0 for an interrupt.
+    type Woken = (u32, u64, u64, ThreadState, Option<(u64, u32)>);
+
+    fn woken(state: &State) -> Vec<Woken> {
+        state
+            .off_cpu
+            .iter()
+            .map(|i| {
+                let wakeup = i.wakeup.as_ref().map(|w| match &w.waker {
+                    Waker::Thread { tid, name, .. } => {
+                        assert_eq!(name, "waker");
+                        (w.time_ns, *tid)
+                    }
+                    Waker::Interrupt => (w.time_ns, 0),
+                });
+                (i.tid, i.start_ns, i.end_ns, i.state, wakeup)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn ends_each_wait_where_its_thread_was_woken() {
+        let mut state = State::new(127);
+        state.switch_in(1, 2, 5);
+        state.switch_out(1, 2, 10, TaskWasPreempted::No);
+        wake(&mut state, 2, 15, Some(9));
+        state.switch_in(1, 2, 20);
+        // Preempted, it needs no wakeup.
+        state.switch_out(1, 2, 25, TaskWasPreempted::Yes);
+        state.switch_in(1, 2, 30);
+        // Woken as the kernel took it off the run queue, just before its
+        // switch out shows.
+        wake(&mut state, 2, 34, None);
+        state.switch_out(1, 2, 35, TaskWasPreempted::No);
+        state.switch_in(1, 2, 40);
+        // Its wakeup was lost.
+        state.switch_out(1, 2, 45, TaskWasPreempted::No);
+        state.switch_in(1, 2, 50);
+        // A wakeup with the time of its switch in, which came after it.
+        wake(&mut state, 2, 50, Some(9));
+        state.switch_out(1, 2, 51, TaskWasPreempted::No);
+        state.switch_in(1, 2, 52);
+        // Woken, but still waiting for a CPU at the end.
+        state.switch_out(1, 3, 52, TaskWasPreempted::No);
+        wake(&mut state, 3, 55, Some(2));
+        state.end_ns = Some(60);
+        state.finish_off_cpu();
+        assert_eq!(
+            woken(&state),
+            [
+                (2, 10, 20, ThreadState::Blocked, Some((15, 9))),
+                (2, 25, 30, ThreadState::Runnable, None),
+                (2, 35, 40, ThreadState::Blocked, Some((35, 0))),
+                (2, 45, 50, ThreadState::Blocked, None),
+                (2, 51, 52, ThreadState::Blocked, None),
+                (3, 52, 60, ThreadState::Blocked, Some((55, 2))),
+            ]
+        );
+        // The waker's stack.
+        let stack = state.off_cpu[0].wakeup.as_ref().unwrap().stack.unwrap();
+        assert_eq!(state.stacks[stack as usize].len(), 1);
+    }
+
+    #[test]
+    fn takes_no_wakeup_from_before_its_thread_last_ran() {
+        let mut state = State::new(127);
+        state.switch_out(1, 2, 10, TaskWasPreempted::No);
+        wake(&mut state, 2, 15, Some(9));
+        // Its switch back in was lost.
+        state.seen_on_cpu(1, 2, 22);
+        state.switch_out(1, 2, 30, TaskWasPreempted::No);
+        state.switch_in(1, 2, 40);
+        state.finish_off_cpu();
+        assert_eq!(woken(&state), [(2, 30, 40, ThreadState::Blocked, None)]);
+    }
+
+    #[test]
+    fn a_wakeup_says_a_thread_off_cpu_when_uhr_attached_had_blocked() {
+        let mut state = State::new(127);
+        (state.start_ns, state.end_ns) = (Some(100), Some(1_000));
+        for tid in [1, 2] {
+            state.comm(1, tid, "t".into(), false, None);
+        }
+        wake(&mut state, 1, 250, None);
+        state.switch_in(1, 1, 300);
+        state.switch_in(1, 2, 400);
+        state.attached_ns = Some(100);
+        state.finish_off_cpu();
+        assert_eq!(
+            woken(&state),
+            [
+                (1, 100, 300, ThreadState::Blocked, Some((250, 0))),
+                (2, 100, 400, ThreadState::Unknown, None),
+            ]
+        );
+    }
+
+    #[test]
+    fn cuts_an_interrupts_stack_where_the_kernel_entered_it() {
+        let mut state = State::new(127);
+        state.interrupt_entries = vec![(0x3000, 0x3100)];
+        let header = SampleHeader {
+            time_ns: 15,
+            ip: 0,
+            period: 0,
+            address: 0,
+            event: event::WAKEUP,
+            tgid: 1,
+            tid: 2,
+            cpu: 0,
+            mode: mode::KERNEL,
+            kernel_frames: 4,
+            user_frames: 0,
+            stack_bytes: 0,
+            copy: 0,
+            walk: walk::NONE,
+            walked_frames: 0,
+            walked_bytes: 0,
+            frame_ends: 0,
+            exec: 0,
+            mapped: 0,
+        };
+        let wakeup = uhr_ebpf::Wakeup {
+            tgid: 1,
+            tid: 3,
+            interrupt: 1,
+            pad: 0,
+            comm: [0; 16],
+        };
+        // The entry returns to what the interrupt interrupted.
+        let frames = [0x1000, 0x2010, 0x3010, 0x4010].map(|address| (address, None));
+        state.wakeup(&header, &wakeup, frames.into_iter(), None);
+        let stack = state.woken[&(1, 3)].stack.unwrap();
+        let addresses: Vec<u64> = state.stacks[stack as usize]
+            .iter()
+            .map(|&frame| state.frames[frame as usize].address)
+            .collect();
+        assert_eq!(addresses, [0x1000, 0x2010, 0x3010]);
     }
 
     #[test]

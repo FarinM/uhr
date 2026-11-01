@@ -87,6 +87,28 @@ fn symbol(line: &str) -> Option<(u64, &str, Option<&str>, char)> {
     (matches!(kind, 't' | 'T' | 'w' | 'W') && !marker).then_some((start, name, module, kind))
 }
 
+/// The addresses of the kernel's own symbols `names`, of any kind, such as
+/// its variables. `None` for one not found, or all if unreadable. A per-CPU
+/// variable's is its offset into each CPU's area.
+pub(crate) fn addresses<const N: usize>(names: [&str; N]) -> [Option<u64>; N] {
+    let mut found = [None; N];
+    let Ok(text) = fs::read_to_string(KALLSYMS) else {
+        return found;
+    };
+    for line in text.lines() {
+        let mut fields = line.split_whitespace();
+        let (Some(address), Some(_), Some(name), None) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        if let Some(i) = names.iter().position(|&n| n == name) {
+            found[i] = u64::from_str_radix(address, 16).ok();
+        }
+    }
+    found
+}
+
 /// The module a kernel mapping holds: `Some(None)` for the kernel itself,
 /// `None` if the mapping is neither.
 fn module_of(mapping: &Mapping) -> Option<Option<&str>> {
@@ -178,6 +200,19 @@ impl Kallsyms {
             }
         }
         found.into_values().collect()
+    }
+
+    /// Where the kernel's own functions whose names `wanted` takes are,
+    /// each from its start to the next function's, sorted.
+    pub(crate) fn kernel_functions(&self, wanted: impl Fn(&str) -> bool) -> Vec<(u64, u64)> {
+        let Some(symbols) = self.modules.get(&None) else {
+            return Vec::new();
+        };
+        symbols
+            .windows(2)
+            .filter(|pair| wanted(&pair[0].name))
+            .map(|pair| (pair[0].start, pair[1].start))
+            .collect()
     }
 
     fn in_mapping(&self, mapping: &Mapping, address: u64) -> Option<KernelSymbol> {

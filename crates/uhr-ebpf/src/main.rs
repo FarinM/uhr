@@ -18,6 +18,12 @@ mod syscalls;
 mod targets;
 #[cfg(target_arch = "bpf")]
 mod walk;
+// It shares the sampler's ring buffer.
+#[cfg(all(
+    target_arch = "bpf",
+    any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64")
+))]
+mod wakeups;
 
 #[cfg(target_arch = "bpf")]
 #[panic_handler]

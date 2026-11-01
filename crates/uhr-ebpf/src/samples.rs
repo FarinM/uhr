@@ -49,7 +49,7 @@ const _: () = assert!(FRAME_WORDS >= 2 * MAX_FRAMES);
 #[map]
 static SCRATCH: PerCpuArray<Sample> = PerCpuArray::with_max_entries(1, 0);
 
-const PAGE: usize = 4096;
+pub(crate) const PAGE: usize = 4096;
 
 /// A sample with a copy of its user stack: the header, then the kernel
 /// frames, the user registers and the copy, and the interpreter frames,
@@ -70,7 +70,7 @@ static COPIES: Array<Copy> = Array::with_max_entries(1, 0);
 /// The bytes of user stack to copy with each sample, which uhr sets at
 /// load. 0 to walk user stacks with frame pointers instead.
 #[unsafe(no_mangle)]
-static STACK_BYTES: Global<u32> = Global::new(0);
+pub(crate) static STACK_BYTES: Global<u32> = Global::new(0);
 
 /// `walk_frames`, which uhr puts at 0, `walk_native` at 1 and
 /// `walk_memory` at 2.
@@ -124,13 +124,13 @@ pub fn cpuhp_enter(ctx: TracePointContext) -> u32 {
     0
 }
 
-const FRAME: usize = size_of::<u64>();
+pub(crate) const FRAME: usize = size_of::<u64>();
 
 /// The kernel's `perf_event_max_stack`, up to `MAX_FRAMES`, which uhr sets
 /// at load. As in perf's, a sample's kernel and user frames together take
 /// at most this many.
 #[unsafe(no_mangle)]
-static MAX_STACK: Global<u32> = Global::new(MAX_FRAMES as u32);
+pub(crate) static MAX_STACK: Global<u32> = Global::new(MAX_FRAMES as u32);
 
 /// Where a task's flags are in the kernel's `task_struct`, which uhr sets
 /// at load from the kernel's BTF. `u32::MAX` where unknown.
@@ -462,7 +462,7 @@ fn fill_copy(ctx: &PerfEventContext, event: u32, sample: &mut Copy, stack_bytes:
 /// Copies the user stack from `sp` up, a page at a time, until `limit`
 /// bytes or the end of the stack, where reading fails, and returns how many
 /// bytes it copied.
-fn copy_stack(sp: u64, to: *mut u8, limit: usize) -> usize {
+pub(crate) fn copy_stack(sp: u64, to: *mut u8, limit: usize) -> usize {
     let mut copied = 0;
     for _ in 0..MAX_STACK_COPY / PAGE + 2 {
         if copied >= limit {
@@ -532,17 +532,29 @@ fn interrupted(regs: &bpf_user_pt_regs_t) -> (u64, bool) {
 /// those the kernel saved on entry otherwise. `None` for a kernel thread.
 #[cfg(bpf_target_arch = "x86_64")]
 fn user_registers(regs: &bpf_user_pt_regs_t, kernel_mode: bool) -> Option<UserRegisters> {
+    if kernel_mode {
+        saved_user_registers()
+    } else {
+        of_user_code(regs)
+    }
+}
+
+/// The user registers the kernel saved as the current thread entered it.
+/// `None` for a kernel thread.
+#[cfg(bpf_target_arch = "x86_64")]
+pub(crate) fn saved_user_registers() -> Option<UserRegisters> {
+    let saved = unsafe { bpf_task_pt_regs(bpf_get_current_task_btf()) };
+    let regs = unsafe { bpf_probe_read_kernel(saved as *const bpf_user_pt_regs_t) }.ok()?;
+    of_user_code(&regs)
+}
+
+#[cfg(bpf_target_arch = "x86_64")]
+fn of_user_code(regs: &bpf_user_pt_regs_t) -> Option<UserRegisters> {
     // The code segments of 64-bit user code, natively and in a Xen PV
     // guest. As in the kernel's `user_64bit_mode`, any other is 32-bit
     // code, such as one from the LDT.
     const USER_CS: u16 = 0x33;
     const XEN_PV_USER_CS: u16 = 0xe033;
-    let regs = if kernel_mode {
-        let saved = unsafe { bpf_task_pt_regs(bpf_get_current_task_btf()) };
-        unsafe { bpf_probe_read_kernel(saved as *const bpf_user_pt_regs_t) }.ok()?
-    } else {
-        *regs
-    };
     (regs.cs & 3 == 3).then_some(UserRegisters {
         ip: regs.rip,
         sp: regs.rsp,
@@ -555,6 +567,11 @@ fn user_registers(regs: &bpf_user_pt_regs_t, kernel_mode: bool) -> Option<UserRe
 /// uhr unwinds copies of x86-64 stacks only.
 #[cfg(bpf_target_arch = "aarch64")]
 fn user_registers(_regs: &bpf_user_pt_regs_t, _kernel_mode: bool) -> Option<UserRegisters> {
+    None
+}
+
+#[cfg(bpf_target_arch = "aarch64")]
+pub(crate) fn saved_user_registers() -> Option<UserRegisters> {
     None
 }
 

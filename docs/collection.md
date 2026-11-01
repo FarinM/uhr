@@ -138,9 +138,8 @@ Debian and Ubuntu its package must match the running kernel.
   preempted, which tells runnable from blocked. Neither needs root: the
   switch records come wherever perf can record, and the stacks need kernel
   sampling, so a `perf_event_paranoid` of 2 or more leaves them out.
-  Wakeups would also tell when a blocked thread became runnable and what
-  woke it, but perf gets them only from the scheduler's tracepoints, which
-  need root.
+  Where uhr's eBPF programs sample, they add when each blocked thread was
+  woken and what woke it, see [below](#ebpf-on-linux).
 - The cost of context switches grows with how often the target switches. A
   pipe ping-pong between two threads, 125,000 switches a second, ran 1.6
   times as long under CPU sampling alone and 2.2 times with context
@@ -266,6 +265,25 @@ from tracepoints, such as wakeups and syscall latency.
   call still runs them, which a program making millions of quick calls
   notices, and while they run every process's syscalls take the kernel's
   slower path for traced ones.
+- With context switches, they see the kernel wake each of the target's
+  threads that slept, at the scheduler's `sched_waking` raw tracepoint,
+  which runs in the waker. They take when, the thread that woke it and its
+  name, and its stack: the kernel's frames, and its user frames if it is
+  one of the target's, walked or copied as samples' are. A thread or an
+  interrupt wakes a thread: a timer's at the end of a sleep or a timeout, or
+  a device's, which runs in whatever thread it interrupted. To tell them
+  apart they read the kernel's preempt count, in each CPU's own area on
+  x86-64, which they find from `__per_cpu_offset` in `/proc/kallsyms` and
+  the count's place in the kernel's BTF, and in the task on arm64. An
+  interrupt's stack ends at the kernel's entry for it, as the code it
+  interrupted had no part in it, and has no user frames. The kernel also
+  wakes a thread about to sleep that is still on its run queue, which then
+  runs on without sleeping; they leave those out. uhr ends each blocked
+  thread's time off CPU with the last wakeup since it last ran. Wakeups
+  have a ring buffer of their own, as big as the samples', so a target that
+  wakes its threads often can't crowd samples out; those that find it full
+  are lost events. They see wakeups only where they sample, not with
+  `--sampler perf`, and `--no-wakeups` leaves them out.
 - They follow the processes the target starts until the last thread of
   each exits, and sample and count a launched target from its exec on.
   They start before perf, so that uhr falls back to perf where they can't
@@ -291,7 +309,12 @@ from tracepoints, such as wakeups and syscall latency.
   leaves, which takes 23 ns a read with the virtual machine's kvm-clock.
   A skipped syscall's calls took 38 ns longer, as they still run the
   programs, which then return at once. Without counting, syscalls take no
-  longer.
+  longer. A wakeup of the target's took 2.6 µs, 1.3 of it walking the
+  kernel's stack and 0.8 the waker's user stack, and 3.4 µs with
+  `--unwind dwarf`. Two threads handing a byte back and forth through pipes,
+  two wakeups a round trip, took 15.8 µs a round trip alone, 22 µs under
+  uhr without wakeups and 27.7 µs with them. Other processes' wakeups
+  return at once.
 - Building them needs nightly Rust with `rust-src`, and `bpf-linker`.
   Without those uhr builds without them.
 

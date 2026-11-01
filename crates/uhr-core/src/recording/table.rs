@@ -178,6 +178,31 @@ impl Table {
         self.lists::<UInt64Type>(column)
     }
 
+    /// Columns added to the format since recordings were first written,
+    /// which read as all null from a recording without them.
+    pub fn added_u32(&self, column: &str) -> Result<Vec<Option<u32>>> {
+        self.added(column, Self::optional_u32)
+    }
+
+    pub fn added_u64(&self, column: &str) -> Result<Vec<Option<u64>>> {
+        self.added(column, Self::optional_u64)
+    }
+
+    pub fn added_string(&self, column: &str) -> Result<Vec<Option<String>>> {
+        self.added(column, Self::optional_string)
+    }
+
+    fn added<T: Clone>(
+        &self,
+        column: &str,
+        read: fn(&Self, &str) -> Result<Vec<Option<T>>>,
+    ) -> Result<Vec<Option<T>>> {
+        match self.batch.column_by_name(column) {
+            Some(_) => read(self, column),
+            None => Ok(vec![None; self.len()]),
+        }
+    }
+
     fn lists<T: ArrowPrimitiveType>(&self, column: &str) -> Result<Vec<Vec<T::Native>>> {
         let array = self.array::<ListArray>(column)?;
         self.check_no_nulls(column, array)?;

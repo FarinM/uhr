@@ -167,6 +167,10 @@ pub enum Signal {
     /// The stack of each thread going off CPU.
     #[serde(rename = "off_cpu_stacks")]
     OffCPUStacks,
+    /// When each thread that blocked was woken, and what woke it, with its
+    /// stack.
+    #[serde(rename = "wakeups")]
+    Wakeups,
     /// How often each thread called each syscall, and how long the calls
     /// took.
     #[serde(rename = "syscall_calls")]
@@ -195,6 +199,7 @@ impl Signal {
             Signal::KernelStacks => "kernel_stacks",
             Signal::OffCPUTime => "off_cpu_time",
             Signal::OffCPUStacks => "off_cpu_stacks",
+            Signal::Wakeups => "wakeups",
             Signal::SyscallCalls => "syscall_calls",
             Signal::PageFaults => "page_faults",
             Signal::ResidentMemory => "resident_memory",

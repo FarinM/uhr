@@ -58,14 +58,34 @@ pub mod event {
     /// A tick of the CPU's clock.
     pub const CPU_CLOCK: u32 = 0;
     pub const PAGE_FAULT: u32 = 1;
+    /// The kernel waking one of the target's threads that slept. The
+    /// sample is of what the CPU ran as it did, and a `Wakeup` follows its
+    /// header.
+    pub const WAKEUP: u32 = 2;
+}
+
+/// The thread a wakeup woke, and what woke it.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct Wakeup {
+    pub tgid: u32,
+    pub tid: u32,
+    /// 1 if the CPU ran an interrupt, which woke the thread rather than
+    /// the thread it interrupted, which the sample is of. Then the sample
+    /// has only its kernel frames.
+    pub interrupt: u32,
+    pub pad: u32,
+    /// The name of the thread the CPU ran.
+    pub comm: [u8; 16],
 }
 
 /// The most bytes of user stack a sample copies, as perf's limit.
 pub const MAX_STACK_COPY: usize = 65528;
 
-/// What precedes a sample's frames in the ring buffer: its kernel frames,
-/// then its user frames, each leaf first. A sample with a stack copy has
-/// no user frames, but then `UserRegisters` and the copy.
+/// What starts a sample in the ring buffer. Then come, after a wakeup's
+/// `Wakeup`, its kernel frames, then its user frames, each leaf first. A
+/// sample with a stack copy has no user frames, but then `UserRegisters`
+/// and the copy.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct SampleHeader {

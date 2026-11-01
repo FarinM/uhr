@@ -1,5 +1,5 @@
-//! uhr's own eBPF programs, which sample the target's stacks and count and
-//! time its syscalls.
+//! uhr's own eBPF programs, which sample the target's stacks, see its
+//! threads woken, and count and time its syscalls.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error as _;
@@ -26,7 +26,7 @@ use aya::{Btf, Ebpf, EbpfLoader};
 use syscalls::Sysno;
 use tracing::warn;
 use uhr_core::recording::SyscallCalls;
-use uhr_ebpf::{ACTIVE, CallKey, Calls, HELD, SampleHeader, Start, UserRegisters};
+use uhr_ebpf::{ACTIVE, CallKey, Calls, HELD, SampleHeader, Start, UserRegisters, event};
 
 use crate::btf;
 use crate::interpreters::{Finder, Interpreters, Maps, Walked};
@@ -52,6 +52,13 @@ pub enum Error {
     Btf(#[source] aya::BtfError),
     #[error("uhr's eBPF programs have no {0}")]
     Missing(&'static str),
+    #[error("without the kernel's BTF, uhr's eBPF programs can't tell which thread it woke")]
+    NoTaskLayout,
+    #[error(
+        "uhr's eBPF programs found no preempt count to tell the kernel's interrupts apart from \
+         the threads they interrupt"
+    )]
+    NoPreemptCount,
     #[error(
         "uhr runs in a PID namespace of its own, as in a container, and its eBPF programs know \
          processes by their ids outside it"
@@ -120,6 +127,10 @@ const SYSCALLS: [&str; 2] = ["sys_enter", "sys_exit"];
 
 const SAMPLER: &str = "sample";
 
+/// The program that sees the target's threads woken, at the raw tracepoint
+/// of its name.
+const WAKER: &str = "sched_waking";
+
 /// The sampler at page faults.
 const FAULT_SAMPLER: &str = "sample_fault";
 
@@ -159,6 +170,8 @@ pub(crate) struct Options {
     /// Syscalls not to count, of those `syscalls` counts.
     pub(crate) skipped: Vec<Sysno>,
     pub(crate) sampling: Option<Sampling>,
+    /// See the target's threads woken, if they sample.
+    pub(crate) wakeups: bool,
 }
 
 /// Sampling at every tick of each CPU's clock, `period_ns` apart, into
@@ -193,6 +206,9 @@ pub(crate) struct Samples {
 pub(crate) struct Found {
     pub(crate) syscalls: Option<Counted>,
     pub(crate) samples: Option<Samples>,
+    /// Whether they saw the target's threads woken, with the wakeups that
+    /// found their ring buffer full, or why not.
+    pub(crate) wakeups: Option<Result<u64, Error>>,
     /// Processes the target started that found the programs' table of
     /// processes full, which they then did not follow.
     pub(crate) unfollowed: u64,
@@ -221,6 +237,7 @@ pub(crate) struct Programs {
     tracepoints: Vec<(&'static str, TracePointLinkId)>,
     syscalls: Option<Vec<(&'static str, RawTracePointLinkId)>>,
     mapping: Option<FExitLinkId>,
+    wakeups: Option<Result<RawTracePointLinkId, Error>>,
     /// By CPU, with when each was attached.
     sampler: BTreeMap<u32, (Links, u64)>,
     period_ns: u64,
@@ -268,8 +285,9 @@ impl Programs {
     /// starts, which they count and sample from `begin` on, or for a target
     /// `held` before its exec, from the exec.
     pub(crate) fn start(pid: u32, held: bool, options: &Options) -> Result<Self, Error> {
-        let layout = Layout::read();
-        let mut ebpf = load(options.sampling.as_ref(), layout)?;
+        let wakeups = options.wakeups && options.sampling.is_some();
+        let layout = Layout::read(wakeups);
+        let mut ebpf = load(options.sampling.as_ref(), wakeups, layout)?;
         let targets = ebpf.map_mut("TARGETS").ok_or(Error::Missing("TARGETS"))?;
         let mut targets: HashMap<_, u32, u8> =
             HashMap::try_from(targets).map_err(|e| Error::Map("TARGETS", e))?;
@@ -309,6 +327,7 @@ impl Programs {
             tracepoints,
             syscalls,
             mapping: None,
+            wakeups: None,
             sampler: BTreeMap::new(),
             period_ns: 0,
             fault_period: None,
@@ -326,17 +345,39 @@ impl Programs {
             ended: None,
         };
         if let Some(sampling) = &options.sampling {
-            programs.sample(sampling)?;
+            programs.sample(sampling, wakeups)?;
+            if wakeups {
+                programs.wakeups = Some(programs.watch_wakeups(layout));
+            }
         }
         Ok(programs)
     }
 
-    fn sample(&mut self, sampling: &Sampling) -> Result<(), Error> {
-        let ring = self
-            .ebpf
-            .take_map("SAMPLES")
-            .ok_or(Error::Missing("SAMPLES"))?;
-        let ring = RingBuf::try_from(ring).map_err(|e| Error::Map("SAMPLES", e))?;
+    /// Their ring buffer is read with the samples', so this comes after
+    /// `sample`.
+    fn watch_wakeups(&mut self, layout: Layout) -> Result<RawTracePointLinkId, Error> {
+        if layout.woken.is_none() {
+            return Err(Error::NoTaskLayout);
+        }
+        if layout.preempt_count.is_none() {
+            return Err(Error::NoPreemptCount);
+        }
+        let waker = raw_tracepoint(&mut self.ebpf, WAKER)?;
+        waker
+            .load()
+            .and_then(|()| waker.attach(WAKER))
+            .map_err(|e| Error::Program(WAKER, e))
+    }
+
+    /// Samples, and reads wakeups with the samples if `wakeups`.
+    fn sample(&mut self, sampling: &Sampling, wakeups: bool) -> Result<(), Error> {
+        let mut rings = Vec::new();
+        for (name, wanted) in [("SAMPLES", true), ("WAKEUPS", wakeups)] {
+            if wanted {
+                let ring = self.ebpf.take_map(name).ok_or(Error::Missing(name))?;
+                rings.push(RingBuf::try_from(ring).map_err(|e| Error::Map(name, e))?);
+            }
+        }
         sampler_program(&mut self.ebpf)?
             .load()
             .map_err(|e| Error::Program(SAMPLER, e).or_not_permitted())?;
@@ -397,7 +438,7 @@ impl Programs {
             threads: aya::maps::HashMap::try_from(threads).map_err(|e| Error::Map("THREADS", e))?,
         };
         let finder = Finder::start(maps, sampling.stack_bytes.is_none());
-        self.reader = Some(Reader::start(ring, &sampling.path, finder.sender())?);
+        self.reader = Some(Reader::start(rings, &sampling.path, finder.sender())?);
         self.finder = Some(finder);
         Ok(())
     }
@@ -553,6 +594,7 @@ impl Programs {
             tracepoints,
             syscalls,
             mapping,
+            wakeups,
             sampler,
             fault_period,
             late_cpus,
@@ -603,6 +645,17 @@ impl Programs {
             let info = tracepoint.info().map_err(|e| Error::Program(program, e))?;
             programs.push(format!("{:016x}", info.tag()));
         }
+        let watched = match wakeups {
+            Some(Ok(link)) => {
+                let waker = raw_tracepoint(&mut ebpf, WAKER)?;
+                waker.detach(link).map_err(|e| Error::Program(WAKER, e))?;
+                let info = waker.info().map_err(|e| Error::Program(WAKER, e))?;
+                programs.push(format!("{:016x}", info.tag()));
+                Some(Ok(()))
+            }
+            Some(Err(error)) => Some(Err(error)),
+            None => None,
+        };
         if let Some(link) = mapping {
             let program = fexit(&mut ebpf, MAPPING.0)?;
             program
@@ -637,10 +690,17 @@ impl Programs {
         } else {
             None
         };
+        // After the reader, which has the last of them.
+        let wakeups = match watched {
+            Some(Ok(())) => Some(Ok(sum(&mut ebpf, "WAKEUPS_DROPPED")?)),
+            Some(Err(error)) => Some(Err(error)),
+            None => None,
+        };
         Ok(Stopped {
             found: Found {
                 syscalls,
                 samples,
+                wakeups,
                 unfollowed: sum(&mut ebpf, "UNFOLLOWED")?,
                 late_cpus,
                 unsampled_cpus: unsampled_cpus.len() as u32,
@@ -716,8 +776,8 @@ fn sum(ebpf: &mut Ebpf, name: &'static str) -> Result<u64, Error> {
     Ok(values.iter().sum())
 }
 
-/// Copies samples from the ring buffer to a file while recording, each
-/// after its length as a 32-bit number.
+/// Copies samples, and wakeups, from their ring buffers to a file while
+/// recording, each after its length as a 32-bit number.
 struct Reader {
     stop: Arc<AtomicBool>,
     /// `None` once joined.
@@ -726,7 +786,11 @@ struct Reader {
 }
 
 impl Reader {
-    fn start(ring: RingBuf<MapData>, path: &Path, walked: Sender<Walked>) -> Result<Self, Error> {
+    fn start(
+        rings: Vec<RingBuf<MapData>>,
+        path: &Path,
+        walked: Sender<Walked>,
+    ) -> Result<Self, Error> {
         let error = |source| Error::Samples {
             path: path.to_owned(),
             source,
@@ -735,7 +799,7 @@ impl Reader {
         let stop = Arc::new(AtomicBool::new(false));
         let thread = {
             let stop = stop.clone();
-            thread::spawn(move || copy(ring, BufWriter::new(file), &stop, &walked))
+            thread::spawn(move || copy(rings, BufWriter::new(file), &stop, &walked))
         };
         Ok(Self {
             stop,
@@ -776,7 +840,7 @@ fn create_private(path: &Path) -> io::Result<File> {
 }
 
 fn copy(
-    mut ring: RingBuf<MapData>,
+    mut rings: Vec<RingBuf<MapData>>,
     mut out: BufWriter<File>,
     stop: &AtomicBool,
     walked: &Sender<Walked>,
@@ -784,12 +848,14 @@ fn copy(
     loop {
         // Before the last read, so that it gets every sample from before.
         let stopping = stop.load(Ordering::Acquire);
-        while let Some(sample) = ring.next() {
-            out.write_all(&(sample.len() as u32).to_le_bytes())?;
-            out.write_all(&sample)?;
-            if let Some(found) = walked_frames(&sample) {
-                // Gone only once uhr stops sampling.
-                let _ = walked.send(found);
+        for ring in &mut rings {
+            while let Some(sample) = ring.next() {
+                out.write_all(&(sample.len() as u32).to_le_bytes())?;
+                out.write_all(&sample)?;
+                if let Some(found) = walked_frames(&sample) {
+                    // Gone only once uhr stops sampling.
+                    let _ = walked.send(found);
+                }
             }
         }
         if stopping {
@@ -800,11 +866,15 @@ fn copy(
 }
 
 /// What a sample says of its interpreter frames, which follow all else.
+/// `None` for a wakeup, which walks none, and can be of any process.
 fn walked_frames(sample: &[u8]) -> Option<Walked> {
     // SAFETY: plain numbers, any bits of which are valid.
     let header: SampleHeader = unsafe {
         std::ptr::read_unaligned(sample.get(..size_of::<SampleHeader>())?.as_ptr().cast())
     };
+    if header.event == event::WAKEUP {
+        return None;
+    }
     let user_words = header.user_frames as usize * (1 + header.frame_ends as usize);
     let frames = (header.kernel_frames as usize + user_words) * 8;
     let copy = match header.copy {
@@ -828,7 +898,7 @@ fn walked_frames(sample: &[u8]) -> Option<Walked> {
 /// goes on without the one that counts the times processes map code, so
 /// why that can't load, if it can't, comes apart.
 pub fn check() -> Result<Option<Error>, Error> {
-    let mut ebpf = load(None, Layout::default())?;
+    let mut ebpf = load(None, false, Layout::default())?;
     for (program, ..) in FOLLOWERS.into_iter().chain([LET_GO, LET_GO_LATE]) {
         tracepoint(&mut ebpf, program)?
             .load()
@@ -851,6 +921,9 @@ pub fn check() -> Result<Option<Error>, Error> {
             .load()
             .map_err(|e| Error::Program(program, e).or_not_permitted())?;
     }
+    raw_tracepoint(&mut ebpf, WAKER)?
+        .load()
+        .map_err(|e| Error::Program(WAKER, e).or_not_permitted())?;
     Ok(load_mapping(&mut ebpf).err())
 }
 
@@ -914,24 +987,90 @@ struct Layout {
     /// Where a `task_struct` keeps the user thread pointer, which
     /// thread-locals are found from.
     thread_pointer: Option<u32>,
+    /// `task_struct.tgid`, `pid` and `on_rq`: whose a woken thread is, and
+    /// whether it slept.
+    woken: Option<(u32, u32, u32)>,
+    preempt_count: Option<PreemptCount>,
+}
+
+/// Where the kernel keeps the preempt count, which says whether the CPU
+/// runs an interrupt.
+#[derive(Clone, Copy)]
+struct PreemptCount {
+    /// The address of `__per_cpu_offset`, which holds each CPU's area by
+    /// CPU, or 0 for a count kept in each task.
+    per_cpu_offsets: u64,
+    /// How far into the CPU's area, or the task, it is.
+    at: u64,
 }
 
 impl Layout {
-    fn read() -> Self {
-        let [task_flags, signal, live, exec_id, thread_pointer] = btf::kernel_member_offsets([
+    /// With where the preempt count is if `wakeups`, which can take reading
+    /// the kernel's symbols.
+    fn read(wakeups: bool) -> Self {
+        let [
+            task_flags,
+            signal,
+            live,
+            exec_id,
+            thread_pointer,
+            tgid,
+            pid,
+            on_rq,
+            in_task,
+            in_cpu,
+        ] = btf::kernel_member_offsets([
             ("task_struct", "flags"),
             ("task_struct", "signal"),
             ("signal_struct", "live"),
             ("task_struct", "self_exec_id"),
             ("task_struct", btf::THREAD_POINTER),
+            ("task_struct", "tgid"),
+            ("task_struct", "pid"),
+            ("task_struct", "on_rq"),
+            ("task_struct", "thread_info.preempt_count"),
+            ("pcpu_hot", "preempt_count"),
         ]);
         Self {
             task_flags,
             exits: signal.zip(live),
             exec_id,
             thread_pointer,
+            woken: tgid.zip(pid).zip(on_rq).map(|((t, p), o)| (t, p, o)),
+            preempt_count: wakeups.then(|| preempt_count(in_task, in_cpu)).flatten(),
         }
     }
+}
+
+/// arm64 keeps the count in the task.
+#[cfg(target_arch = "aarch64")]
+fn preempt_count(in_task: Option<u32>, _in_cpu: Option<u32>) -> Option<PreemptCount> {
+    Some(PreemptCount {
+        per_cpu_offsets: 0,
+        at: in_task?.into(),
+    })
+}
+
+/// x86-64 keeps the count in each CPU's area: as a variable of its own, or
+/// from Linux 6.2 in `pcpu_hot`, at `in_cpu`.
+#[cfg(target_arch = "x86_64")]
+fn preempt_count(_in_task: Option<u32>, in_cpu: Option<u32>) -> Option<PreemptCount> {
+    let [offsets, alone, hot] =
+        crate::kallsyms::addresses(["__per_cpu_offset", "__preempt_count", "pcpu_hot"]);
+    let at = match alone {
+        Some(at) => at,
+        None => hot? + u64::from(in_cpu?),
+    };
+    Some(PreemptCount {
+        // 0 where the kernel hides its addresses.
+        per_cpu_offsets: offsets.filter(|&a| a != 0)?,
+        at,
+    })
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+fn preempt_count(_in_task: Option<u32>, _in_cpu: Option<u32>) -> Option<PreemptCount> {
+    None
 }
 
 /// The ring buffer's size for samples with stack copies from `cpus` CPUs,
@@ -942,7 +1081,9 @@ fn copy_buffer(cpus: usize) -> u32 {
     size.next_power_of_two() as u32
 }
 
-fn load(sampling: Option<&Sampling>, layout: Layout) -> Result<Ebpf, Error> {
+/// Loads the programs, with room in their ring buffers for `sampling`, and
+/// for wakeups if `wakeups`.
+fn load(sampling: Option<&Sampling>, wakeups: bool, layout: Layout) -> Result<Ebpf, Error> {
     let stack_bytes = sampling.and_then(|s| s.stack_bytes);
     // A copy of the stack for each CPU, which the kernel wants room for in
     // every one it may bring online.
@@ -958,23 +1099,39 @@ fn load(sampling: Option<&Sampling>, layout: Layout) -> Result<Ebpf, Error> {
         // Without sampling, the smallest size the kernel allows, a page.
         (None, _) => rustix::param::page_size() as u32,
     };
+    // As many as samples, at most.
+    let wakeup_size = match wakeups {
+        true => size,
+        false => rustix::param::page_size() as u32,
+    };
     let max_stack = sampling.map_or(uhr_ebpf::MAX_FRAMES as u32, |s| s.max_stack);
     let stack_bytes = stack_bytes.unwrap_or(0);
     let task_flags = layout.task_flags.unwrap_or(u32::MAX);
     let exec_id = layout.exec_id.unwrap_or(u32::MAX);
     let thread_pointer = layout.thread_pointer.unwrap_or(u32::MAX);
     let (signal, live) = layout.exits.unwrap_or((u32::MAX, u32::MAX));
+    let (tgid, pid, on_rq) = layout.woken.unwrap_or((u32::MAX, u32::MAX, u32::MAX));
+    let (per_cpu_offsets, preempt_count) = layout
+        .preempt_count
+        .map_or((0, u64::MAX), |p| (p.per_cpu_offsets, p.at));
     #[cfg(uhr_ebpf)]
     {
         check_namespace()?;
         EbpfLoader::new()
             .map_max_entries("SAMPLES", size)
+            .map_max_entries("WAKEUPS", wakeup_size)
             .map_max_entries("COPIES", copies)
+            .map_max_entries("WOKEN_COPIES", copies)
             .override_global("MAX_STACK", &max_stack, CAN_SAMPLE)
             .override_global("STACK_BYTES", &stack_bytes, CAN_SAMPLE)
             .override_global("TASK_FLAGS", &task_flags, CAN_SAMPLE)
             .override_global("TASK_EXEC_ID", &exec_id, CAN_SAMPLE)
             .override_global("TASK_THREAD_POINTER", &thread_pointer, CAN_SAMPLE)
+            .override_global("TASK_TGID", &tgid, CAN_SAMPLE)
+            .override_global("TASK_PID", &pid, CAN_SAMPLE)
+            .override_global("TASK_ON_RQ", &on_rq, CAN_SAMPLE)
+            .override_global("PER_CPU_OFFSETS", &per_cpu_offsets, CAN_SAMPLE)
+            .override_global("PREEMPT_COUNT", &preempt_count, CAN_SAMPLE)
             .override_global("TASK_SIGNAL", &signal, true)
             .override_global("SIGNAL_LIVE", &live, true)
             .load(PROGRAMS)
@@ -984,12 +1141,18 @@ fn load(sampling: Option<&Sampling>, layout: Layout) -> Result<Ebpf, Error> {
     {
         let _ = (
             size,
+            wakeup_size,
             max_stack,
             stack_bytes,
             task_flags,
             signal,
             live,
             thread_pointer,
+            tgid,
+            pid,
+            on_rq,
+            per_cpu_offsets,
+            preempt_count,
         );
         let _ = EbpfLoader::new;
         Err(Error::NotBuilt)

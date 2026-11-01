@@ -166,6 +166,7 @@ fn with_off_cpu(mut recording: Recording) -> Recording {
         tid,
         state,
         stack,
+        wakeup: None,
     };
     recording.off_cpu = vec![
         interval(1, 2_000, 10_000, ThreadState::Blocked, Some(0)),

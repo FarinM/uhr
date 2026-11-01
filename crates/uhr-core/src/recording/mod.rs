@@ -492,6 +492,29 @@ pub struct OffCPUInterval {
     pub state: ThreadState,
     /// Where it was switched out. `None` if its stack was not recorded.
     pub stack: Option<u32>,
+    /// When it was woken, for a blocked thread, which from then on waited
+    /// for a CPU. `None` if its wakeup was not recorded.
+    pub wakeup: Option<Wakeup>,
+}
+
+/// When a thread that blocked was woken, and what woke it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Wakeup {
+    pub time_ns: u64,
+    pub waker: Waker,
+    /// Where the kernel was asked to wake it: the kernel's frames, and the
+    /// waking thread's own if it is one of the target's. `None` if not
+    /// recorded.
+    pub stack: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Waker {
+    /// A thread, the target's or another process's, by the name it had.
+    Thread { pid: u32, tid: u32, name: String },
+    /// An interrupt, such as a timer's or a device's, or the kernel's work
+    /// deferred from one.
+    Interrupt,
 }
 
 /// Why a thread was off CPU.
@@ -501,8 +524,8 @@ pub enum ThreadState {
     /// Preempted: it could have run, but had to wait for a CPU.
     Runnable,
     /// It gave up the CPU to wait: for a lock, I/O, a timer or another
-    /// thread. Once woken, it can wait for a CPU too, and that time counts
-    /// here as well.
+    /// thread. Once woken, it can wait for a CPU too, from its wakeup where
+    /// that is known.
     Blocked,
     /// It was off CPU already when an attached capture started, so whether
     /// it was preempted or blocked is not known.
@@ -787,6 +810,39 @@ impl Recording {
                 Column::u32("tid", off_cpu.iter().map(|i| i.tid).collect()),
                 Column::string("state", off_cpu.iter().map(|i| i.state.as_str()).collect()),
                 Column::optional_u32("stack_id", off_cpu.iter().map(|i| i.stack).collect()),
+                Column::optional_u64(
+                    "woken_ns",
+                    off_cpu
+                        .iter()
+                        .map(|i| Some(i.wakeup.as_ref()?.time_ns))
+                        .collect(),
+                ),
+                Column::optional_string(
+                    "woken_by",
+                    off_cpu
+                        .iter()
+                        .map(|i| match i.wakeup.as_ref()?.waker {
+                            Waker::Thread { .. } => Some("thread"),
+                            Waker::Interrupt => Some("interrupt"),
+                        })
+                        .collect(),
+                ),
+                Column::optional_u32(
+                    "waker_pid",
+                    off_cpu.iter().map(|i| Some(waker(i)?.0)).collect(),
+                ),
+                Column::optional_u32(
+                    "waker_tid",
+                    off_cpu.iter().map(|i| Some(waker(i)?.1)).collect(),
+                ),
+                Column::optional_string(
+                    "waker_name",
+                    off_cpu.iter().map(|i| Some(waker(i)?.2)).collect(),
+                ),
+                Column::optional_u32(
+                    "waker_stack_id",
+                    off_cpu.iter().map(|i| i.wakeup.as_ref()?.stack).collect(),
+                ),
             ],
         )?;
 
@@ -978,6 +1034,27 @@ impl Recording {
             }
             if let Some(stack) = interval.stack {
                 check_id("off-CPU interval", index, "stack", stack, self.stacks.len())?;
+            }
+            if let Some(wakeup) = &interval.wakeup {
+                if interval.state != ThreadState::Blocked {
+                    return Err(format!(
+                        "off-CPU interval {index} was woken, but did not block"
+                    ));
+                }
+                if !(interval.start_ns..=interval.end_ns).contains(&wakeup.time_ns) {
+                    return Err(format!(
+                        "off-CPU interval {index} was woken outside its time off CPU"
+                    ));
+                }
+                if let Some(stack) = wakeup.stack {
+                    check_id(
+                        "off-CPU interval",
+                        index,
+                        "waker stack",
+                        stack,
+                        self.stacks.len(),
+                    )?;
+                }
             }
         }
         for (index, symbol) in self.kernel_symbols.iter().enumerate() {
@@ -1222,8 +1299,37 @@ fn read_off_cpu(dir: &Path) -> Result<Vec<OffCPUInterval>> {
     let tid = table.u32("tid")?;
     let state = table.string("state")?;
     let stack = table.optional_u32("stack_id")?;
+    let woken_ns = table.added_u64("woken_ns")?;
+    let woken_by = table.added_string("woken_by")?;
+    let waker_pid = table.added_u32("waker_pid")?;
+    let waker_tid = table.added_u32("waker_tid")?;
+    let waker_name = table.added_string("waker_name")?;
+    let waker_stack = table.added_u32("waker_stack_id")?;
     (0..table.len())
         .map(|i| {
+            let waker = match (woken_by[i].as_deref(), waker_pid[i], waker_tid[i]) {
+                (None, ..) => None,
+                (Some("thread"), Some(pid), Some(tid)) => Some(Waker::Thread {
+                    pid,
+                    tid,
+                    name: waker_name[i].clone().unwrap_or_default(),
+                }),
+                (Some("interrupt"), None, None) => Some(Waker::Interrupt),
+                (Some(by), ..) => {
+                    return Err(
+                        table.invalid(format!("woken by {by:?}, with waker ids that don't fit"))
+                    );
+                }
+            };
+            let wakeup = match (woken_ns[i], waker) {
+                (Some(time_ns), Some(waker)) => Some(Wakeup {
+                    time_ns,
+                    waker,
+                    stack: waker_stack[i],
+                }),
+                (None, None) => None,
+                _ => return Err(table.invalid("woken_ns and woken_by must be set together")),
+            };
             Ok(OffCPUInterval {
                 start_ns: start_ns[i],
                 end_ns: end_ns[i],
@@ -1231,9 +1337,18 @@ fn read_off_cpu(dir: &Path) -> Result<Vec<OffCPUInterval>> {
                 tid: tid[i],
                 state: ThreadState::parse(&state[i]).map_err(|reason| table.invalid(reason))?,
                 stack: stack[i],
+                wakeup,
             })
         })
         .collect()
+}
+
+/// The thread that woke `interval`, and its name.
+fn waker(interval: &OffCPUInterval) -> Option<(u32, u32, &str)> {
+    match &interval.wakeup.as_ref()?.waker {
+        Waker::Thread { pid, tid, name } => Some((*pid, *tid, name.as_str())),
+        Waker::Interrupt => None,
+    }
 }
 
 /// The tag and name of a BPF program, from its kernel symbol

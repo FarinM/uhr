@@ -164,6 +164,11 @@ struct RecordArgs {
     /// switch often, but then nothing says why threads were off CPU
     #[arg(long)]
     no_off_cpu: bool,
+    /// Don't see when each thread that slept was woken, and what woke it,
+    /// which takes a stack at each wakeup. uhr's eBPF programs see wakeups
+    /// when they sample
+    #[arg(long)]
+    no_wakeups: bool,
     /// Don't set the variables that make runtimes, such as Python 3.12
     /// and later and Node, name the code they compile, and glibc the
     /// memory it maps. That costs them a little time, and without it
@@ -568,6 +573,7 @@ fn run_record(args: RecordArgs) -> Result<ExitCode> {
         frequency_hz: args.frequency,
         unwind,
         off_cpu: !args.no_off_cpu,
+        wakeups: !args.no_wakeups,
         runtime_support: !args.no_runtime_support,
         syscalls: !args.no_syscalls,
         skipped_syscalls,

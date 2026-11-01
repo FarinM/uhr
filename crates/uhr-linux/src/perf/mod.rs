@@ -122,6 +122,9 @@ pub struct RecordOptions {
     /// Record every context switch, with the stack of each thread going
     /// off CPU.
     pub off_cpu: bool,
+    /// With `off_cpu`, see when each thread that slept was woken, and what
+    /// woke it, where uhr's eBPF programs sample.
+    pub wakeups: bool,
     /// Set the variables that make runtimes, such as Python 3.12 and later
     /// and Node, name the code they compile in perf maps.
     pub runtime_support: bool,
@@ -280,6 +283,10 @@ pub fn record(options: &RecordOptions, interrupts: &Interrupts, out: &Path) -> R
         .and_then(|found| found.as_ref().ok()?.samples.as_ref());
     let interpreters = ebpf_samples.map_or(&none, |samples| &samples.interpreters);
     let page_faults = ebpf_samples.is_some_and(|samples| samples.fault_period.is_some());
+    let wakeups = found
+        .as_ref()
+        .and_then(|found| found.as_ref().ok())
+        .is_some_and(|found| matches!(found.wakeups, Some(Ok(_))));
     let ebpf_samples = match tick.as_ref().filter(|_| !ended.perf_sampled) {
         Some(_) if let Some(Err(error)) = found => {
             remove_staging(&staging);
@@ -291,6 +298,7 @@ pub fn record(options: &RecordOptions, interrupts: &Interrupts, out: &Path) -> R
             stack_bytes: tick.stack_bytes,
             interpreters,
             page_faults,
+            wakeups,
         }),
         None => None,
     };
@@ -373,6 +381,7 @@ pub fn record(options: &RecordOptions, interrupts: &Interrupts, out: &Path) -> R
         found,
         ebpf_stacks.zip(sampling),
         options.syscalls.then_some(&options.skipped_syscalls[..]),
+        options.off_cpu && options.wakeups,
         matches!(ready, Ready::Attach { .. }),
     );
     add_memory(&mut recording, ended.memory, ended.glibc_names);
@@ -509,27 +518,46 @@ fn add_memory(
 }
 
 /// Adds what uhr's eBPF programs found as a stream of their own, or says
-/// why the syscalls were not counted. `sampled` is the coverage of the
-/// stacks they sampled, and how they sampled. `syscalls` is the syscalls
-/// they were to leave uncounted, if they were to count.
+/// why the syscalls were not counted, and the wakeups not seen. `sampled`
+/// is the coverage of the stacks they sampled, and how they sampled.
+/// `syscalls` is the syscalls they were to leave uncounted, if they were to
+/// count, and `wakeups` whether they were to see wakeups.
 fn add_ebpf(
     recording: &mut Recording,
     found: Option<Result<ebpf::Found, ebpf::Error>>,
     sampled: Option<(convert::EbpfStacks, recording::Sampling)>,
     syscalls: Option<&[Sysno]>,
+    wakeups: bool,
     attached: bool,
 ) {
+    let not_sampled = "uhr's eBPF programs see wakeups only where they sample CPU time, and perf \
+                       sampled it";
     let found = match found {
         Some(Ok(found)) => found,
-        Some(Err(error)) if syscalls.is_some() => {
-            recording.manifest.missing_signals.push(MissingSignal {
-                signal: recording::Signal::SyscallCalls,
-                reason: error.reason(),
-            });
+        Some(Err(error)) => {
+            let missing = [
+                (recording::Signal::SyscallCalls, syscalls.is_some()),
+                (recording::Signal::Wakeups, wakeups),
+            ];
+            for (signal, _) in missing.into_iter().filter(|&(_, asked)| asked) {
+                recording.manifest.missing_signals.push(MissingSignal {
+                    signal,
+                    reason: error.reason(),
+                });
+            }
             return;
         }
-        _ => return,
+        None => {
+            if wakeups {
+                recording.manifest.missing_signals.push(MissingSignal {
+                    signal: recording::Signal::Wakeups,
+                    reason: not_sampled.into(),
+                });
+            }
+            return;
+        }
     };
+    let mut missing_signals = Vec::new();
     let mut signals = Vec::new();
     let mut known_biases = Vec::new();
     let mut lost_events = 0;
@@ -578,6 +606,32 @@ fn add_ebpf(
                 .map(String::from),
             );
         }
+    }
+    match &found.wakeups {
+        Some(Ok(dropped)) => {
+            signals.push(recording::Signal::Wakeups);
+            known_biases.push(
+                "A wakeup by a thread of a process outside the target has only that thread's \
+                 kernel frames: uhr names the user code of the target's processes only."
+                    .to_owned(),
+            );
+            if *dropped > 0 {
+                known_biases.push(format!(
+                    "{dropped} wakeups found uhr's buffer for them full, so the times off CPU \
+                     they ended say nothing of when the threads were woken."
+                ));
+            }
+            lost_events += dropped;
+        }
+        Some(Err(error)) => missing_signals.push(MissingSignal {
+            signal: recording::Signal::Wakeups,
+            reason: error.reason(),
+        }),
+        None if wakeups => missing_signals.push(MissingSignal {
+            signal: recording::Signal::Wakeups,
+            reason: not_sampled.into(),
+        }),
+        None => {}
     }
     if let Some((stacks, _)) = sampled.as_ref().filter(|(s, _)| s.untracked > 0) {
         known_biases.push(format!(
@@ -704,7 +758,7 @@ fn add_ebpf(
             skipped_syscalls: skipped,
         },
         signals,
-        missing_signals: Vec::new(),
+        missing_signals,
         coverage: StreamCoverage {
             lost_events,
             stacks,
@@ -1072,6 +1126,7 @@ fn start_ebpf(
         syscalls: options.syscalls,
         skipped: options.skipped_syscalls.clone(),
         sampling,
+        wakeups: options.off_cpu && options.wakeups,
     };
     let programs = Programs::start(pid, held, &ebpf_options);
     if let Err(error) = &programs {

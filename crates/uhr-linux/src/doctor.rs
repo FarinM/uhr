@@ -257,6 +257,7 @@ fn probe_recording(perf: &Path) -> Result<bool, String> {
         frequency_hz: 1,
         unwind: Unwind::FramePointers,
         off_cpu: true,
+        wakeups: false,
         runtime_support: false,
         syscalls: false,
         skipped_syscalls: Vec::new(),
