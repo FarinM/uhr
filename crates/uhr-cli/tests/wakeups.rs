@@ -5,7 +5,7 @@
 mod common;
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::thread;
@@ -24,7 +24,7 @@ fn one_at_a_time() -> MutexGuard<'static, ()> {
 }
 
 /// Records `waits` as root with `flags`. `None` where uhr can't be root.
-fn record_waits(name: &str, flags: &[&str]) -> Option<Recording> {
+fn record_waits(name: &str, flags: &[&str]) -> Option<(PathBuf, Recording)> {
     let dir = scratch(name);
     let program = dir.join("waits");
     compile("waits", &program, "-O2");
@@ -33,7 +33,15 @@ fn record_waits(name: &str, flags: &[&str]) -> Option<Recording> {
     args.extend(flags);
     args.extend(["--", program.to_str().unwrap()]);
     uhr_as_root(&args, &recording)?;
-    Some(Recording::read(&recording).unwrap())
+    let read = Recording::read(&recording).unwrap();
+    Some((recording, read))
+}
+
+/// The time off CPU of the overview of `recording`.
+fn off_cpu(recording: &Path) -> serde_json::Value {
+    let args = ["overview", recording.to_str().unwrap(), "--json"];
+    let overview: serde_json::Value = serde_json::from_slice(&uhr(&args).stdout).unwrap();
+    overview["off_cpu"].clone()
 }
 
 /// Each thread's last name.
@@ -66,7 +74,7 @@ fn kernel_functions(recording: &Recording, stack: u32) -> Vec<&str> {
 #[test]
 fn sees_what_woke_each_waiting_thread() {
     let _turn = one_at_a_time();
-    let Some(recording) = record_waits("wakeups", &[]) else {
+    let Some((path, recording)) = record_waits("wakeups", &[]) else {
         eprintln!("skipped: needs root through sudo without a password");
         return;
     };
@@ -113,6 +121,12 @@ fn sees_what_woke_each_waiting_thread() {
         assert!(runnable.clone().count() > 0);
         assert!(runnable.into_iter().all(|i| i.wakeup.is_none()));
     }
+
+    // Once woken, threads waited for a CPU.
+    let time = off_cpu(&path);
+    let woken = time["wakeup_latency_ns"].as_u64().unwrap();
+    let runnable = time["runnable_ns"].as_u64().unwrap();
+    assert!(0 < woken && woken < runnable, "{time}");
 }
 
 #[test]
@@ -163,7 +177,7 @@ fn an_interrupt_wakes_a_thread_rather_than_the_one_it_interrupts() {
 #[test]
 fn sees_no_wakeups_when_asked_not_to() {
     let _turn = one_at_a_time();
-    let Some(recording) = record_waits("no_wakeups", &["--no-wakeups"]) else {
+    let Some((path, recording)) = record_waits("no_wakeups", &["--no-wakeups"]) else {
         eprintln!("skipped: needs root through sudo without a password");
         return;
     };
@@ -178,6 +192,7 @@ fn sees_no_wakeups_when_asked_not_to() {
     assert!(missing.into_iter().all(|m| m.signal != Signal::Wakeups));
     assert!(!recording.off_cpu.is_empty());
     assert!(recording.off_cpu.iter().all(|i| i.wakeup.is_none()));
+    assert!(off_cpu(&path)["wakeup_latency_ns"].is_null());
 }
 
 #[test]

@@ -128,7 +128,8 @@ pub(crate) fn stack_amounts(
         }
     }
     if metric != Metric::OnCPU {
-        for (interval, ns) in filter.off_cpu(recording, functions)? {
+        for (interval, start, end) in filter.off_cpu(recording, functions)? {
+            let ns = end - start;
             match interval.stack {
                 Some(stack) => amounts.by_stack[stack as usize] += ns,
                 None => amounts.no_stack += ns,

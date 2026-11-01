@@ -177,12 +177,44 @@ fn with_off_cpu(mut recording: Recording) -> Recording {
     recording
 }
 
+/// Adds wakeups to `with_off_cpu`'s: the main thread 1 woken at 9000 by
+/// the worker 2, and the second thread 3 at 8600 by an interrupt. The
+/// worker's wakeup was not recorded.
+fn with_wakeups(recording: Recording) -> Recording {
+    let mut recording = with_off_cpu(recording);
+    recording.manifest.streams[0].signals.push(Signal::Wakeups);
+    let wakeup = |time_ns, waker| {
+        Some(Wakeup {
+            time_ns,
+            waker,
+            stack: None,
+        })
+    };
+    let worker = Waker::Thread {
+        pid: 1,
+        tid: 2,
+        name: "worker".into(),
+    };
+    recording.off_cpu[0].wakeup = wakeup(9_000, worker);
+    recording.off_cpu[3].wakeup = wakeup(8_600, Waker::Interrupt);
+    recording
+}
+
 fn off_cpu(intervals: u64, runnable_ns: u64, blocked_ns: u64) -> Option<OffCPUTime> {
     Some(OffCPUTime {
         intervals,
         runnable_ns,
+        wakeup_latency_ns: None,
         blocked_ns,
         unknown_state_ns: 0,
+    })
+}
+
+/// As `off_cpu`, with `woken_ns` of the runnable time after wakeups.
+fn woken(intervals: u64, runnable_ns: u64, woken_ns: u64, blocked_ns: u64) -> Option<OffCPUTime> {
+    Some(OffCPUTime {
+        wakeup_latency_ns: Some(woken_ns),
+        ..off_cpu(intervals, runnable_ns, blocked_ns).unwrap()
     })
 }
 
@@ -548,6 +580,31 @@ fn cuts_off_cpu_time_to_the_time_range() {
     let result = overview(&with_off_cpu(recording()), filter);
     assert_eq!(result.off_cpu, off_cpu(2, 0, 4_800));
     assert_eq!(find(&result, 1, None).blocked_share, Some(0.9));
+}
+
+#[test]
+fn a_blocked_thread_once_woken_waits_for_a_cpu() {
+    let recording = with_wakeups(recording());
+    let result = overview(&recording, Filter::default());
+    assert_eq!(result.off_cpu, woken(4, 1_600, 1_200, 7_700));
+    let main = find(&result, 1, None);
+    assert_eq!(main.off_cpu, woken(1, 1_000, 1_000, 7_000));
+    assert_eq!(
+        (main.runnable_share, main.blocked_share),
+        (Some(0.1), Some(0.7))
+    );
+    assert_eq!(find(&result, 2, Some(1_000)).off_cpu, woken(2, 400, 0, 600));
+
+    let range = |from_ns, to_ns| Filter {
+        from_ns: Some(from_ns),
+        to_ns: Some(to_ns),
+        ..Filter::default()
+    };
+    let result = overview(&recording, range(4_500, 8_500));
+    assert_eq!(result.off_cpu, woken(2, 700, 700, 3_600));
+    // It ends before the main thread was woken.
+    let result = overview(&recording, range(4_500, 7_000));
+    assert_eq!(result.off_cpu, woken(1, 0, 0, 2_500));
 }
 
 #[test]

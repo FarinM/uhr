@@ -138,10 +138,14 @@ pub struct CPUTime {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct OffCPUTime {
     pub intervals: u64,
-    /// Preempted, waiting for a CPU.
+    /// Waiting for a CPU: preempted, or woken but not yet running.
     pub runnable_ns: u64,
-    /// Waiting for something else: a lock, I/O, a timer or another thread.
-    /// Includes the wait for a CPU after it was woken.
+    /// Of `runnable_ns`, the time from threads' wakeups until they ran:
+    /// their wakeup latency. `None` without wakeups.
+    pub wakeup_latency_ns: Option<u64>,
+    /// Waiting for something else: a lock, I/O, a timer or another thread,
+    /// until woken. A wait whose wakeup is not known, as without wakeups,
+    /// counts here whole, with the wait for a CPU after it.
     pub blocked_ns: u64,
     /// Off CPU already when an attached capture started, runnable or
     /// blocked.
@@ -265,7 +269,14 @@ pub fn run(
         .streams
         .iter()
         .any(|s| s.signals.contains(&Signal::OffCPUTime));
-    let no_off_cpu = switches_recorded.then(OffCPUTime::default);
+    let wakeups_recorded = manifest
+        .streams
+        .iter()
+        .any(|s| s.signals.contains(&Signal::Wakeups));
+    let no_off_cpu = switches_recorded.then(|| OffCPUTime {
+        wakeup_latency_ns: wakeups_recorded.then_some(0),
+        ..OffCPUTime::default()
+    });
 
     let lifetimes = Lifetimes::new(recording);
     let names = ThreadNames::new(recording);
@@ -320,14 +331,14 @@ pub fn run(
         threads.entry(id).or_insert_with(|| row(id)).cpu.add(sample);
     }
     let mut off_cpu = no_off_cpu.clone();
-    for (interval, ns) in filter.off_cpu(recording, &functions)? {
+    for (interval, start, end) in filter.off_cpu(recording, &functions)? {
         if let Some(total) = off_cpu.as_mut() {
-            total.add(interval, ns);
+            total.add(interval, start, end);
         }
         let id = lifetimes.of(interval.pid, interval.tid, interval.start_ns);
         let row = threads.entry(id).or_insert_with(|| row(id));
         if let Some(time) = row.off_cpu.as_mut() {
-            time.add(interval, ns);
+            time.add(interval, start, end);
         }
     }
 
@@ -532,18 +543,31 @@ fn memory(
 }
 
 impl OffCPUTime {
-    fn add(&mut self, interval: &OffCPUInterval, ns: u64) {
+    /// Adds `interval`'s time from `start` to `end`.
+    fn add(&mut self, interval: &OffCPUInterval, start: u64, end: u64) {
         self.intervals += 1;
         match interval.state {
-            ThreadState::Runnable => self.runnable_ns += ns,
-            ThreadState::Blocked => self.blocked_ns += ns,
-            ThreadState::Unknown => self.unknown_state_ns += ns,
+            ThreadState::Runnable => self.runnable_ns += end - start,
+            ThreadState::Blocked => {
+                let wakeup = interval.wakeup.as_ref();
+                let woken = wakeup.map_or(end, |w| w.time_ns.clamp(start, end));
+                self.blocked_ns += woken - start;
+                self.runnable_ns += end - woken;
+                if let Some(ns) = self.wakeup_latency_ns.as_mut() {
+                    *ns += end - woken;
+                }
+            }
+            ThreadState::Unknown => self.unknown_state_ns += end - start,
         }
     }
 
     fn merge(&mut self, other: &OffCPUTime) {
         self.intervals += other.intervals;
         self.runnable_ns += other.runnable_ns;
+        if let (Some(ns), Some(other)) = (self.wakeup_latency_ns.as_mut(), other.wakeup_latency_ns)
+        {
+            *ns += other;
+        }
         self.blocked_ns += other.blocked_ns;
         self.unknown_state_ns += other.unknown_state_ns;
     }

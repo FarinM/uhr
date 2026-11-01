@@ -144,11 +144,13 @@ impl Filter {
 
     /// The off-CPU intervals that pass, each with how long it lies in the
     /// time range. Fails like `samples`.
+    /// The off-CPU intervals that pass, each with its start and end cut to
+    /// the time range.
     pub(crate) fn off_cpu<'a>(
         &'a self,
         recording: &'a Recording,
         functions: &Functions,
-    ) -> Result<impl Iterator<Item = (&'a OffCPUInterval, u64)> + 'a, Error> {
+    ) -> Result<impl Iterator<Item = (&'a OffCPUInterval, u64, u64)> + 'a, Error> {
         let stacks = self.stacks(recording, functions)?;
         let mut names = (!self.thread_names.is_empty()).then(|| NameMatcher::new(recording));
         let range = self.time_range(recording.manifest.start_ns);
@@ -166,7 +168,7 @@ impl Filter {
                 && names.as_mut().is_none_or(|names| {
                     names.matches(self, interval.pid, interval.tid, interval.start_ns)
                 });
-            passes.then(|| (interval, end - start))
+            passes.then_some((interval, start, end))
         }))
     }
 

@@ -672,9 +672,13 @@ fn write_overview(out: &mut impl Write, result: &Overview) -> io::Result<()> {
                 0 => String::new(),
                 ns => format!(", unknown {}", seconds(ns)),
             };
+            let woken = match off_cpu.wakeup_latency_ns {
+                Some(ns) => format!(" ({} of it once woken)", seconds(ns)),
+                None => String::new(),
+            };
             writeln!(
                 out,
-                "off CPU {}, summed over threads: runnable {}, blocked {}{unknown}",
+                "off CPU {}, summed over threads: runnable {}{woken}, blocked {}{unknown}",
                 seconds(off_cpu.runnable_ns + off_cpu.blocked_ns + off_cpu.unknown_state_ns),
                 seconds(off_cpu.runnable_ns),
                 seconds(off_cpu.blocked_ns)
