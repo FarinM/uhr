@@ -87,3 +87,9 @@ sample.
 In the docs, **must** marks a requirement the design depends on, and
 **candidate** one possible approach, with alternatives welcome. Tool and field
 names are sketches of the shape, not final APIs.
+
+## License
+
+[MIT](LICENSE), except that `crates/uhr-ebpf`, which holds the eBPF programs,
+is under your choice of MIT or [GPL-2.0](crates/uhr-ebpf/LICENSE-GPL2). The
+kernel only lets GPL-compatible programs use the helpers they need.

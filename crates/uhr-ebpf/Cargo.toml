@@ -3,6 +3,8 @@ name = "uhr-ebpf"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+# Has to match the license string the kernel reads from the programs.
+license = "MIT OR GPL-2.0-only"
 
 [features]
 # The aya traits that let uhr-linux read these types from the maps.

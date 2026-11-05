@@ -3,6 +3,7 @@ name = "uhr-linux"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+license.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 uhr-core.workspace = true
