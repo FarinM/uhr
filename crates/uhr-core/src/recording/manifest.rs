@@ -118,6 +118,12 @@ pub enum Collector {
         sampling: Option<Sampling>,
         /// How they sampled page faults, if they did.
         page_faults: Option<FaultSampling>,
+        /// How long the intervals are that they counted syscalls in, by
+        /// when the calls returned. `None` if they counted none, or in a
+        /// recording from before they counted by interval, whose counts
+        /// are of the whole capture.
+        #[serde(default)]
+        call_interval_ns: Option<u64>,
         /// The syscalls they were asked not to count, by name. None in a
         /// recording from before they could be, which has no such field.
         #[serde(default)]

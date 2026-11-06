@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use aya::maps::{Array, HashMap, MapData, PerCpuArray, ProgramArray, RingBuf};
 use aya::programs::fexit::FExitLinkId;
@@ -24,9 +24,12 @@ use aya::programs::{FExit, PerfEvent, RawTracePoint, TracePoint};
 use aya::util::{nr_cpus, online_cpus};
 use aya::{Btf, Ebpf, EbpfLoader};
 use syscalls::Sysno;
-use tracing::warn;
+use tracing::{debug, warn};
 use uhr_core::recording::SyscallCalls;
-use uhr_ebpf::{ACTIVE, CallKey, Calls, HELD, SampleHeader, Start, UserRegisters, event};
+use uhr_ebpf::{
+    ACTIVE, BUCKETS, CALL_INTERVAL_SHIFT, CallKey, Calls, HELD, SampleHeader, Start, UserRegisters,
+    event,
+};
 
 use crate::btf;
 use crate::interpreters::{Finder, Interpreters, Maps, Walked};
@@ -261,7 +264,15 @@ pub(crate) struct Programs {
     /// The kernel empties a program array once uhr no longer has it open.
     next: Option<ProgramArray<MapData>>,
     ended: Option<Result<u64, Error>>,
+    /// The calls taken out of `CALLS` as the capture goes on, and the
+    /// interval they were taken up to, exclusive.
+    calls: BTreeMap<CallRow, SyscallCalls>,
+    drained_to: u32,
 }
+
+/// A row of counted calls: by process, thread, the name it had, syscall and
+/// interval.
+type CallRow = (u32, u32, u64, u32, u32);
 
 /// A CPU's sampling events: at its clock, and at its page faults if asked
 /// for.
@@ -347,6 +358,8 @@ impl Programs {
             finder: None,
             next: None,
             ended: None,
+            calls: BTreeMap::new(),
+            drained_to: 0,
         };
         if let Some(sampling) = &options.sampling {
             programs.sample(sampling, wakeups)?;
@@ -557,6 +570,30 @@ impl Programs {
         steps.map_or_else(BTreeMap::new, |steps| steps.iter().flatten().collect())
     }
 
+    /// Takes the intervals that ended half an interval ago or more out of
+    /// `CALLS`, which then keeps two at most.
+    pub(crate) fn drain_calls(&mut self) {
+        // The map reuses a removed entry at once, so a program still adding
+        // to one would add to another key's. Those that add to an interval
+        // run as its calls return, and are long done half an interval on.
+        let half = 1 << (CALL_INTERVAL_SHIFT - 1);
+        let before = (monotonic_ns().saturating_sub(half) >> CALL_INTERVAL_SHIFT) as u32;
+        if self.syscalls.is_none() || self.ended.is_some() || before <= self.drained_to {
+            return;
+        }
+        // What is left in the map is read at the end instead.
+        let started = Instant::now();
+        match drain(&mut self.ebpf, before, &mut self.calls) {
+            Ok(drained) => debug!(
+                drained,
+                ms = started.elapsed().as_secs_f64() * 1e3,
+                "took the counted syscalls of intervals that ended out of their map"
+            ),
+            Err(error) => warn!(%error, "taking the counted syscalls out of their map"),
+        }
+        self.drained_to = before;
+    }
+
     pub(crate) fn samples(&self) -> bool {
         self.reader.is_some()
     }
@@ -609,6 +646,7 @@ impl Programs {
             let_go_late,
             reader,
             finder,
+            calls: drained,
             ..
         } = self;
         let mut programs = Vec::new();
@@ -690,7 +728,7 @@ impl Programs {
             _ => None,
         };
         let syscalls = if counting {
-            Some(counted(&mut ebpf, now)?)
+            Some(counted(&mut ebpf, now, drained)?)
         } else {
             None
         };
@@ -730,7 +768,53 @@ fn skip(ebpf: &mut Ebpf, skipped: &[Sysno]) -> Result<(), Error> {
     Ok(())
 }
 
-fn counted(ebpf: &mut Ebpf, now: u64) -> Result<Counted, Error> {
+/// Moves the calls of the intervals before `before` out of `CALLS`, into
+/// `rows`, and returns how many entries it moved.
+fn drain(
+    ebpf: &mut Ebpf,
+    before: u32,
+    rows: &mut BTreeMap<CallRow, SyscallCalls>,
+) -> Result<usize, Error> {
+    let map = ebpf.map_mut("CALLS").ok_or(Error::Missing("CALLS"))?;
+    let mut map: HashMap<_, CallKey, Calls> =
+        HashMap::try_from(map).map_err(|e| Error::Map("CALLS", e))?;
+    let mut ended = Vec::new();
+    for entry in map.iter() {
+        let (key, calls) = entry.map_err(|e| Error::Map("CALLS", e))?;
+        if key.interval < before {
+            ended.push((key, calls));
+        }
+    }
+    // A key seen twice, as the programs add to the map meanwhile, is
+    // removed once.
+    let mut drained = 0;
+    for (key, calls) in ended {
+        if map.remove(&key).is_ok() {
+            add(rows, &key, &calls);
+            drained += 1;
+        }
+    }
+    Ok(drained)
+}
+
+fn add(rows: &mut BTreeMap<CallRow, SyscallCalls>, key: &CallKey, calls: &Calls) {
+    let (tgid, tid, nr, interval) = (key.tgid, key.tid, key.nr, key.interval);
+    let row = rows
+        .entry((tgid, tid, key.name, nr, interval))
+        .or_insert_with(|| row(tgid, tid, nr, interval));
+    row.calls += calls.calls;
+    row.time_ns += calls.ns;
+    for (sum, &bucket) in row.latency.iter_mut().zip(&calls.buckets) {
+        *sum += u64::from(bucket);
+    }
+}
+
+/// `rows` holds the calls taken out of `CALLS` during the capture.
+fn counted(
+    ebpf: &mut Ebpf,
+    now: u64,
+    mut rows: BTreeMap<CallRow, SyscallCalls>,
+) -> Result<Counted, Error> {
     let mut take = |name| ebpf.take_map(name).ok_or(Error::Missing(name));
     let (calls, starts, names) = (take("CALLS")?, take("STARTS")?, take("NAMES")?);
     let names: HashMap<MapData, u64, [u8; 16]> =
@@ -746,21 +830,9 @@ fn counted(ebpf: &mut Ebpf, now: u64) -> Result<Counted, Error> {
     };
     let calls: HashMap<MapData, CallKey, Calls> =
         HashMap::try_from(calls).map_err(|e| Error::Map("CALLS", e))?;
-    let mut rows = BTreeMap::new();
     for entry in calls.iter() {
         let (key, calls) = entry.map_err(|e| Error::Map("CALLS", e))?;
-        rows.insert(
-            (key.tgid, key.tid, key.name, key.nr),
-            row(
-                key.tgid,
-                key.tid,
-                name(key.name),
-                key.nr,
-                calls.calls,
-                calls.ns,
-                &calls.buckets,
-            ),
-        );
+        add(&mut rows, &key, &calls);
     }
     let starts: HashMap<MapData, u32, Start> =
         HashMap::try_from(starts).map_err(|e| Error::Map("STARTS", e))?;
@@ -773,13 +845,19 @@ fn counted(ebpf: &mut Ebpf, now: u64) -> Result<Counted, Error> {
         if start.ns == 0 || !alive || ends.contains(&start.nr) {
             continue;
         }
-        let empty = [0; uhr_ebpf::BUCKETS];
-        rows.entry((start.tgid, tid, start.name, start.nr))
-            .or_insert_with(|| row(start.tgid, tid, name(start.name), start.nr, 0, 0, &empty))
+        let interval = (now >> CALL_INTERVAL_SHIFT) as u32;
+        rows.entry((start.tgid, tid, start.name, start.nr, interval))
+            .or_insert_with(|| row(start.tgid, tid, start.nr, interval))
             .unfinished_ns = Some(now.saturating_sub(start.ns));
     }
+    let calls = rows
+        .into_iter()
+        .map(|((_, _, key, _, _), row)| SyscallCalls {
+            thread_name: name(key),
+            ..row
+        });
     Ok(Counted {
-        calls: rows.into_values().collect(),
+        calls: calls.collect(),
         lost: sum(ebpf, "LOST")?,
         missed_renames,
     })
@@ -1201,24 +1279,18 @@ fn check_namespace() -> Result<(), Error> {
     Ok(())
 }
 
-fn row(
-    pid: u32,
-    tid: u32,
-    thread_name: Option<String>,
-    number: u32,
-    calls: u64,
-    ns: u64,
-    buckets: &[u64],
-) -> SyscallCalls {
+/// A row with no calls yet, and no thread name until uhr reads them.
+fn row(pid: u32, tid: u32, number: u32, interval: u32) -> SyscallCalls {
     SyscallCalls {
         pid,
         tid,
-        thread_name,
+        thread_name: None,
         number,
         name: Sysno::new(number as usize).map(|s| s.name().to_owned()),
-        calls,
-        time_ns: ns,
-        latency: buckets.to_vec(),
+        interval_start_ns: Some(u64::from(interval) << CALL_INTERVAL_SHIFT),
+        calls: 0,
+        time_ns: 0,
+        latency: vec![0; BUCKETS],
         unfinished_ns: None,
     }
 }

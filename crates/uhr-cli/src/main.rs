@@ -1166,6 +1166,14 @@ fn write_query(out: &mut impl Write, result: &QueryResult) -> io::Result<()> {
         Rows::Regions(rows) => write_region_rows(out, rows)?,
         Rows::Wakers(rows) => write_waker_rows(out, rows)?,
     }
+    if let Some(window) = &result.calls_window {
+        writeln!(
+            out,
+            "(calls: counted from {} to {}, in whole intervals of about 1.07s)",
+            seconds(window.start_ns),
+            seconds(window.end_ns)
+        )?;
+    }
     if result.rows_omitted > 0 {
         writeln!(
             out,

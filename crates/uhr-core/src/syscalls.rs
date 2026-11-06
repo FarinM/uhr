@@ -4,7 +4,7 @@ use serde::Serialize;
 
 use crate::filter::Filter;
 use crate::functions::Functions;
-use crate::recording::{Origin, Recording, Signal, SyscallCalls};
+use crate::recording::{Collector, Origin, Recording, Signal, SyscallCalls};
 
 /// Where a stack stands with syscalls, read from the kernel functions on it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -194,33 +194,76 @@ fn table_name(function: &str) -> &str {
     }
 }
 
-/// What uhr's eBPF programs counted of each syscall, for the processes and
-/// threads `filter` keeps, by the names the threads had as the calls
-/// returned. `None` without them, or for a filter they can't take: they
-/// count each thread's calls over the whole capture, not by time, mode,
-/// stack or region of memory, and recordings from before uhr kept the
-/// names have none.
-pub(crate) fn counted(recording: &Recording, filter: &Filter) -> Option<BTreeMap<String, Counted>> {
-    let streamed = recording
-        .manifest
+/// What uhr's eBPF programs counted of each syscall.
+pub(crate) struct CountedCalls {
+    pub by_syscall: BTreeMap<String, Counted>,
+    /// With a time filter, where the calls were counted.
+    pub window: Option<CallsWindow>,
+}
+
+/// The part of the recording calls were counted in, as offsets from its
+/// start: a time filter's window, widened to the edges of the intervals
+/// uhr counts calls in, by when they returned, and cut to the capture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct CallsWindow {
+    pub start_ns: u64,
+    pub end_ns: u64,
+}
+
+/// What uhr's eBPF programs counted of each syscall, for the processes,
+/// threads and time `filter` keeps, by the names the threads had as the
+/// calls returned. `None` without them, or for a filter they can't take:
+/// they count calls by thread and interval of time, not by mode, stack or
+/// region of memory, and recordings from before uhr kept the names, or
+/// counted by interval, have none for a filter by name, or by time.
+pub(crate) fn counted(recording: &Recording, filter: &Filter) -> Option<CountedCalls> {
+    let manifest = &recording.manifest;
+    let streamed = manifest
         .streams
         .iter()
         .any(|s| s.signals.contains(&Signal::SyscallCalls));
     let rows = &recording.syscall_calls;
     let named = filter.thread_names.is_empty() || rows.iter().all(|c| c.thread_name.is_some());
-    let whole_threads = named
-        && filter.modes.is_empty()
-        && filter.under.is_empty()
-        && filter.from_ns.is_none()
-        && filter.to_ns.is_none()
-        && filter.regions.is_empty();
-    if !streamed || !whole_threads {
+    let countable =
+        named && filter.modes.is_empty() && filter.under.is_empty() && filter.regions.is_empty();
+    if !streamed || !countable {
         return None;
     }
+    let range = match (filter.from_ns, filter.to_ns) {
+        (None, None) => None,
+        (from, to) => {
+            let interval_ns = manifest.streams.iter().find_map(|s| match s.collector {
+                Collector::Ebpf {
+                    call_interval_ns, ..
+                } => call_interval_ns,
+                Collector::Perf { .. } | Collector::Procfs { .. } => None,
+            })?;
+            if rows.iter().any(|c| c.interval_start_ns.is_none()) {
+                return None;
+            }
+            let (start, end) = manifest.start_ns.zip(manifest.end_ns)?;
+            let from = start.saturating_add(from.unwrap_or(0));
+            let to = to.map_or(u64::MAX, |to| start.saturating_add(to));
+            // Widened, an empty range would touch an interval.
+            let (from, to) = if from < to {
+                let to = to.div_ceil(interval_ns).saturating_mul(interval_ns);
+                (from / interval_ns * interval_ns, to)
+            } else {
+                (from, from)
+            };
+            Some((from, to, start, end))
+        }
+    };
     let mut counted: BTreeMap<String, Counted> = BTreeMap::new();
     for calls in rows {
         let name = calls_name(calls);
-        let kept = (filter.pids.is_empty() || filter.pids.contains(&calls.pid))
+        let in_range = range.is_none_or(|(from, to, ..)| {
+            calls
+                .interval_start_ns
+                .is_some_and(|at| from <= at && at < to)
+        });
+        let kept = in_range
+            && (filter.pids.is_empty() || filter.pids.contains(&calls.pid))
             && (filter.tids.is_empty() || filter.tids.contains(&calls.tid))
             && (filter.thread_names.is_empty()
                 || (calls.thread_name.as_deref()).is_some_and(|n| filter.matches_name(n)))
@@ -233,7 +276,17 @@ pub(crate) fn counted(recording: &Recording, filter: &Filter) -> Option<BTreeMap
         counted.median = counted.percentile(50);
         counted.p99 = counted.percentile(99);
     }
-    Some(counted)
+    let window = range.map(|(from, to, start, end)| {
+        let start_ns = from.clamp(start, end) - start;
+        CallsWindow {
+            start_ns,
+            end_ns: (to.clamp(start, end) - start).max(start_ns),
+        }
+    });
+    Some(CountedCalls {
+        by_syscall: counted,
+        window,
+    })
 }
 
 /// The name of a syscall that was counted, or its number for one the
@@ -345,6 +398,7 @@ mod tests {
             thread_name: None,
             number: 0,
             name: Some("read".into()),
+            interval_start_ns: None,
             calls: 100,
             time_ns: 0,
             latency: vec![1, 0, 0, 97, 2],

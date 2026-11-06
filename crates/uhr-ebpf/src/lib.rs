@@ -5,6 +5,11 @@
 /// than `2^(i + 1)`, and the last one also every longer call.
 pub const BUCKETS: usize = 36;
 
+/// Calls are counted by the interval they returned in, of `1 <<
+/// CALL_INTERVAL_SHIFT` ns on the kernel's monotonic clock, about 1.07 s,
+/// which a shift finds without a division.
+pub const CALL_INTERVAL_SHIFT: u32 = 30;
+
 /// The syscall numbers `SKIPPED` has room for, past the last of the tables
 /// of the architectures uhr samples on.
 pub const SYSCALL_NUMBERS: u32 = 1024;
@@ -33,18 +38,21 @@ pub struct CallKey {
     pub tgid: u32,
     pub tid: u32,
     pub nr: u32,
-    pub pad: u32,
+    /// The interval the calls returned in: their time shifted right by
+    /// `CALL_INTERVAL_SHIFT`.
+    pub interval: u32,
     /// The thread's name when the calls returned, by its key in `NAMES`.
     pub name: u64,
 }
 
-/// The calls a thread made to one syscall that returned.
+/// The calls a thread made to one syscall that returned in one interval.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct Calls {
     pub calls: u64,
     pub ns: u64,
-    pub buckets: [u64; BUCKETS],
+    /// No thread returns from 2^32 calls in an interval.
+    pub buckets: [u32; BUCKETS],
 }
 
 /// The most frames of a sample's stacks, kernel and user together, as

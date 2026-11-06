@@ -1,5 +1,5 @@
 use std::fs::{self, File};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use arrow_array::RecordBatch;
 use parquet::arrow::ArrowWriter;
@@ -297,6 +297,7 @@ fn example() -> Recording {
                 thread_name: Some("app".into()),
                 number: 0,
                 name: Some("read".into()),
+                interval_start_ns: Some(0),
                 calls: 3,
                 time_ns: 4_500,
                 latency: vec![0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 1],
@@ -308,6 +309,7 @@ fn example() -> Recording {
                 thread_name: Some("worker".into()),
                 number: 4_000,
                 name: None,
+                interval_start_ns: Some(1 << 30),
                 calls: 0,
                 time_ns: 0,
                 latency: vec![0; 12],
@@ -397,6 +399,7 @@ fn reads_a_recording_from_before_syscalls_could_be_skipped() {
             programs: Vec::new(),
             sampling: None,
             page_faults: None,
+            call_interval_ns: None,
             skipped_syscalls: Vec::new(),
         },
         signals: vec![Signal::SyscallCalls],
@@ -439,13 +442,10 @@ fn reads_a_recording_from_before_its_wall_clock() {
     assert_eq!(Recording::read(&dir).unwrap(), recording);
 }
 
-#[test]
-fn reads_a_recording_from_before_the_names_of_counted_threads() {
-    let dir = scratch("before_counted_thread_names");
-    let mut recording = example();
-    recording.write(&dir).unwrap();
-    let path = dir.join("syscall_calls.parquet");
-    let file = File::open(&path).unwrap();
+/// Writes the table at `path` again without the column `name`, as a
+/// recording from before it was added has it.
+fn drop_column(path: &Path, name: &str) {
+    let file = File::open(path).unwrap();
     let batches: Vec<RecordBatch> = ParquetRecordBatchReaderBuilder::try_new(file)
         .unwrap()
         .build()
@@ -454,15 +454,35 @@ fn reads_a_recording_from_before_the_names_of_counted_threads() {
         .unwrap();
     let schema = batches[0].schema();
     let kept: Vec<usize> = (0..schema.fields().len())
-        .filter(|&i| schema.field(i).name() != "thread_name")
+        .filter(|&i| schema.field(i).name() != name)
         .collect();
     let batch = batches[0].project(&kept).unwrap();
-    let file = File::create(&path).unwrap();
+    let file = File::create(path).unwrap();
     let mut writer = ArrowWriter::try_new(file, batch.schema(), None).unwrap();
     writer.write(&batch).unwrap();
     writer.close().unwrap();
+}
+
+#[test]
+fn reads_a_recording_from_before_the_names_of_counted_threads() {
+    let dir = scratch("before_counted_thread_names");
+    let mut recording = example();
+    recording.write(&dir).unwrap();
+    drop_column(&dir.join("syscall_calls.parquet"), "thread_name");
     for calls in &mut recording.syscall_calls {
         calls.thread_name = None;
+    }
+    assert_eq!(Recording::read(&dir).unwrap(), recording);
+}
+
+#[test]
+fn reads_a_recording_from_before_calls_were_counted_by_interval() {
+    let dir = scratch("before_call_intervals");
+    let mut recording = example();
+    recording.write(&dir).unwrap();
+    drop_column(&dir.join("syscall_calls.parquet"), "interval_start_ns");
+    for calls in &mut recording.syscall_calls {
+        calls.interval_start_ns = None;
     }
     assert_eq!(Recording::read(&dir).unwrap(), recording);
 }

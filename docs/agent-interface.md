@@ -113,10 +113,11 @@ but gives the time in each syscall, not how often it was called or how long
 each call took. Where uhr's eBPF programs ran, each syscall's row also has
 its `calls`: how many returned, their time, the ranges the median and the
 99th percentile call fall in, and the calls still running at the end. A
-syscall `uhr record --skip-syscall` left out has none. They count whole
-threads over the whole capture, by the name each had as its calls
-returned, so a filter by thread name keeps them, but one by time, mode,
-stack or region leaves them out. Where only the code every syscall
+syscall `uhr record --skip-syscall` left out has none. They count each
+thread's calls by the name it had and the interval of about a second
+they returned in, so a filter by thread name keeps them, and a filter by
+time keeps the intervals it touches whole, which the result gives as
+`calls_window`. A filter by mode, stack or region leaves them out. Where only the code every syscall
 passes through is on the stack, as on the way back to user space, where
 threads are often preempted, the time is in a syscall, but which one is
 unknown. Time in uhr's own eBPF programs, which run as syscalls enter and

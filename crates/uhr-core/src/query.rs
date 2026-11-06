@@ -12,7 +12,7 @@ use crate::recording::{self, Origin, Recording, RegionKind, Signal, ThreadState,
 use crate::regions;
 use crate::symbols::Symbols;
 use crate::syscalls::{self, InSyscall};
-pub use crate::syscalls::{Counted, Latency};
+pub use crate::syscalls::{CallsWindow, Counted, Latency};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -60,6 +60,9 @@ pub struct QueryResult {
     pub rows: Rows,
     /// Rows cut by `top`.
     pub rows_omitted: usize,
+    /// Grouped by syscall with a time filter, the window the rows' `calls`
+    /// were counted in, which can be wider. `None` otherwise.
+    pub calls_window: Option<CallsWindow>,
     pub coverage: QueryCoverage,
 }
 
@@ -135,10 +138,11 @@ pub struct SyscallRow {
     pub value: u64,
     pub share: f64,
     /// The calls uhr's eBPF programs counted, for a named syscall. `None`
-    /// without them, or with a filter by time, mode or stack: they count each
-    /// thread's calls over the whole capture, by the name it had then. A
-    /// recording from before uhr kept the names has none with a filter by
-    /// thread name either.
+    /// without them, or with a filter by mode or stack: they count each
+    /// thread's calls by the name it had then and the interval of time they
+    /// returned in, which a time filter keeps whole, as `calls_window` says.
+    /// A recording from before uhr kept the names, or counted by interval,
+    /// has none with a filter by thread name, or by time, either.
     pub calls: Option<Counted>,
 }
 
@@ -282,6 +286,7 @@ pub fn run(
             amount as f64 / value as f64
         }
     };
+    let mut calls_window = None;
     let mut rows = match query.group_by {
         GroupBy::Function | GroupBy::Line => Rows::Functions(function_rows(
             recording,
@@ -296,13 +301,17 @@ pub fn run(
             &amounts.by_stack,
             &share,
         )),
-        GroupBy::Syscall => Rows::Syscalls(syscall_rows(
-            recording,
-            &functions,
-            &amounts,
-            syscalls::counted(recording, &query.filter),
-            &share,
-        )),
+        GroupBy::Syscall => {
+            let counted = syscalls::counted(recording, &query.filter);
+            calls_window = counted.as_ref().and_then(|c| c.window);
+            Rows::Syscalls(syscall_rows(
+                recording,
+                &functions,
+                &amounts,
+                counted.map(|c| c.by_syscall),
+                &share,
+            ))
+        }
         GroupBy::Region => {
             Rows::Regions(region_rows(recording, &functions, &query.filter, &share)?)
         }
@@ -358,6 +367,7 @@ pub fn run(
         value,
         rows,
         rows_omitted,
+        calls_window,
         coverage,
     })
 }

@@ -62,7 +62,7 @@ Each stream has:
 | Field | Meaning |
 |---|---|
 | `id` | Unique within the recording |
-| `collector` | `name` plus the collector's version and settings. For perf: `version`, `sampling`, `page_faults`, `context_switches` (whether perf recorded every context switch). uhr's eBPF programs are `ebpf`, with `programs`, their tags in hex, as in the kernel's names for their code: `bpf_prog_<tag>_<name>`, `sampling`, `page_faults` and `skipped_syscalls`, the names of the syscalls `uhr record --skip-syscall` had them leave uncounted. uhr reading `/proc` is `procfs`, with `interval_ns`, how often it read |
+| `collector` | `name` plus the collector's version and settings. For perf: `version`, `sampling`, `page_faults`, `context_switches` (whether perf recorded every context switch). uhr's eBPF programs are `ebpf`, with `programs`, their tags in hex, as in the kernel's names for their code: `bpf_prog_<tag>_<name>`, `sampling`, `page_faults`, `call_interval_ns`, how long the intervals are they counted syscalls in, null if they counted none, and `skipped_syscalls`, the names of the syscalls `uhr record --skip-syscall` had them leave uncounted. uhr reading `/proc` is `procfs`, with `interval_ns`, how often it read |
 | `collector.page_faults` | How the collector sampled page faults: `event` and `period`, one fault in every that many, which each sample stands for. Null for one that did not |
 | `collector.sampling` | How the collector sampled CPU time: `event`, `frequency_hz` (what it sampled at), `requested_frequency_hz`. Null for one that did not |
 | `signals` | What was captured: `user_cpu_samples`, `kernel_cpu_samples`, `user_stacks`, `kernel_stacks`, `off_cpu_time` (when threads went off CPU and came back, and whether they were preempted), `off_cpu_stacks` (where they went off CPU), `wakeups` (when each thread that blocked was woken, and what woke it), `syscall_calls` (how often threads called each syscall and how long the calls took), `resident_memory` (how much memory each process had resident and in swap, over time), `memory_regions` (the regions of each process's memory, as it mapped them), `region_memory` (how much each process had resident and in swap in each kind of region, over time), `page_faults` (samples of the page faults threads took, with their stacks) |
@@ -228,10 +228,12 @@ at its address later, which then keeps the name of the first.
 | `first_line` | uint32, nullable | The line it starts at |
 | `first_column` | uint32, nullable | The column it starts at, from 1, where the runtime says |
 
-`syscall_calls`, one row per thread, name it had and syscall, from uhr's
-eBPF programs. They count the target's processes and those they start,
-from the first syscall after the target's exec, and when attached from the
-attach on.
+`syscall_calls`, one row per thread, name it had, syscall and interval of
+time, from uhr's eBPF programs. They count the target's processes and
+those they start, from the first syscall after the target's exec, and
+when attached from the attach on, by when each call returned, in
+intervals of the eBPF collector's `call_interval_ns` on the recording's
+clock, which start at its multiples.
 
 | Column | Type | Meaning |
 |---|---|---|
@@ -239,10 +241,11 @@ attach on.
 | `thread_name` | string, nullable | The thread's name when the calls returned. Null in a recording from before uhr kept it, for a name the programs had no room for, and in every row if they missed a rename of a thread by another, without the kernel's BTF |
 | `number` | uint32 | In the syscall table of the recording's `platform.arch` |
 | `name` | string, nullable | Null for a number the table has no name for |
-| `calls` | uint64 | Calls that returned during the capture |
+| `interval_start_ns` | uint64, nullable | When the interval starts that the calls returned in. Null in a recording from before uhr counted by interval, whose rows are of the whole capture |
+| `calls` | uint64 | Calls that returned in the interval |
 | `time_ns` | uint64 | Their time from entry to exit, on CPU or not |
 | `latency` | list of uint64 | Those calls by time: entry `i` counts the ones of at least 2^i ns and less than 2^(i+1), and the last also every longer one. Sums to `calls` |
-| `unfinished_ns` | uint64, nullable | The time so far of a call the thread was still in when the capture ended. Null if it was in none |
+| `unfinished_ns` | uint64, nullable | The time so far of a call the thread was still in when the capture ended, in the row of the last interval. Null if it was in none |
 
 `memory`, one row per reading of a process, sorted by `time_ns`, from
 uhr reading `/proc/<pid>/status`. Each of the target's processes is read

@@ -578,6 +578,50 @@ fn counts_a_thread_that_execs_by_its_new_name() {
 }
 
 #[test]
+fn counts_the_calls_in_a_time_range() {
+    let _turn = one_at_a_time();
+    let dir = scratch("syscalls_by_time");
+    let program = dir.join("phases");
+    compile("phases", &program, "-O2");
+    let recording = dir.join("rec");
+    let rec = recording.to_str().unwrap();
+    let args = ["record", "-o", rec, "--", program.to_str().unwrap()];
+    if uhr_as_root(&args, &recording).is_none() {
+        eprintln!("skipped: needs root through sudo without a password");
+        return;
+    }
+    let getppid = |range: &[&str]| {
+        let mut args = vec![
+            "query",
+            rec,
+            "--group-by",
+            "syscall",
+            "--syscall",
+            "getppid",
+        ];
+        args.extend(range);
+        let result = json(&args);
+        let rows = result["rows"].as_array().unwrap();
+        let row = rows.iter().find(|r| r["syscall"] == "getppid");
+        let calls = row.and_then(|r| r["calls"]["calls"].as_u64());
+        (calls, result["calls_window"].clone())
+    };
+    let (all, window) = getppid(&[]);
+    assert_eq!(all, Some(400));
+    assert!(window.is_null(), "{window}");
+    // Widened to whole intervals of about 1.07 s, a range up to 1 s ends
+    // before the calls 2.5 s in.
+    let (first, window) = getppid(&["--to", "1s"]);
+    assert_eq!(first, Some(100), "{window}");
+    assert_eq!(window["start_ns"], 0, "{window}");
+    assert!(
+        window["end_ns"].as_u64().unwrap() >= 1_000_000_000,
+        "{window}"
+    );
+    assert_eq!(getppid(&["--from", "2.5s"]).0, Some(300));
+}
+
+#[test]
 fn says_which_calls_were_still_running_at_the_end() {
     let _turn = one_at_a_time();
     let dir = scratch("syscalls_unfinished");

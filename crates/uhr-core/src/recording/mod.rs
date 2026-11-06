@@ -272,7 +272,8 @@ pub struct InterpretedCode {
     pub first_column: Option<u32>,
 }
 
-/// The calls a thread made to one syscall during the capture.
+/// The calls a thread made to one syscall, under one name, that returned in
+/// one interval of the capture.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyscallCalls {
     pub pid: u32,
@@ -285,7 +286,12 @@ pub struct SyscallCalls {
     pub number: u32,
     /// `None` for a number that table has no name for.
     pub name: Option<String>,
-    /// Calls that returned during the capture.
+    /// Where on the recording's clock the interval starts that the calls
+    /// returned in, which lasts the eBPF collector's `call_interval_ns`.
+    /// `None` in a recording from before uhr counted by interval, where the
+    /// calls are those of the whole capture.
+    pub interval_start_ns: Option<u64>,
+    /// Calls that returned in the interval.
     pub calls: u64,
     /// Their time from entry to exit, on CPU or not.
     pub time_ns: u64,
@@ -906,6 +912,10 @@ impl Recording {
                 ),
                 Column::u32("number", calls.iter().map(|c| c.number).collect()),
                 Column::optional_string("name", calls.iter().map(|c| c.name.as_deref()).collect()),
+                Column::optional_u64(
+                    "interval_start_ns",
+                    calls.iter().map(|c| c.interval_start_ns).collect(),
+                ),
                 Column::u64("calls", calls.iter().map(|c| c.calls).collect()),
                 Column::u64("time_ns", calls.iter().map(|c| c.time_ns).collect()),
                 Column::u64_lists("latency", &latency),
@@ -1433,6 +1443,7 @@ fn read_syscall_calls(dir: &Path) -> Result<Vec<SyscallCalls>> {
     let mut thread_name = table.added_string("thread_name")?;
     let number = table.u32("number")?;
     let mut name = table.optional_string("name")?;
+    let interval_start_ns = table.added_u64("interval_start_ns")?;
     let calls = table.u64("calls")?;
     let time_ns = table.u64("time_ns")?;
     let mut latency = table.u64_lists("latency")?;
@@ -1444,6 +1455,7 @@ fn read_syscall_calls(dir: &Path) -> Result<Vec<SyscallCalls>> {
             thread_name: thread_name[i].take(),
             number: number[i],
             name: name[i].take(),
+            interval_start_ns: interval_start_ns[i],
             calls: calls[i],
             time_ns: time_ns[i],
             latency: std::mem::take(&mut latency[i]),

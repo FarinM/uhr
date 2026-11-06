@@ -768,6 +768,10 @@ fn add_ebpf(
             programs: found.programs,
             sampling,
             page_faults,
+            call_interval_ns: found
+                .syscalls
+                .is_some()
+                .then_some(1 << uhr_ebpf::CALL_INTERVAL_SHIFT),
             skipped_syscalls: skipped,
         },
         signals,
@@ -1196,6 +1200,7 @@ impl Capture<'_> {
     fn poll(&mut self) {
         if let Some(ebpf) = self.ebpf.as_mut() {
             ebpf.follow_cpus();
+            ebpf.drain_calls();
         }
     }
 

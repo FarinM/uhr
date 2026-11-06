@@ -268,20 +268,27 @@ from tracepoints, such as wakeups and syscall latency.
   only, where a tracepoint of the syscall would make every syscall of every
   process take the kernel's slower path for traced ones.
 - They count and time the target's syscalls. At each syscall's entry and
-  exit they add, per thread, the name it has then and syscall, the call,
-  its time and a log2 histogram of times in the kernel, so nothing is
-  written per call. Each thread's name is read at its first call and kept
-  as the kernel renames it, at the `task_rename` raw tracepoint, so the
-  calls a thread made before it named itself, as threads do right after
-  they start, count under the name they had. The task renamed says which
-  thread it is, read with the kernel's BTF. Without it they can't follow
-  a thread renamed by another, so if one was, the calls have no thread
-  names. Each name is kept once, by its hash, which the thread's entry
-  holds, so a call that returns as another thread renames this one counts
-  under the old name or the new, not part of each. Each
-  call still runs them, which a program making millions of quick calls
-  notices, and while they run every process's syscalls take the kernel's
-  slower path for traced ones.
+  exit they add, per thread, the name it has then, syscall and interval of
+  2^30 ns, about 1.07 s, that the call returns in, the call, its time and
+  a log2 histogram of times in the kernel, so nothing is written per call.
+  Each thread's name is read at its first call and kept as the kernel
+  renames it, at the `task_rename` raw tracepoint, so the calls a thread
+  made before it named itself, as threads do right after they start, count
+  under the name they had. The task renamed says which thread it is, read
+  with the kernel's BTF. Without it they can't follow a thread renamed by
+  another, so if one was, the calls have no thread names. Each name is
+  kept once, by its hash, which the thread's entry holds, so a call that
+  returns as another thread renames this one counts under the old name or
+  the new, not part of each. As the capture goes on, uhr takes each
+  interval out of the programs' map half an interval after it ends, when
+  no call adds to it any more, so the map holds two at most, with room for
+  65536 threads, names and syscalls with calls in each. That costs uhr
+  about 3 µs for each it takes out, as it reads the next interval's too:
+  for 1500 threads that made 23 syscalls each, about 100 ms at each
+  interval. Each call still runs
+  them, which a program making millions of quick calls notices, and while
+  they run every process's syscalls take the kernel's slower path for
+  traced ones.
 - With context switches, they see the kernel wake each of the target's
   threads that slept, at the scheduler's `sched_waking` raw tracepoint,
   which runs in the waker. They take when, the thread that woke it and its
@@ -322,7 +329,8 @@ from tracepoints, such as wakeups and syscall latency.
   which at 999 a second is about 0.05% of a CPU. Counting made each call of
   16 threads calling getppid in a loop 110 ns slower, in a virtual machine
   with 32 CPUs, which is 11% of a CPU at a million syscalls a second, about
-  6 ns of it for keying the counts by the thread's name. Nearly
+  6 ns of it for keying the counts by the thread's name and the interval.
+  Nearly
   half of that is reading the kernel's clock as each call enters and
   leaves, which takes 23 ns a read with the virtual machine's kvm-clock.
   A skipped syscall's calls took 38 ns longer, as they still run the

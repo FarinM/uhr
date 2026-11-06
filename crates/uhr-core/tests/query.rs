@@ -460,6 +460,7 @@ fn with_own_programs() -> (Recording, Symbols) {
             programs: vec!["8782325c7cb17f7f".into()],
             sampling: None,
             page_faults: None,
+            call_interval_ns: None,
             skipped_syscalls: Vec::new(),
         },
         signals: vec![Signal::SyscallCalls],
@@ -1236,6 +1237,7 @@ fn with_counted_calls() -> (Recording, Symbols) {
             programs: Vec::new(),
             sampling: None,
             page_faults: None,
+            call_interval_ns: Some(1_000),
             skipped_syscalls: Vec::new(),
         },
         signals: vec![Signal::SyscallCalls],
@@ -1253,6 +1255,7 @@ fn with_counted_calls() -> (Recording, Symbols) {
         thread_name: Some(if tid == 1 { "main" } else { "worker-2" }.into()),
         number: 0,
         name: Some(name.into()),
+        interval_start_ns: Some(0),
         calls,
         time_ns: calls * 10,
         latency,
@@ -1319,14 +1322,6 @@ fn joins_the_counted_calls_to_the_syscalls_on_stacks() {
     let read = read.iter().find(|r| r.0 == Some("read")).unwrap();
     assert_eq!(read.2.as_ref().unwrap().calls, 1, "{read:?}");
 
-    // They count whole threads over the whole capture.
-    let later = Filter {
-        from_ns: Some(1),
-        ..Filter::default()
-    };
-    let result = run(&recording, Some(&symbols), &by_syscall(later)).unwrap();
-    assert!(counted_rows(&result).iter().all(|r| r.2.is_none()));
-
     let getppid = Filter {
         syscalls: vec!["getppid".into()],
         ..Filter::default()
@@ -1362,6 +1357,136 @@ fn counts_the_calls_of_a_renamed_thread_by_the_name_it_had() {
     assert_eq!(calls("main"), Some(3));
     assert_eq!(calls("worker-1"), Some(2));
     assert_eq!(calls("worker-*"), Some(3));
+}
+
+/// Reads by thread 1 in each interval of 1000 ns of a capture from 500 to
+/// 3700: 1 call in the first, then 2, 4 and 8.
+fn with_counted_intervals() -> (Recording, Symbols) {
+    let (mut recording, symbols) = with_counted_calls();
+    recording.manifest.start_ns = Some(500);
+    recording.manifest.end_ns = Some(3_700);
+    let read = recording.syscall_calls[0].clone();
+    recording.syscall_calls = (0..4)
+        .map(|i| SyscallCalls {
+            interval_start_ns: Some(i * 1_000),
+            calls: 1 << i,
+            time_ns: 10 << i,
+            latency: vec![1 << i, 0, 0],
+            ..read.clone()
+        })
+        .collect();
+    (recording, symbols)
+}
+
+fn read_calls(recording: &Recording, symbols: &Symbols, filter: Filter) -> Option<u64> {
+    let query = Query {
+        group_by: GroupBy::Syscall,
+        filter: Filter {
+            syscalls: vec!["read".into()],
+            ..filter
+        },
+        ..query(20)
+    };
+    let result = run(recording, Some(symbols), &query).unwrap();
+    let rows = counted_rows(&result);
+    rows.first()?.2.as_ref().map(|c| c.calls)
+}
+
+fn calls_window(recording: &Recording, symbols: &Symbols, filter: Filter) -> Option<(u64, u64)> {
+    let query = Query {
+        group_by: GroupBy::Syscall,
+        filter,
+        ..query(20)
+    };
+    let result = run(recording, Some(symbols), &query).unwrap();
+    result.calls_window.map(|w| (w.start_ns, w.end_ns))
+}
+
+#[test]
+fn counts_the_calls_of_the_intervals_a_time_range_touches() {
+    let (recording, symbols) = with_counted_intervals();
+    let range = |from_ns, to_ns| Filter {
+        from_ns,
+        to_ns,
+        ..Filter::default()
+    };
+    assert_eq!(
+        read_calls(&recording, &symbols, range(None, None)),
+        Some(15)
+    );
+    assert_eq!(calls_window(&recording, &symbols, range(None, None)), None);
+
+    // Up to 900 on the clock touches the first interval only.
+    let first = range(None, Some(400));
+    assert_eq!(read_calls(&recording, &symbols, first.clone()), Some(1));
+    assert_eq!(calls_window(&recording, &symbols, first), Some((0, 500)));
+
+    // 1100 to 2100 touches the second and third.
+    let middle = range(Some(600), Some(1_600));
+    assert_eq!(read_calls(&recording, &symbols, middle.clone()), Some(6));
+    assert_eq!(
+        calls_window(&recording, &symbols, middle),
+        Some((500, 2_500))
+    );
+
+    // From 3600 on, the last, cut to the capture's end.
+    let last = range(Some(3_100), None);
+    assert_eq!(read_calls(&recording, &symbols, last.clone()), Some(8));
+    assert_eq!(
+        calls_window(&recording, &symbols, last),
+        Some((2_500, 3_200))
+    );
+
+    // An interval that starts at the end of the range is not in it.
+    let edge = range(None, Some(500));
+    assert_eq!(read_calls(&recording, &symbols, edge), Some(1));
+}
+
+#[test]
+fn counts_no_calls_in_an_empty_time_range() {
+    let (recording, symbols) = with_counted_intervals();
+    let range = |from_ns, to_ns| Filter {
+        from_ns,
+        to_ns,
+        ..Filter::default()
+    };
+    let none = range(None, Some(0));
+    assert_eq!(read_calls(&recording, &symbols, none.clone()), None);
+    assert_eq!(calls_window(&recording, &symbols, none), Some((0, 0)));
+    let reversed = range(Some(1_600), Some(600));
+    assert_eq!(read_calls(&recording, &symbols, reversed.clone()), None);
+    assert_eq!(
+        calls_window(&recording, &symbols, reversed),
+        Some((1_600, 1_600))
+    );
+}
+
+#[test]
+fn has_no_calls_by_time_where_they_were_not_counted_by_interval() {
+    let time = Filter {
+        to_ns: Some(400),
+        ..Filter::default()
+    };
+    let (mut recording, symbols) = with_counted_intervals();
+    for calls in &mut recording.syscall_calls {
+        calls.interval_start_ns = None;
+    }
+    assert_eq!(read_calls(&recording, &symbols, time.clone()), None);
+    assert_eq!(
+        read_calls(&recording, &symbols, Filter::default()),
+        Some(15)
+    );
+
+    let (mut recording, symbols) = with_counted_intervals();
+    for stream in &mut recording.manifest.streams {
+        if let Collector::Ebpf {
+            call_interval_ns, ..
+        } = &mut stream.collector
+        {
+            *call_interval_ns = None;
+        }
+    }
+    assert_eq!(read_calls(&recording, &symbols, time), None);
 }
 
 #[test]

@@ -1,5 +1,6 @@
 //! Counts and times the syscalls of the target's processes, per thread, the
-//! name it had then, and syscall, from their first after exec.
+//! name it had then, syscall and interval of time, from their first after
+//! exec.
 
 use core::ptr;
 
@@ -10,7 +11,7 @@ use aya_ebpf::helpers::{
 use aya_ebpf::macros::{map, raw_tracepoint};
 use aya_ebpf::maps::{Array, HashMap, PerCpuArray};
 use aya_ebpf::programs::RawTracePointContext;
-use uhr_ebpf::{BUCKETS, CallKey, Calls, SYSCALL_NUMBERS, Start};
+use uhr_ebpf::{BUCKETS, CALL_INTERVAL_SHIFT, CallKey, Calls, SYSCALL_NUMBERS, Start};
 
 use crate::targets::{active, current, ids, running};
 
@@ -28,8 +29,11 @@ static STARTS: HashMap<u32, Start> = HashMap::with_max_entries(65536, 0);
 #[map]
 static NAMES: HashMap<u64, [u8; 16]> = HashMap::with_max_entries(65536, 0);
 
+/// uhr takes each interval out half an interval after it ends, as the
+/// capture goes on, so this holds two at most: room for 65536 threads,
+/// names and syscalls with calls in each.
 #[map]
-static CALLS: HashMap<CallKey, Calls> = HashMap::with_max_entries(65536, 0);
+static CALLS: HashMap<CallKey, Calls> = HashMap::with_max_entries(131072, 0);
 
 /// What a new entry of `CALLS` starts from, as it is too big for the stack.
 #[map]
@@ -100,12 +104,13 @@ pub fn sys_exit(_ctx: RawTracePointContext) -> i32 {
     if start.ns == 0 || start.tgid != tgid {
         return 0;
     }
-    let ns = unsafe { bpf_ktime_get_ns() }.saturating_sub(start.ns);
+    let now = unsafe { bpf_ktime_get_ns() };
+    let ns = now.saturating_sub(start.ns);
     let key = CallKey {
         tgid,
         tid,
         nr: start.nr,
-        pad: 0,
+        interval: (now >> CALL_INTERVAL_SHIFT) as u32,
         name: unsafe { ptr::read_volatile(&start.name) },
     };
     start.ns = 0;
