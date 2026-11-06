@@ -23,9 +23,10 @@ use uhr_core::functions::Function;
 use uhr_core::metric::{Metric, Unit};
 use uhr_core::overview::{self, CPUTime, Memory, Overview};
 use uhr_core::query::{
-    self, FunctionRow, GroupBy, Latency, ModuleRow, Query, QueryResult, RegionRow, Rows, SyscallRow,
+    self, FunctionRow, GroupBy, Latency, ModuleRow, Query, QueryResult, RegionRow, Rows,
+    SyscallRow, WakerRow, WokenBy,
 };
-use uhr_core::recording::{Exit, Mode, RegionKind};
+use uhr_core::recording::{Exit, Mode, RegionKind, ThreadState};
 use uhr_core::symbols;
 
 #[cfg(target_os = "linux")]
@@ -245,6 +246,12 @@ enum GroupByArg {
     /// The region of memory a page fault was in, as the heap or a file, with
     /// --metric page-faults
     Region,
+    /// The thread or interrupt that woke each thread that blocked, with
+    /// --metric off-cpu. Filters pick the waits, not the wakers
+    Waker,
+    /// The functions on the stacks of those wakeups: the kernel's from
+    /// try_to_wake_up, then the waking thread's
+    WakerFunction,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -1089,6 +1096,8 @@ fn run_query(
             GroupByArg::Module => GroupBy::Module,
             GroupByArg::Syscall => GroupBy::Syscall,
             GroupByArg::Region => GroupBy::Region,
+            GroupByArg::Waker => GroupBy::Waker,
+            GroupByArg::WakerFunction => GroupBy::WakerFunction,
         },
         metric,
         top,
@@ -1111,6 +1120,8 @@ fn write_query(out: &mut impl Write, result: &QueryResult) -> io::Result<()> {
         GroupBy::Module => "module",
         GroupBy::Syscall => "syscall",
         GroupBy::Region => "region",
+        GroupBy::Waker => "waker",
+        GroupBy::WakerFunction => "waker function",
     };
     writeln!(
         out,
@@ -1126,10 +1137,11 @@ fn write_query(out: &mut impl Write, result: &QueryResult) -> io::Result<()> {
         writeln!(out, "filter: {}\n", describe_filter(&result.filter))?;
     }
     match &result.rows {
-        Rows::Functions(rows) => write_function_rows(out, result.group_by == GroupBy::Line, rows)?,
+        Rows::Functions(rows) => write_function_rows(out, result.group_by, rows)?,
         Rows::Modules(rows) => write_module_rows(out, rows)?,
         Rows::Syscalls(rows) => write_syscall_rows(out, rows, result.unit)?,
         Rows::Regions(rows) => write_region_rows(out, rows)?,
+        Rows::Wakers(rows) => write_waker_rows(out, rows)?,
     }
     if result.rows_omitted > 0 {
         writeln!(
@@ -1157,7 +1169,15 @@ fn write_query(out: &mut impl Write, result: &QueryResult) -> io::Result<()> {
     for (origin, share) in &coverage.unnamed_by_origin {
         writeln!(out, "  unnamed {}: {:.1}%", origin.as_str(), share * 100.0)?;
     }
-    write_no_stack(out, coverage.no_stack_share)?;
+    match result.group_by {
+        GroupBy::WakerFunction if coverage.no_stack_share > 0.0 => writeln!(
+            out,
+            "  off-CPU time no wakeup with a stack ended: {:.1}% (see --group-by waker)",
+            coverage.no_stack_share * 100.0
+        )?,
+        GroupBy::WakerFunction => {}
+        _ => write_no_stack(out, coverage.no_stack_share)?,
+    }
     if let Some(share) = coverage.own_programs_share {
         writeln!(
             out,
@@ -1172,10 +1192,15 @@ fn write_query(out: &mut impl Write, result: &QueryResult) -> io::Result<()> {
 
 fn write_function_rows(
     out: &mut impl Write,
-    by_line: bool,
+    group_by: GroupBy,
     rows: &[FunctionRow],
 ) -> io::Result<()> {
-    let by = if by_line { "line" } else { "function" };
+    let by_line = group_by == GroupBy::Line;
+    let by = match group_by {
+        GroupBy::Line => "line",
+        GroupBy::WakerFunction => "waker function",
+        _ => "function",
+    };
     writeln!(out, "{:>7} {:>7}  {by}", "self", "total")?;
     for row in rows {
         let line = match (by_line, &row.line) {
@@ -1224,6 +1249,40 @@ fn write_region_rows(out: &mut impl Write, rows: &[RegionRow]) -> io::Result<()>
             "{:>6.1}%  {kind}{}",
             row.share * 100.0,
             path.unwrap_or_default()
+        )?;
+    }
+    Ok(())
+}
+
+fn write_waker_rows(out: &mut impl Write, rows: &[WakerRow]) -> io::Result<()> {
+    writeln!(
+        out,
+        "{:>7} {:>9} {:>9} {:>9} {:>9}  waker",
+        "time", "intervals", "latency", "pid", "tid"
+    )?;
+    for row in rows {
+        let latency = row.wakeup_latency_ns.map(duration).unwrap_or_default();
+        let id = |id: Option<u32>| id.map(|id| id.to_string()).unwrap_or_default();
+        let waker = match (row.woken_by, row.state) {
+            (Some(WokenBy::Thread), _) => row.waker_name.as_deref().unwrap_or("<unnamed>"),
+            (Some(WokenBy::Interrupt), _) => "(interrupt)",
+            (None, ThreadState::Runnable) => "(preempted, not woken)",
+            (None, ThreadState::Blocked) => "(blocked, wakeup not recorded)",
+            (None, ThreadState::Unknown) => "(unknown: off CPU when the capture attached)",
+        };
+        writeln!(
+            out,
+            "{:>6.1}% {:>9} {latency:>9} {:>9} {:>9}  {waker}",
+            row.share * 100.0,
+            row.intervals,
+            id(row.waker_pid),
+            id(row.waker_tid),
+        )?;
+    }
+    if rows.iter().any(|row| row.wakeup_latency_ns.is_some()) {
+        writeln!(
+            out,
+            "(latency: of the time, how long woken threads waited for a CPU)"
         )?;
     }
     Ok(())

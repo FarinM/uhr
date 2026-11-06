@@ -84,6 +84,19 @@ memory, a file or code, and its file or name. A `region` filter keeps the
 page faults in a kind of region, so grouping them by function shows the
 code that grew the heap, say. Other metrics refuse it.
 
+Time off CPU also groups by what ended each wait, where uhr saw the
+wakeups. `waker` gives the thread that woke each thread that blocked, by its
+ids and the name it had then, or an interrupt. `waker_function` gives the
+functions on the wakeups' stacks, weighed the same way. Those stacks all
+start in the kernel's `try_to_wake_up`, so their self time says little, and
+the result's coverage of named frames is of them. A row has the time off CPU of
+the waits it ended, until they ran again, and how much of that came after
+the wakeup, waiting for a CPU. Waits that no wakeup ended get rows by why:
+preempted, blocked with the wakeup not recorded, or off CPU already when an
+attached capture started. Filters still pick the waits, not the wakers, so
+the waits `under` a lock's function, grouped by waker, show who let go of
+the lock. Other metrics refuse both groupings.
+
 A module is a binary or library, by build-id or by path without one, or the
 kernel or one of its modules. Its self time is time running its code, and
 its total time is time with it anywhere on the stack, which for the libc

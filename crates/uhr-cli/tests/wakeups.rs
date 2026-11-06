@@ -129,6 +129,47 @@ fn sees_what_woke_each_waiting_thread() {
     assert!(0 < woken && woken < runnable, "{time}");
 }
 
+#[test]
+fn finds_who_let_go_of_the_lock_a_thread_waited_for() {
+    let _turn = one_at_a_time();
+    let Some((path, recording)) = record_waits("waker_query", &[]) else {
+        eprintln!("skipped: needs root through sudo without a password");
+        return;
+    };
+    let query = |group_by| -> serde_json::Value {
+        let args = [
+            "query",
+            path.to_str().unwrap(),
+            "--group-by",
+            group_by,
+            "--metric",
+            "off-cpu",
+            "--under",
+            "wait_for_lock",
+            "--json",
+        ];
+        serde_json::from_slice(&uhr(&args).stdout).unwrap()
+    };
+    let share = |row: &serde_json::Value, field| row[field].as_f64().unwrap();
+
+    let wakers = query("waker");
+    let top = &wakers["rows"][0];
+    assert_eq!(top["waker_name"], "holder", "{wakers}");
+    assert!(share(top, "share") > 0.9, "{wakers}");
+
+    let functions = query("waker-function");
+    let rows = functions["rows"].as_array().unwrap();
+    let total = |name: &str| {
+        let row = rows.iter().find(|r| r["function"] == name);
+        let row = row.unwrap_or_else(|| panic!("no {name}: {functions}"));
+        share(row, "total_share")
+    };
+    assert!(total("holder") > 0.9, "{functions}");
+    if recording.manifest.kernel_symbols == uhr_core::recording::KernelSymbols::Saved {
+        assert!(total("futex_wake") > 0.9, "{functions}");
+    }
+}
+
 /// Records `program`, run on `cpus` with `arg`, by attaching to it as root
 /// for a second, with its process id. `None` where uhr can't be root.
 fn record_attached(name: &str, program: &str, cpus: &str, arg: &str) -> Option<(u32, Recording)> {

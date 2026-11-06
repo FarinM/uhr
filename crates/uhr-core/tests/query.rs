@@ -4,7 +4,7 @@ use uhr_core::functions;
 use uhr_core::metric::{self, Metric, Unit};
 use uhr_core::query::{
     Counted, Error, FunctionRow, GroupBy, Latency, ModuleRow, Query, QueryResult, RegionRow, Rows,
-    SyscallRow, run,
+    SyscallRow, WakerRow, WokenBy, run,
 };
 use uhr_core::recording::*;
 use uhr_core::symbols::{FrameName, InlineFrame, Source, SourceStatus, Symbols};
@@ -1928,4 +1928,218 @@ fn leaves_out_the_counted_calls_for_a_region() {
     )
     .unwrap();
     assert!(counted_rows(&result).iter().all(|r| r.2.is_none()));
+}
+
+/// Waits off CPU, by tid 1: blocked 10 to 30 under leaf and woken at 25 by
+/// holder, at stack 2; preempted 40 to 45; blocked 50 to 65 without a stack
+/// and woken at 60 by an interrupt, without one; blocked 70 to 80 and woken
+/// at 72 by holder, at stack 0; blocked 90 to 92 with no wakeup recorded;
+/// and off CPU 0 to 4 when the capture attached.
+fn with_wakeups() -> Recording {
+    let mut recording = with_off_cpu(recording());
+    recording.manifest.start_ns = Some(0);
+    let stream = recording.manifest.streams.last_mut().unwrap();
+    stream.signals.push(Signal::Wakeups);
+    let holder = |time_ns, stack| {
+        Some(Wakeup {
+            time_ns,
+            waker: Waker::Thread {
+                pid: 1,
+                tid: 2,
+                name: "holder".into(),
+            },
+            stack,
+        })
+    };
+    let interrupt = Some(Wakeup {
+        time_ns: 60,
+        waker: Waker::Interrupt,
+        stack: None,
+    });
+    recording.off_cpu[0].wakeup = holder(25, Some(2));
+    recording.off_cpu[2].wakeup = interrupt;
+    let interval = |start_ns, end_ns, state, stack, wakeup| OffCPUInterval {
+        start_ns,
+        end_ns,
+        pid: 1,
+        tid: 1,
+        state,
+        stack,
+        wakeup,
+    };
+    recording.off_cpu.extend([
+        interval(70, 80, ThreadState::Blocked, Some(1), holder(72, Some(0))),
+        interval(90, 92, ThreadState::Blocked, Some(1), None),
+        interval(0, 4, ThreadState::Unknown, None, None),
+    ]);
+    recording
+}
+
+fn by_waker(filter: Filter) -> Query {
+    Query {
+        group_by: GroupBy::Waker,
+        metric: Metric::OffCPU,
+        top: 10,
+        filter,
+    }
+}
+
+type WakerKey = (
+    ThreadState,
+    Option<WokenBy>,
+    Option<u32>,
+    u64,
+    u64,
+    Option<u64>,
+);
+
+fn waker_rows(result: &QueryResult) -> Vec<WakerKey> {
+    let Rows::Wakers(rows) = &result.rows else {
+        panic!("rows of another grouping: {:?}", result.rows)
+    };
+    let key = |r: &WakerRow| {
+        (
+            r.state,
+            r.woken_by,
+            r.waker_tid,
+            r.intervals,
+            r.value,
+            r.wakeup_latency_ns,
+        )
+    };
+    rows.iter().map(key).collect()
+}
+
+#[test]
+fn groups_waits_by_what_ended_them() {
+    let result = run(
+        &with_wakeups(),
+        Some(&symbols()),
+        &by_waker(Filter::default()),
+    )
+    .unwrap();
+    assert_eq!((result.off_cpu_intervals, result.value), (6, 56));
+    let (blocked, thread, interrupt) = (
+        ThreadState::Blocked,
+        Some(WokenBy::Thread),
+        Some(WokenBy::Interrupt),
+    );
+    assert_eq!(
+        waker_rows(&result),
+        [
+            (blocked, thread, Some(2), 2, 30, Some(13)),
+            (blocked, interrupt, None, 1, 15, Some(5)),
+            (ThreadState::Runnable, None, None, 1, 5, None),
+            (ThreadState::Unknown, None, None, 1, 4, None),
+            (blocked, None, None, 1, 2, None),
+        ]
+    );
+    let Rows::Wakers(rows) = &result.rows else {
+        unreachable!()
+    };
+    assert_eq!(rows[0].waker_name.as_deref(), Some("holder"));
+    assert_eq!(rows[0].waker_pid, Some(1));
+    assert_eq!(rows[0].share, 30.0 / 56.0);
+}
+
+#[test]
+fn filters_pick_the_waits_not_their_wakers() {
+    let under_leaf = Filter {
+        under: vec!["leaf".into()],
+        ..Filter::default()
+    };
+    let result = run(&with_wakeups(), Some(&symbols()), &by_waker(under_leaf)).unwrap();
+    let thread = Some(WokenBy::Thread);
+    assert_eq!(
+        waker_rows(&result),
+        [(ThreadState::Blocked, thread, Some(2), 1, 20, Some(5))]
+    );
+}
+
+#[test]
+fn a_wait_cut_before_its_wakeup_has_no_wakeup_latency() {
+    let until_22 = Filter {
+        to_ns: Some(22),
+        ..Filter::default()
+    };
+    let result = run(&with_wakeups(), Some(&symbols()), &by_waker(until_22)).unwrap();
+    let thread = Some(WokenBy::Thread);
+    assert_eq!(
+        waker_rows(&result),
+        [
+            (ThreadState::Blocked, thread, Some(2), 1, 12, Some(0)),
+            (ThreadState::Unknown, None, None, 1, 4, None),
+        ]
+    );
+}
+
+#[test]
+fn weighs_waker_stacks_by_the_waits_they_ended() {
+    let query = Query {
+        group_by: GroupBy::WakerFunction,
+        ..by_waker(Filter::default())
+    };
+    let result = run(&with_wakeups(), Some(&symbols()), &query).unwrap();
+    assert_eq!(result.value, 56);
+    // Stack 2 ended 20 of it, stack 0 ended 10, and no stack the rest.
+    assert_eq!(times(&result, "main"), (0, 30));
+    assert_eq!(times(&result, "leaf"), (10, 10));
+    assert_eq!(result.coverage.named_share, Some(10.0 / 56.0));
+    assert_eq!(
+        result.coverage.unnamed_by_origin[&Origin::Kernel],
+        20.0 / 56.0
+    );
+    assert_eq!(result.coverage.no_stack_share, 26.0 / 56.0);
+
+    let under_leaf = Query {
+        filter: Filter {
+            under: vec!["leaf".into()],
+            ..Filter::default()
+        },
+        ..query
+    };
+    let result = run(&with_wakeups(), Some(&symbols()), &under_leaf).unwrap();
+    assert_eq!(result.value, 20);
+    assert_eq!(times(&result, "main"), (0, 20));
+    let rows = function_rows(&result).iter();
+    assert!(
+        rows.into_iter()
+            .all(|r| r.function.name.as_deref() != Some("leaf"))
+    );
+}
+
+#[test]
+fn groups_by_waker_only_time_off_cpu() {
+    let recording = with_wakeups();
+    for group_by in [GroupBy::Waker, GroupBy::WakerFunction] {
+        for metric in [Metric::OnCPU, Metric::Wall] {
+            let query = Query {
+                group_by,
+                metric,
+                ..by_waker(Filter::default())
+            };
+            match run(&recording, Some(&symbols()), &query) {
+                Err(Error::WakersOfOffCPU) => {}
+                other => panic!("{other:?}"),
+            }
+        }
+    }
+}
+
+#[test]
+fn says_why_a_recording_has_no_wakeups() {
+    let mut recording = with_off_cpu(recording());
+    match run(&recording, Some(&symbols()), &by_waker(Filter::default())) {
+        Err(Error::NoWakeups(reason)) => assert!(reason.contains("--no-wakeups"), "{reason}"),
+        other => panic!("{other:?}"),
+    }
+    let stream = recording.manifest.streams.last_mut().unwrap();
+    stream.missing_signals.push(MissingSignal {
+        signal: Signal::Wakeups,
+        reason: "needs root".into(),
+    });
+    match run(&recording, Some(&symbols()), &by_waker(Filter::default())) {
+        Err(Error::NoWakeups(reason)) => assert_eq!(reason, "needs root"),
+        other => panic!("{other:?}"),
+    }
 }

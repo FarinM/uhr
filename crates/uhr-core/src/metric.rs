@@ -139,3 +139,32 @@ pub(crate) fn stack_amounts(
     }
     Ok(amounts)
 }
+
+/// The off-CPU time that passed a filter, by the stack of the wakeup that
+/// ended it. Time without a waker stack, as a preempted thread's, is
+/// `no_stack`.
+pub(crate) fn waker_amounts(
+    recording: &Recording,
+    functions: &Functions,
+    filter: &Filter,
+) -> Result<StackAmounts, filter::Error> {
+    let mut amounts = StackAmounts {
+        by_stack: vec![0; recording.stacks.len()],
+        user: vec![0; recording.stacks.len()],
+        no_stack: 0,
+        samples: 0,
+        off_cpu_intervals: 0,
+    };
+    if !filter.regions.is_empty() {
+        return Err(filter::Error::RegionsOfPageFaults);
+    }
+    for (interval, start, end) in filter.off_cpu(recording, functions)? {
+        let ns = end - start;
+        match interval.wakeup.as_ref().and_then(|w| w.stack) {
+            Some(stack) => amounts.by_stack[stack as usize] += ns,
+            None => amounts.no_stack += ns,
+        }
+        amounts.off_cpu_intervals += 1;
+    }
+    Ok(amounts)
+}

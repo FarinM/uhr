@@ -7,8 +7,8 @@ use serde::Serialize;
 use crate::coverage::{Coverage, SymbolCoverage};
 use crate::filter::{self, Filter};
 use crate::functions::{Function, Functions, SourceLine};
-use crate::metric::{self, Metric, StackAmounts, Unit, stack_amounts};
-use crate::recording::{self, Origin, Recording, RegionKind, Signal};
+use crate::metric::{self, Metric, StackAmounts, Unit, stack_amounts, waker_amounts};
+use crate::recording::{self, Origin, Recording, RegionKind, Signal, ThreadState, Waker};
 use crate::regions;
 use crate::symbols::Symbols;
 use crate::syscalls::{self, InSyscall};
@@ -28,6 +28,11 @@ pub enum GroupBy {
     /// The region of memory a page fault was in: its kind, and its file or
     /// name.
     Region,
+    /// What ended each wait off CPU: the thread or interrupt that woke it.
+    Waker,
+    /// The functions on the stacks of the wakeups that ended each wait, the
+    /// kernel's from `try_to_wake_up` and the waking thread's.
+    WakerFunction,
 }
 
 #[derive(Debug, Clone)]
@@ -70,6 +75,8 @@ pub enum Rows {
     Syscalls(Vec<SyscallRow>),
     /// Sorted by amount.
     Regions(Vec<RegionRow>),
+    /// Sorted by amount.
+    Wakers(Vec<WakerRow>),
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -147,6 +154,44 @@ pub struct RegionRow {
     pub share: f64,
 }
 
+/// The waits off CPU one waker ended, or that no wakeup recorded ended, in
+/// one state.
+#[derive(Debug, Clone, Serialize)]
+pub struct WakerRow {
+    /// `blocked` for waits a wakeup ended. Without one, `runnable` for a
+    /// preempted thread, which needed none, `blocked` where the wakeup was
+    /// not recorded, and `unknown` for one off CPU already when an attached
+    /// capture started.
+    pub state: ThreadState,
+    /// `None` without a wakeup.
+    pub woken_by: Option<WokenBy>,
+    /// The waking thread, the target's or another process's, by the name it
+    /// had then. `None` unless `woken_by` is `thread`.
+    pub waker_pid: Option<u32>,
+    pub waker_tid: Option<u32>,
+    pub waker_name: Option<String>,
+    /// Off-CPU intervals.
+    pub intervals: u64,
+    /// Their time off CPU, until they ran again.
+    pub value: u64,
+    pub share: f64,
+    /// Of `value`, the time from the wakeup until the thread ran, waiting
+    /// for a CPU. `None` without a wakeup.
+    pub wakeup_latency_ns: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WokenBy {
+    Thread,
+    /// An interrupt, such as a timer's or a device's, or the kernel's work
+    /// deferred from one.
+    Interrupt,
+}
+
+/// The stack shares are of the stacks the amount is weighed by: the ones
+/// threads went off CPU or were sampled at, or grouped by waker function,
+/// those of the wakeups that ended their waits.
 #[derive(Debug, Clone, Serialize)]
 pub struct QueryCoverage {
     /// Share of the amount whose leaf frame has a name. Placeholders don't
@@ -155,7 +200,8 @@ pub struct QueryCoverage {
     /// Share of the amount whose leaf frame has no name, by origin.
     pub unnamed_by_origin: BTreeMap<Origin, f64>,
     /// Share of the amount with no stack: off-CPU time whose stack was not
-    /// recorded. It is in no row.
+    /// recorded, or grouped by waker function, that no wakeup with a stack
+    /// ended. It is in no row.
     pub no_stack_share: f64,
     /// Share of the amount in uhr's own eBPF programs, which the target's
     /// threads run at their syscalls. `None` without them.
@@ -181,6 +227,10 @@ pub enum Error {
          Record without --no-page-faults"
     )]
     NoRegions,
+    #[error("wakeups end only time off CPU: group by them with --metric off-cpu")]
+    WakersOfOffCPU,
+    #[error("the recording has no wakeups: {0}")]
+    NoWakeups(String),
 }
 
 pub fn query(dir: &Path, query: &Query) -> Result<QueryResult, Error> {
@@ -195,20 +245,32 @@ pub fn run(
     query: &Query,
 ) -> Result<QueryResult, Error> {
     query.metric.check(recording)?;
-    if query.group_by == GroupBy::Region {
-        if query.metric != Metric::PageFaults {
+    let streams = &recording.manifest.streams;
+    let recorded = |signal| streams.iter().any(|s| s.signals.contains(&signal));
+    match query.group_by {
+        GroupBy::Region if query.metric != Metric::PageFaults => {
             return Err(Error::RegionsOfPageFaults);
         }
-        let read = recording.manifest.streams.iter();
-        if !read
-            .clone()
-            .any(|s| s.signals.contains(&Signal::MemoryRegions))
-        {
-            return Err(Error::NoRegions);
+        GroupBy::Region if !recorded(Signal::MemoryRegions) => return Err(Error::NoRegions),
+        GroupBy::Waker | GroupBy::WakerFunction if query.metric != Metric::OffCPU => {
+            return Err(Error::WakersOfOffCPU);
         }
+        GroupBy::Waker | GroupBy::WakerFunction if !recorded(Signal::Wakeups) => {
+            let missing = streams.iter().flat_map(|s| &s.missing_signals);
+            let mut missing = missing.chain(&recording.manifest.missing_signals);
+            let reason = match missing.find(|m| m.signal == Signal::Wakeups) {
+                Some(missing) => missing.reason.clone(),
+                None => "uhr was not asked to see them. Record without --no-wakeups".into(),
+            };
+            return Err(Error::NoWakeups(reason));
+        }
+        _ => {}
     }
     let functions = Functions::new(recording, symbols);
-    let amounts = stack_amounts(recording, &functions, &query.filter, query.metric)?;
+    let amounts = match query.group_by {
+        GroupBy::WakerFunction => waker_amounts(recording, &functions, &query.filter)?,
+        _ => stack_amounts(recording, &functions, &query.filter, query.metric)?,
+    };
     let value = amounts.total();
 
     let share = |amount: u64| {
@@ -242,6 +304,14 @@ pub fn run(
         GroupBy::Region => {
             Rows::Regions(region_rows(recording, &functions, &query.filter, &share)?)
         }
+        GroupBy::Waker => Rows::Wakers(waker_rows(recording, &functions, &query.filter, &share)?),
+        GroupBy::WakerFunction => Rows::Functions(function_rows(
+            recording,
+            &functions,
+            false,
+            &amounts.by_stack,
+            &share,
+        )),
     };
     let rows_omitted = rows.truncate(query.top);
 
@@ -298,6 +368,7 @@ impl Rows {
             Rows::Modules(rows) => truncate(rows, top),
             Rows::Syscalls(rows) => truncate(rows, top),
             Rows::Regions(rows) => truncate(rows, top),
+            Rows::Wakers(rows) => truncate(rows, top),
         }
     }
 }
@@ -523,6 +594,65 @@ fn region_rows(
             .cmp(&a.value)
             .then_with(|| a.kind.cmp(&b.kind))
             .then_with(|| a.path.cmp(&b.path))
+    });
+    Ok(rows)
+}
+
+#[derive(Default)]
+struct Waits {
+    intervals: u64,
+    ns: u64,
+    latency_ns: u64,
+}
+
+/// The off-CPU time that passes `filter`, by what ended each wait.
+fn waker_rows(
+    recording: &Recording,
+    functions: &Functions,
+    filter: &Filter,
+    share: &impl Fn(u64) -> f64,
+) -> Result<Vec<WakerRow>, filter::Error> {
+    type Key<'a> = (ThreadState, Option<WokenBy>, Option<(u32, u32, &'a str)>);
+    let mut by_waker: HashMap<Key, Waits> = HashMap::new();
+    for (interval, start, end) in filter.off_cpu(recording, functions)? {
+        let wakeup = interval.wakeup.as_ref();
+        let (woken_by, thread) = match wakeup.map(|w| &w.waker) {
+            Some(Waker::Thread { pid, tid, name }) => {
+                (Some(WokenBy::Thread), Some((*pid, *tid, name.as_str())))
+            }
+            Some(Waker::Interrupt) => (Some(WokenBy::Interrupt), None),
+            None => (None, None),
+        };
+        let waits = by_waker
+            .entry((interval.state, woken_by, thread))
+            .or_default();
+        waits.intervals += 1;
+        waits.ns += end - start;
+        if let Some(wakeup) = wakeup {
+            waits.latency_ns += end - wakeup.time_ns.clamp(start, end);
+        }
+    }
+    let mut rows: Vec<WakerRow> = by_waker
+        .into_iter()
+        .map(|((state, woken_by, thread), waits)| WakerRow {
+            state,
+            woken_by,
+            waker_pid: thread.map(|t| t.0),
+            waker_tid: thread.map(|t| t.1),
+            waker_name: thread.map(|t| t.2.to_owned()),
+            intervals: waits.intervals,
+            value: waits.ns,
+            share: share(waits.ns),
+            wakeup_latency_ns: woken_by.map(|_| waits.latency_ns),
+        })
+        .collect();
+    rows.sort_by(|a, b| {
+        b.value
+            .cmp(&a.value)
+            .then_with(|| a.state.as_str().cmp(b.state.as_str()))
+            .then_with(|| a.woken_by.cmp(&b.woken_by))
+            .then_with(|| (a.waker_pid, a.waker_tid).cmp(&(b.waker_pid, b.waker_tid)))
+            .then_with(|| a.waker_name.cmp(&b.waker_name))
     });
     Ok(rows)
 }
