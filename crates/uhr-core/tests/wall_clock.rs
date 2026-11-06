@@ -118,11 +118,15 @@ fn refuses_a_range_of_times_of_day_outside_the_recording() {
 fn a_range_has_to_start_before_it_ends() {
     let manifest = manifest();
     let backwards = [
-        (Time::Offset(3 * S), Time::Offset(3 * S)),
-        (Time::Offset(5 * S), Time::Utc(utc("2026-11-06T12:00:04Z"))),
+        (Some(Time::Offset(3 * S)), Time::Offset(3 * S)),
+        (
+            Some(Time::Offset(5 * S)),
+            Time::Utc(utc("2026-11-06T12:00:04Z")),
+        ),
+        (None, Time::Offset(0)),
     ];
     for (from, to) in backwards {
-        let range = offsets(&manifest, Some(from), Some(to));
+        let range = offsets(&manifest, from, Some(to));
         assert!(matches!(range, Err(Error::Empty)), "{range:?}");
     }
 }

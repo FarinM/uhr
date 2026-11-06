@@ -147,8 +147,9 @@ pub fn offsets(
         }
         None => None,
     };
-    if let (Some(from), Some(to)) = (from, to)
-        && from >= to
+    // Without a start, a range starts at the recording's.
+    if let Some(to) = to
+        && from.unwrap_or(0) >= to
     {
         return Err(Error::Empty);
     }
