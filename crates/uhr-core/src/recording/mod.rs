@@ -1124,7 +1124,8 @@ impl Recording {
     }
 }
 
-fn read_manifest(dir: &Path) -> Result<Manifest> {
+/// Reads the manifest alone, without the tables.
+pub fn read_manifest(dir: &Path) -> Result<Manifest> {
     let path = dir.join(MANIFEST);
     let text = match fs::read(&path) {
         Ok(text) => text,

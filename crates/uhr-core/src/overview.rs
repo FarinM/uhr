@@ -7,11 +7,12 @@ use crate::coverage::Coverage;
 use crate::filter::{self, Filter};
 use crate::functions::Functions;
 use crate::recording::{
-    self, Collector, Exit, MemoryReading, Mode, OffCPUInterval, Recording, RegionKind, Sample,
-    Signal, Thread, ThreadState,
+    self, Collector, Exit, Manifest, MemoryReading, Mode, OffCPUInterval, Recording, RegionKind,
+    Sample, Signal, Thread, ThreadState,
 };
 use crate::symbols::Symbols;
 use crate::threads::ThreadNames;
+use crate::wall_clock;
 
 /// Time level 0: how much CPU time each process and thread used, in which
 /// mode, and how long it waited off CPU, against how long it was alive. It
@@ -30,6 +31,10 @@ pub struct Overview {
     /// The part of the recording covered: all of it, or what the time
     /// filter selects.
     pub window: Window,
+    /// The recording's start and the window as times of day. `None` if they
+    /// are not known, for the reason in `times_of_day_unknown`.
+    pub times_of_day: Option<TimesOfDay>,
+    pub times_of_day_unknown: Option<String>,
     #[serde(flatten)]
     pub cpu: CPUTime,
     /// CPU time over the window's wall time: 2.0 means two CPUs busy on
@@ -119,6 +124,25 @@ pub struct MemoryUsage {
 pub struct Window {
     pub start_ns: u64,
     pub end_ns: u64,
+}
+
+/// In UTC, as RFC 3339, to the microsecond.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TimesOfDay {
+    pub recording_start: String,
+    pub window_start: String,
+    pub window_end: String,
+}
+
+impl TimesOfDay {
+    fn of(manifest: &Manifest, window: &Window) -> Result<Self, wall_clock::Error> {
+        let utc = |offset| wall_clock::utc_of(manifest, offset).map(wall_clock::format);
+        Ok(Self {
+            recording_start: utc(0)?,
+            window_start: utc(window.start_ns)?,
+            window_end: utc(window.end_ns)?,
+        })
+    }
 }
 
 /// Sampled CPU time, by mode.
@@ -424,6 +448,10 @@ pub fn run(
         ));
     }
 
+    let (times_of_day, times_of_day_unknown) = match TimesOfDay::of(manifest, &window) {
+        Ok(times) => (Some(times), None),
+        Err(unknown) => (None, Some(unknown.to_string())),
+    };
     Ok(Overview {
         command: manifest.target.command.clone(),
         exit: manifest.target.exit.clone(),
@@ -431,6 +459,8 @@ pub fn run(
         recording_start_ns: start,
         recording_duration_ns: duration,
         window,
+        times_of_day,
+        times_of_day_unknown,
         cpu_utilization: ratio(cpu.cpu_ns, window.end_ns - window.start_ns),
         cpu,
         off_cpu,

@@ -28,9 +28,14 @@ behaviors.
 - Results are structured (JSON with a published schema) with a short readable
   form.
 - Large results are paged, and truncation is always reported.
-- Times in results and filters are nanosecond offsets from the recording
-  start, which `overview` gives once as a clock value. Raw clock values are
-  large numbers that are easy to get wrong.
+- Times in results are nanosecond offsets from the recording start, which
+  `overview` gives once as a clock value, and with its window as times of
+  day in UTC. Raw clock values are large numbers that are easy to get wrong.
+  Filters take offsets, or times of day as logs write them, in RFC 3339 with
+  a date and a UTC offset, so a moment in a log can be found in a
+  recording. A time of day before the start is the start, but a range that
+  ends before the recording or starts after it is refused, as more likely a
+  mistake of date or time zone than a question.
 
 ## Sketch of the tool surface
 

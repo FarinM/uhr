@@ -11,6 +11,7 @@ arrow-array.workspace = true
 arrow-buffer.workspace = true
 arrow-schema.workspace = true
 arrow-select.workspace = true
+chrono.workspace = true
 memmap2.workspace = true
 lzma-rs.workspace = true
 crc32fast.workspace = true

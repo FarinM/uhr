@@ -26,8 +26,9 @@ use uhr_core::query::{
     self, FunctionRow, GroupBy, Latency, ModuleRow, Query, QueryResult, RegionRow, Rows,
     SyscallRow, WakerRow, WokenBy,
 };
-use uhr_core::recording::{Exit, Mode, RegionKind, ThreadState};
+use uhr_core::recording::{Exit, Mode, RegionKind, ThreadState, read_manifest};
 use uhr_core::symbols;
+use uhr_core::wall_clock::{self, Time};
 
 #[cfg(target_os = "linux")]
 use signals::{Handlers, INTERRUPTS};
@@ -305,13 +306,14 @@ struct FilterArgs {
     /// page-faults
     #[arg(long = "region", value_name = "KIND", value_enum)]
     regions: Vec<RegionArg>,
-    /// Only samples from this offset into the recording on, such as 1.5s or
-    /// 200ms
-    #[arg(long, value_name = "OFFSET", value_parser = parse_offset)]
-    from: Option<u64>,
-    /// Only samples before this offset into the recording
-    #[arg(long, value_name = "OFFSET", value_parser = parse_offset)]
-    to: Option<u64>,
+    /// Only samples from this time on: an offset into the recording, such
+    /// as 1.5s or 200ms, or a time of day with a date and a UTC offset, such
+    /// as 2026-11-06T12:34:56.7Z
+    #[arg(long, value_name = "TIME", value_parser = parse_time)]
+    from: Option<Time>,
+    /// Only samples before this time, given as for --from
+    #[arg(long, value_name = "TIME", value_parser = parse_time)]
+    to: Option<Time>,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -358,12 +360,13 @@ impl From<RegionArg> for RegionKind {
 }
 
 impl FilterArgs {
-    fn into_filter(self) -> Result<Filter> {
-        if let (Some(from), Some(to)) = (self.from, self.to)
-            && from >= to
-        {
-            bail!("--from must be before --to");
-        }
+    /// Reads the manifest of `recording` for the times of day of `--from`
+    /// and `--to`.
+    fn into_filter(self, recording: &Path) -> Result<Filter> {
+        let (from_ns, to_ns) = match (self.from, self.to) {
+            (None, None) => (None, None),
+            (from, to) => wall_clock::offsets(&read_manifest(recording)?, from, to)?,
+        };
         Ok(Filter {
             pids: self.pids,
             tids: self.tids,
@@ -380,9 +383,20 @@ impl FilterArgs {
             under: self.under,
             syscalls: self.syscalls,
             regions: self.regions.into_iter().map(RegionKind::from).collect(),
-            from_ns: self.from,
-            to_ns: self.to,
+            from_ns,
+            to_ns,
         })
+    }
+}
+
+/// An offset, or a time of day where it has the shape of one.
+fn parse_time(text: &str) -> Result<Time, String> {
+    if text.contains([':', 'T']) || text.get(4..5) == Some("-") {
+        wall_clock::parse(text)
+            .map(Time::Utc)
+            .map_err(|e| e.to_string())
+    } else {
+        parse_offset(text).map(Time::Offset)
     }
 }
 
@@ -612,7 +626,7 @@ fn run_symbolize(recording: &Path) -> Result<ExitCode> {
 }
 
 fn run_overview(recording: &Path, top: usize, filter: FilterArgs, json: bool) -> Result<ExitCode> {
-    let result = overview::overview(recording, &filter.into_filter()?, top)?;
+    let result = overview::overview(recording, &filter.into_filter(recording)?, top)?;
     if json {
         let text = serde_json::to_string_pretty(&result)?;
         write_output(|out| writeln!(out, "{text}"))?;
@@ -635,15 +649,24 @@ fn write_overview(out: &mut impl Write, result: &Overview) -> io::Result<()> {
     };
     writeln!(out, "{command}, {exit}")?;
     let window = &result.window;
+    let times = result.times_of_day.as_ref();
     write!(out, "{} recorded", seconds(result.recording_duration_ns))?;
+    match (times, &result.times_of_day_unknown) {
+        (Some(times), _) => write!(out, " from {}", times.recording_start)?,
+        (None, Some(unknown)) => write!(out, " (times of day unknown: {unknown})")?,
+        (None, None) => {}
+    }
     if !result.filter.is_empty() {
         write!(
             out,
-            ", showing {} to {}, filter: {}",
+            ", showing {} to {}",
             seconds(window.start_ns),
             seconds(window.end_ns),
-            describe_filter(&result.filter)
         )?;
+        if let Some(times) = times {
+            write!(out, " ({} to {})", times.window_start, times.window_end)?;
+        }
+        write!(out, ", filter: {}", describe_filter(&result.filter))?;
     }
     writeln!(out)?;
     let cpu = &result.cpu;
@@ -874,7 +897,7 @@ fn run_call_paths(
         depth,
         top,
         metric,
-        filter: filter.into_filter()?,
+        filter: filter.into_filter(recording)?,
     };
     let result = call_paths::call_paths(recording, &query)?;
     if json {
@@ -897,7 +920,7 @@ fn run_flamegraph(
 ) -> Result<ExitCode> {
     let query = flamegraph::Query {
         metric,
-        filter: filter.into_filter()?,
+        filter: filter.into_filter(recording)?,
         root,
     };
     let graph = flamegraph::flame_graph(recording, &query)?;
@@ -1101,7 +1124,7 @@ fn run_query(
         },
         metric,
         top,
-        filter: filter.into_filter()?,
+        filter: filter.into_filter(recording)?,
     };
     let result = query::query(recording, &query)?;
     if json {

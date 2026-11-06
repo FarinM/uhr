@@ -60,6 +60,7 @@ uhr query rec --group-by function                  # top functions
 uhr query rec --group-by line --under parse_json   # hot lines under a function
 uhr query rec --group-by syscall --metric off-cpu  # syscalls threads waited in
 uhr query rec --group-by waker --metric off-cpu --under lock_slow  # who ended those waits
+uhr query rec --group-by function --from 2026-11-06T12:34:56Z  # from a time in a log
 uhr query rec --group-by function --metric page-faults  # code that grew memory
 uhr query rec --group-by region --metric page-faults    # heap, files, or mappings?
 uhr call-paths rec --function memcpy               # callers and callees

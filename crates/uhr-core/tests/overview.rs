@@ -334,6 +334,42 @@ fn a_time_range_narrows_the_window_and_lifetimes() {
 }
 
 #[test]
+fn tells_the_window_as_times_of_day() {
+    let mut recording = recording();
+    let noon = uhr_core::wall_clock::parse("2026-11-06T12:00:00Z").unwrap();
+    let reading = |time_ns: u64| ClockReading {
+        time_ns,
+        realtime_ns: noon - 1_000 + time_ns as i64,
+    };
+    recording.manifest.wall_clock = Some(WallClock {
+        start: reading(0),
+        end: reading(12_000),
+    });
+    let filter = Filter {
+        from_ns: Some(4_500),
+        to_ns: Some(9_500),
+        ..Filter::default()
+    };
+    let result = overview(&recording, filter);
+    let times = result.times_of_day.unwrap();
+    assert_eq!(times.recording_start, "2026-11-06T12:00:00.000000Z");
+    assert_eq!(times.window_start, "2026-11-06T12:00:00.000004Z");
+    assert_eq!(times.window_end, "2026-11-06T12:00:00.000009Z");
+    assert_eq!(result.times_of_day_unknown, None);
+}
+
+#[test]
+fn says_why_it_knows_no_times_of_day() {
+    let result = overview(&recording(), Filter::default());
+    assert_eq!(result.times_of_day, None);
+    let unknown = result.times_of_day_unknown.unwrap();
+    assert!(
+        unknown.contains("before it read the system clock"),
+        "{unknown}"
+    );
+}
+
+#[test]
 fn a_time_range_past_the_end_leaves_an_empty_window() {
     let filter = Filter {
         from_ns: Some(20_000),

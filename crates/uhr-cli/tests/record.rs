@@ -12,7 +12,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 
@@ -52,6 +52,47 @@ fn records_the_frequency_perf_actually_used() {
     assert!(sampling["frequency_hz"].as_u64().unwrap() < 10_000_000);
     assert!(
         String::from_utf8_lossy(&output.stderr).contains("perf lowered the sampling frequency")
+    );
+}
+
+#[test]
+fn tells_its_times_as_times_of_day() {
+    let dir = common::scratch("times_of_day");
+    let program = dir.join("cpu_bound");
+    common::compile("cpu_bound", &program, "-O2");
+    let recording = dir.join("rec");
+    let since_1970 = |time: SystemTime| time.duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let before = since_1970(SystemTime::now());
+    let output = record(&recording, &[], &[program.to_str().unwrap(), "20"]);
+    let after = since_1970(SystemTime::now());
+    assert!(output.status.success());
+
+    let rec = recording.to_str().unwrap();
+    let json =
+        |args: &[&str]| -> Value { serde_json::from_slice(&common::uhr(args).stdout).unwrap() };
+    let overview = json(&["overview", rec, "--json"]);
+    let start = overview["times_of_day"]["recording_start"]
+        .as_str()
+        .unwrap();
+    let start_ns = uhr_core::wall_clock::parse(start).unwrap();
+    assert!((before..=after).contains(&(start_ns as u128)), "{overview}");
+
+    let half = overview["recording_duration_ns"].as_u64().unwrap() / 2;
+    let from = uhr_core::wall_clock::format(start_ns + half as i64);
+    let second_half = json(&[
+        "query",
+        rec,
+        "--group-by",
+        "function",
+        "--from",
+        &from,
+        "--json",
+    ]);
+    // The start and `from` are each cut to the microsecond.
+    let from_ns = second_half["filter"]["from_ns"].as_u64().unwrap();
+    assert!(
+        from_ns.abs_diff(half) < 2_000,
+        "{from} is {from_ns} ns in, not {half}"
     );
 }
 
