@@ -1087,6 +1087,7 @@ mod tests {
                 clock: Clock::Monotonic,
                 start_ns: None,
                 end_ns: None,
+                wall_clock: None,
                 streams: Vec::new(),
                 missing_signals: Vec::new(),
                 kernel_symbols: KernelSymbols::Saved,

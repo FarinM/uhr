@@ -15,6 +15,7 @@ use rustix::pipe::{PipeFlags, pipe_with};
 use rustix::process::{Pid, PidfdFlags, Signal, pidfd_open};
 
 use crate::procfs;
+use uhr_core::recording::ClockReading;
 
 /// Why a target could not be started.
 #[derive(Debug, thiserror::Error)]
@@ -261,4 +262,31 @@ impl Interrupts {
 pub(crate) fn monotonic_ns() -> u64 {
     let now = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
     now.tv_sec as u64 * 1_000_000_000 + now.tv_nsec as u64
+}
+
+/// CLOCK_REALTIME at the middle of two readings of CLOCK_MONOTONIC, from
+/// the closest of a few tries, as a thread can be preempted between them.
+pub(crate) fn clock_reading() -> ClockReading {
+    let realtime_ns = || {
+        let now = rustix::time::clock_gettime(rustix::time::ClockId::Realtime);
+        now.tv_sec * 1_000_000_000 + now.tv_nsec
+    };
+    let read = || {
+        let before = monotonic_ns();
+        let realtime_ns = realtime_ns();
+        let took = monotonic_ns() - before;
+        let time_ns = before + took / 2;
+        (
+            took,
+            ClockReading {
+                time_ns,
+                realtime_ns,
+            },
+        )
+    };
+    let first = read();
+    let closest = (1..5)
+        .map(|_| read())
+        .fold(first, |a, b| if b.0 < a.0 { b } else { a });
+    closest.1
 }

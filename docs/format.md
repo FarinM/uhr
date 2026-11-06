@@ -52,6 +52,7 @@ replaces them.
 | `target.exit` | `{"code": n}`, `{"signal": n}`, `{"unknown": reason}` when uhr could not see the status, as for a process it attached to, or null if it was still running |
 | `clock` | `CLOCK_MONOTONIC` |
 | `start_ns`, `end_ns` | When the capture started and stopped: the first and last event or memory reading, or when perf began sampling a process uhr attached to if that came earlier, and when uhr stopped the recording if that came later, at an interrupt or the end of `--duration`. Null if nothing was recorded |
+| `wall_clock` | CLOCK_REALTIME read against `clock` as the capture started and as it stopped, as `start` and `end`, each a `time_ns` on `clock` and a `realtime_ns` in nanoseconds since 1970 began in UTC. They tell times on `clock` as times of day. Where they put the two clocks more than 1 ms further apart at the end than at the start, the system clock was set during the capture, and times of day are not known. Null in a recording from before uhr read it |
 | `streams` | One per collector that ran |
 | `missing_signals` | The signals of collectors that could not run, each with a `reason`, as `syscall_calls` without the privileges to load eBPF |
 | `kernel_symbols` | `{"status": "saved"}` if the kernel's symbols were read while recording, or `{"status": "unavailable", "reason": ...}` if not, and then kernel frames have no names |

@@ -29,6 +29,16 @@ fn example() -> Recording {
             clock: Clock::Monotonic,
             start_ns: Some(1_000),
             end_ns: Some(9_000),
+            wall_clock: Some(WallClock {
+                start: ClockReading {
+                    time_ns: 900,
+                    realtime_ns: 1_793_997_015_000_000_000,
+                },
+                end: ClockReading {
+                    time_ns: 9_100,
+                    realtime_ns: 1_793_997_015_000_008_200,
+                },
+            }),
             streams: vec![
                 Stream {
                     id: "perf".into(),
@@ -409,6 +419,21 @@ fn reads_a_recording_from_before_syscalls_could_be_skipped() {
             .is_some()
     );
     fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    assert_eq!(Recording::read(&dir).unwrap(), recording);
+}
+
+#[test]
+fn reads_a_recording_from_before_its_wall_clock() {
+    let dir = scratch("before_wall_clock");
+    let mut recording = example();
+    recording.write(&dir).unwrap();
+    let path = dir.join("manifest.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let removed = manifest.as_object_mut().unwrap().remove("wall_clock");
+    assert!(removed.is_some());
+    fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    recording.manifest.wall_clock = None;
     assert_eq!(Recording::read(&dir).unwrap(), recording);
 }
 

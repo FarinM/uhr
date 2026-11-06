@@ -148,6 +148,14 @@ Debian and Ubuntu its package must match the running kernel.
   overflow perf's buffer: the switch is kept, but its stack is lost and
   counted among the lost events.
 - `--clockid=CLOCK_MONOTONIC` puts samples on the shared clock.
+- uhr reads CLOCK_REALTIME between two readings of CLOCK_MONOTONIC, the
+  closest of five tries, as the capture starts and as it stops, so the
+  recording's times can be told as times of day. NTP slews both clocks
+  alike, so they keep their offset unless the system clock is set, by hand,
+  by a step of NTP or at a leap second, which the second reading shows.
+  uhr reads the clocks in its own time namespace, which perf's timestamps
+  don't follow, so in a container with one of its own, times of day are off
+  by its offset.
 - `--buildid-mmap` has the kernel record each mapping's build-id, so symbols
   are matched to the exact file that ran.
 - Frame-pointer call graphs by default. With `--unwind dwarf`, perf copies

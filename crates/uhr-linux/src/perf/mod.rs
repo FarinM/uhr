@@ -27,7 +27,7 @@ use crate::doctor;
 use crate::ebpf::{self, Programs};
 use crate::interpreters::Interpreters;
 use crate::kallsyms::Kallsyms;
-use crate::launch::{self, Held, Interrupts, Process, monotonic_ns};
+use crate::launch::{self, Held, Interrupts, Process, clock_reading, monotonic_ns};
 use crate::memory;
 use crate::perf_map;
 use crate::runtimes;
@@ -256,6 +256,7 @@ pub fn record(options: &RecordOptions, interrupts: &Interrupts, out: &Path) -> R
     let watch = perf_map::watch(Path::new(perf_map::DIR))
         .inspect_err(|error| warn!(%error, "watching for perf maps"))
         .ok();
+    let wall_start = clock_reading();
     let ended = run(
         &perf_data,
         &samples,
@@ -265,6 +266,7 @@ pub fn record(options: &RecordOptions, interrupts: &Interrupts, out: &Path) -> R
         interrupts,
         &ready,
     );
+    let wall_end = clock_reading();
     let map_owners = watch.map(perf_map::Watch::stop).unwrap_or_default();
     let ended = match ended {
         Ok(ended) => ended,
@@ -385,6 +387,10 @@ pub fn record(options: &RecordOptions, interrupts: &Interrupts, out: &Path) -> R
         matches!(ready, Ready::Attach { .. }),
     );
     add_memory(&mut recording, ended.memory, ended.glibc_names);
+    recording.manifest.wall_clock = Some(recording::WallClock {
+        start: wall_start,
+        end: wall_end,
+    });
 
     // uhr made the runtimes it launched write them, so it cleans them up
     // once the recording holds the names.

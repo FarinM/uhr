@@ -13,6 +13,11 @@ pub struct Manifest {
     /// any collector, or the interrupt that stopped it if that came later.
     pub start_ns: Option<u64>,
     pub end_ns: Option<u64>,
+    /// CLOCK_REALTIME read against `clock` as the capture started and as it
+    /// stopped, so its times can be told as times of day. `None` in a
+    /// recording from before uhr read it.
+    #[serde(default)]
+    pub wall_clock: Option<WallClock>,
     pub streams: Vec<Stream>,
     /// The signals of collectors that could not run, each with the reason.
     pub missing_signals: Vec<MissingSignal>,
@@ -65,6 +70,22 @@ pub enum Exit {
 pub enum Clock {
     #[serde(rename = "CLOCK_MONOTONIC")]
     Monotonic,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WallClock {
+    pub start: ClockReading,
+    pub end: ClockReading,
+}
+
+/// Both clocks, read at nearly the same moment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClockReading {
+    /// On the recording's clock.
+    pub time_ns: u64,
+    /// CLOCK_REALTIME: nanoseconds since 1970 began in UTC, leap seconds
+    /// left out.
+    pub realtime_ns: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

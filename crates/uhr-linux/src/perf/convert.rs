@@ -518,6 +518,7 @@ pub(super) fn convert(input: Input) -> Result<(Recording, Option<EbpfStacks>)> {
             clock: Clock::Monotonic,
             start_ns: state.start_ns,
             end_ns: state.end_ns,
+            wall_clock: None,
             streams: vec![stream],
             missing_signals: Vec::new(),
             kernel_symbols: saved,

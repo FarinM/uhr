@@ -92,6 +92,7 @@ fn recording() -> Recording {
             clock: Clock::Monotonic,
             start_ns: Some(0),
             end_ns: Some(10),
+            wall_clock: None,
             streams: Vec::new(),
             missing_signals: Vec::new(),
             kernel_symbols: KernelSymbols::Saved,

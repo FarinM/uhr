@@ -17,7 +17,8 @@ A recording is one profiling session of one target. It contains:
   stacks and the process and thread table are shared, so the streams of one
   target can be read together.
 - **Shared clock**: all observations sit on one monotonic timeline. Collectors
-  with their own clocks are aligned by a measured offset.
+  with their own clocks are aligned by a measured offset. The recording also
+  keeps the timeline's offset from the time of day, to line it up with logs.
 - **Process and thread table**: every process and thread seen, with lifetime
   and name history.
 - **Mapping table**: the memory mappings and code regions seen, so addresses
