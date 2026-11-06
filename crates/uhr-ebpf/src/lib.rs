@@ -21,6 +21,10 @@ pub struct Start {
     pub ns: u64,
     pub tgid: u32,
     pub nr: u32,
+    /// The thread's name, by its key in `NAMES`, kept as the kernel
+    /// renames it. One 8-byte write sets it, so a call that returns as
+    /// another thread renames this one reads the old name or the new.
+    pub name: u64,
 }
 
 #[repr(C)]
@@ -30,6 +34,8 @@ pub struct CallKey {
     pub tid: u32,
     pub nr: u32,
     pub pad: u32,
+    /// The thread's name when the calls returned, by its key in `NAMES`.
+    pub name: u64,
 }
 
 /// The calls a thread made to one syscall that returned.

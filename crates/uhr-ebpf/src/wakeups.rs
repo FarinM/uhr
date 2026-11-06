@@ -19,7 +19,7 @@ use uhr_ebpf::{
 use crate::samples::{
     FRAME, FRAME_WORDS, MAX_STACK, PAGE, STACK_BYTES, copy_stack, saved_user_registers,
 };
-use crate::targets::{active, current, running};
+use crate::targets::{active, current, ids, running};
 
 /// Apart from the samples, so that a target that wakes its threads often
 /// can't crowd them out. uhr sets its size at load.
@@ -29,13 +29,6 @@ static WAKEUPS: RingBuf = RingBuf::with_byte_size(16 << 20, 0);
 /// Wakeups that found `WAKEUPS` full.
 #[map]
 static WAKEUPS_DROPPED: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
-
-/// Where a `task_struct` keeps its process's id and its own, which uhr sets
-/// at load from the kernel's BTF.
-#[unsafe(no_mangle)]
-static TASK_TGID: Global<u32> = Global::new(u32::MAX);
-#[unsafe(no_mangle)]
-static TASK_PID: Global<u32> = Global::new(u32::MAX);
 
 /// Where a `task_struct` keeps its softirq count, which only `PREEMPT_RT` has
 /// and where it counts them instead of in the preempt count. uhr sets it at
@@ -117,14 +110,6 @@ pub fn sched_waking(ctx: RawTracePointContext) -> i32 {
         woken(&ctx, wakeup, user);
     }
     0
-}
-
-/// The process and thread ids of `task`.
-fn ids(task: *const u8) -> Option<(u32, u32)> {
-    let read = |offset: u32| unsafe {
-        bpf_probe_read_kernel(task.wrapping_add(offset as usize).cast::<u32>()).ok()
-    };
-    Some((read(TASK_TGID.load())?, read(TASK_PID.load())?))
 }
 
 /// Whether the CPU runs an interrupt: a hard one, an NMI, or the kernel's

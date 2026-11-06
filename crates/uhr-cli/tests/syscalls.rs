@@ -454,6 +454,129 @@ fn counts_a_thread_after_many_have_come_and_gone() {
     assert!(calls >= 1000, "{read}");
 }
 
+/// The calls of `syscall` counted in `recording` under the threads' name
+/// `thread`. `None` if they were not counted.
+/// The calls of `syscall` counted, of the threads `filter` keeps.
+fn calls_of(recording: &str, filter: &[&str], syscall: &str) -> Option<u64> {
+    let mut args = vec![
+        "query",
+        recording,
+        "--group-by",
+        "syscall",
+        "--metric",
+        "off-cpu",
+        "--syscall",
+        syscall,
+    ];
+    args.extend(filter);
+    let result = json(&args);
+    let rows = result["rows"].as_array().unwrap();
+    let row = rows.iter().find(|r| r["syscall"] == syscall)?;
+    row["calls"]["calls"].as_u64()
+}
+
+#[test]
+fn counts_the_calls_of_a_thread_by_the_name_it_had() {
+    let _turn = one_at_a_time();
+    let dir = scratch("syscalls_by_thread_name");
+    let program = dir.join("renamed");
+    compile("renamed", &program, "-O2");
+    let recording = dir.join("rec");
+    let rec = recording.to_str().unwrap();
+    let args = ["record", "-o", rec, "--", program.to_str().unwrap()];
+    if uhr_as_root(&args, &recording).is_none() {
+        eprintln!("skipped: needs root through sudo without a password");
+        return;
+    }
+    assert_eq!(calls_of(rec, &["--thread", "renamed"], "getppid"), Some(3));
+    // Named through its comm file, by the main thread.
+    assert_eq!(calls_of(rec, &["--thread", "by-main"], "getppid"), Some(5));
+    assert_eq!(
+        calls_of(rec, &["--thread", "by-itself"], "getppid"),
+        Some(7)
+    );
+    assert_eq!(calls_of(rec, &["--thread", "by-*"], "getppid"), Some(12));
+}
+
+#[test]
+fn counts_each_call_under_a_name_the_thread_had_as_another_renames_it() {
+    let _turn = one_at_a_time();
+    let dir = scratch("syscalls_renaming");
+    let program = dir.join("renaming");
+    compile("renaming", &program, "-O2");
+    let recording = dir.join("rec");
+    let rec = recording.to_str().unwrap();
+    let args = ["record", "-o", rec, "--", program.to_str().unwrap()];
+    if uhr_as_root(&args, &recording).is_none() {
+        eprintln!("skipped: needs root through sudo without a password");
+        return;
+    }
+    let all = calls_of(rec, &[], "getppid").unwrap();
+    let named: u64 = ["renaming", "AAAAAAAAAAAAAAA", "BBBBBBBBBBBBBBB"]
+        .map(|name| calls_of(rec, &["--thread", name], "getppid").unwrap_or(0))
+        .iter()
+        .sum();
+    assert_eq!(named, all);
+}
+
+#[test]
+fn has_no_thread_names_where_it_could_not_follow_renames() {
+    let _turn = one_at_a_time();
+    if fs::metadata("/sys/kernel/btf/vmlinux").is_err() {
+        eprintln!("skipped: the kernel has no BTF");
+        return;
+    }
+    let dir = scratch("syscalls_renamed_without_btf");
+    let program = dir.join("renamed");
+    compile("renamed", &program, "-O2");
+    let recording = dir.join("rec");
+    let rec = recording.to_str().unwrap();
+    // With the kernel's BTF hidden, in a mount namespace of its own.
+    let hide = r#"mount --bind /dev/null /sys/kernel/btf/vmlinux && exec "$@""#;
+    let record = ["record", "-o", rec, "--", program.to_str().unwrap()];
+    let command = [
+        &["unshare", "--mount", "sh", "-c", hide, "sh", UHR][..],
+        &record,
+    ]
+    .concat();
+    if as_root(&command, &recording).is_none() {
+        eprintln!("skipped: needs root through sudo without a password");
+        return;
+    }
+    assert_eq!(calls_of(rec, &[], "getppid"), Some(15));
+    assert_eq!(calls_of(rec, &["--thread", "renamed"], "getppid"), None);
+    let result = json(&["query", rec, "--group-by", "syscall"]);
+    let biases = result["coverage"]["known_biases"].as_array().unwrap();
+    assert!(
+        biases
+            .iter()
+            .any(|b| b.as_str().unwrap().contains("renames by another thread")),
+        "{biases:?}"
+    );
+}
+
+#[test]
+fn counts_a_thread_that_execs_by_its_new_name() {
+    let _turn = one_at_a_time();
+    let dir = scratch("syscalls_exec_from_thread");
+    let (launcher, program) = (dir.join("exec_from_thread"), dir.join("syscalls"));
+    compile("exec_from_thread", &launcher, "-O2");
+    compile("syscalls", &program, "-O2");
+    let recording = dir.join("rec");
+    let rec = recording.to_str().unwrap();
+    let (launcher, program) = (launcher.to_str().unwrap(), program.to_str().unwrap());
+    let args = ["record", "-o", rec, "--", launcher, program, "2000"];
+    if uhr_as_root(&args, &recording).is_none() {
+        eprintln!("skipped: needs root through sudo without a password");
+        return;
+    }
+    // Each round reads once, and the loader reads the program's libraries.
+    let read = calls_of(rec, &["--thread", "syscalls"], "read").unwrap();
+    assert!((2000..2010).contains(&read), "{read}");
+    // The kernel keeps 15 bytes of a name.
+    assert!(calls_of(rec, &["--thread", "exec_from_threa"], "mmap").unwrap() > 0);
+}
+
 #[test]
 fn says_which_calls_were_still_running_at_the_end() {
     let _turn = one_at_a_time();

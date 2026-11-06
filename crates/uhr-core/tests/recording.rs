@@ -294,6 +294,7 @@ fn example() -> Recording {
             SyscallCalls {
                 pid: 7,
                 tid: 8,
+                thread_name: Some("app".into()),
                 number: 0,
                 name: Some("read".into()),
                 calls: 3,
@@ -304,6 +305,7 @@ fn example() -> Recording {
             SyscallCalls {
                 pid: 7,
                 tid: 8,
+                thread_name: Some("worker".into()),
                 number: 4_000,
                 name: None,
                 calls: 0,
@@ -434,6 +436,34 @@ fn reads_a_recording_from_before_its_wall_clock() {
     assert!(removed.is_some());
     fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
     recording.manifest.wall_clock = None;
+    assert_eq!(Recording::read(&dir).unwrap(), recording);
+}
+
+#[test]
+fn reads_a_recording_from_before_the_names_of_counted_threads() {
+    let dir = scratch("before_counted_thread_names");
+    let mut recording = example();
+    recording.write(&dir).unwrap();
+    let path = dir.join("syscall_calls.parquet");
+    let file = File::open(&path).unwrap();
+    let batches: Vec<RecordBatch> = ParquetRecordBatchReaderBuilder::try_new(file)
+        .unwrap()
+        .build()
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    let schema = batches[0].schema();
+    let kept: Vec<usize> = (0..schema.fields().len())
+        .filter(|&i| schema.field(i).name() != "thread_name")
+        .collect();
+    let batch = batches[0].project(&kept).unwrap();
+    let file = File::create(&path).unwrap();
+    let mut writer = ArrowWriter::try_new(file, batch.schema(), None).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+    for calls in &mut recording.syscall_calls {
+        calls.thread_name = None;
+    }
     assert_eq!(Recording::read(&dir).unwrap(), recording);
 }
 

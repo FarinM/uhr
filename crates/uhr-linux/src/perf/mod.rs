@@ -679,6 +679,13 @@ fn add_ebpf(
                 skipped.join(", ")
             ));
         }
+        if counted.missed_renames > 0 {
+            known_biases.push(format!(
+                "Without the kernel's BTF, uhr's eBPF programs could not see which thread {} \
+                 renames by another thread were of, so the counted calls have no thread names.",
+                counted.missed_renames
+            ));
+        }
         lost_events += counted.lost;
     }
     if found.samples.is_some() && !found.tells_guests {

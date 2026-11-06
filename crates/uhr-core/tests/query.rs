@@ -1250,6 +1250,7 @@ fn with_counted_calls() -> (Recording, Symbols) {
     let calls = |tid, name: &str, calls, latency: Vec<u64>, unfinished_ns| SyscallCalls {
         pid: 1,
         tid,
+        thread_name: Some(if tid == 1 { "main" } else { "worker-2" }.into()),
         number: 0,
         name: Some(name.into()),
         calls,
@@ -1309,6 +1310,15 @@ fn joins_the_counted_calls_to_the_syscalls_on_stacks() {
     assert_eq!(rows.len(), 1, "{rows:?}");
     assert_eq!(rows[0].2.as_ref().unwrap().calls, 1);
 
+    let workers = Filter {
+        thread_names: vec!["worker-*".into()],
+        ..Filter::default()
+    };
+    let result = run(&recording, Some(&symbols), &by_syscall(workers)).unwrap();
+    let read = counted_rows(&result);
+    let read = read.iter().find(|r| r.0 == Some("read")).unwrap();
+    assert_eq!(read.2.as_ref().unwrap().calls, 1, "{read:?}");
+
     // They count whole threads over the whole capture.
     let later = Filter {
         from_ns: Some(1),
@@ -1325,6 +1335,51 @@ fn joins_the_counted_calls_to_the_syscalls_on_stacks() {
     let rows = counted_rows(&result);
     assert_eq!(rows.len(), 1, "{rows:?}");
     assert_eq!(rows[0].2.as_ref().unwrap().calls, 1000);
+}
+
+#[test]
+fn counts_the_calls_of_a_renamed_thread_by_the_name_it_had() {
+    let (mut recording, symbols) = with_counted_calls();
+    let mut renamed = recording.syscall_calls[0].clone();
+    renamed.thread_name = Some("worker-1".into());
+    renamed.calls = 2;
+    renamed.latency = vec![2, 0, 0];
+    recording.syscall_calls.push(renamed);
+    let by_name = |pattern: &str| Query {
+        group_by: GroupBy::Syscall,
+        filter: Filter {
+            thread_names: vec![pattern.into()],
+            syscalls: vec!["read".into()],
+            ..Filter::default()
+        },
+        ..query(20)
+    };
+    let calls = |pattern| {
+        let result = run(&recording, Some(&symbols), &by_name(pattern)).unwrap();
+        let rows = counted_rows(&result);
+        rows[0].2.as_ref().map(|c| c.calls)
+    };
+    assert_eq!(calls("main"), Some(3));
+    assert_eq!(calls("worker-1"), Some(2));
+    assert_eq!(calls("worker-*"), Some(3));
+}
+
+#[test]
+fn has_no_calls_by_thread_name_where_the_names_were_not_kept() {
+    let (mut recording, symbols) = with_counted_calls();
+    for calls in &mut recording.syscall_calls {
+        calls.thread_name = None;
+    }
+    let query = Query {
+        group_by: GroupBy::Syscall,
+        filter: Filter {
+            thread_names: vec!["main".into()],
+            ..Filter::default()
+        },
+        ..query(20)
+    };
+    let result = run(&recording, Some(&symbols), &query).unwrap();
+    assert!(counted_rows(&result).iter().all(|r| r.2.is_none()));
 }
 
 #[test]

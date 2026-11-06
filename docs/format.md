@@ -228,13 +228,15 @@ at its address later, which then keeps the name of the first.
 | `first_line` | uint32, nullable | The line it starts at |
 | `first_column` | uint32, nullable | The column it starts at, from 1, where the runtime says |
 
-`syscall_calls`, one row per thread and syscall, from uhr's eBPF programs.
-They count the target's processes and those they start, from the first
-syscall after the target's exec, and when attached from the attach on.
+`syscall_calls`, one row per thread, name it had and syscall, from uhr's
+eBPF programs. They count the target's processes and those they start,
+from the first syscall after the target's exec, and when attached from the
+attach on.
 
 | Column | Type | Meaning |
 |---|---|---|
 | `pid`, `tid` | uint32 | |
+| `thread_name` | string, nullable | The thread's name when the calls returned. Null in a recording from before uhr kept it, for a name the programs had no room for, and in every row if they missed a rename of a thread by another, without the kernel's BTF |
 | `number` | uint32 | In the syscall table of the recording's `platform.arch` |
 | `name` | string, nullable | Null for a number the table has no name for |
 | `calls` | uint64 | Calls that returned during the capture |

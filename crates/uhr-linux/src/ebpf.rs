@@ -122,8 +122,9 @@ const FOLLOWERS: [(&str, &str, &str); 2] = [
 const LET_GO: (&str, &str, &str) = ("sched_process_exit", "sched", "sched_process_exit");
 const LET_GO_LATE: (&str, &str, &str) = ("sched_process_free", "sched", "sched_process_free");
 
-/// The programs that count syscalls, at the raw tracepoints of their names.
-const SYSCALLS: [&str; 2] = ["sys_enter", "sys_exit"];
+/// The programs that count syscalls, and keep the names of the threads that
+/// make them, at the raw tracepoints of their names.
+const SYSCALLS: [&str; 3] = ["sys_enter", "sys_exit", "task_rename"];
 
 const SAMPLER: &str = "sample";
 
@@ -192,6 +193,9 @@ pub(crate) struct Counted {
     pub(crate) calls: Vec<SyscallCalls>,
     /// Calls that found the programs' table of calls full.
     pub(crate) lost: u64,
+    /// Renames of a thread by another that the programs could not follow,
+    /// for which the calls have no thread names.
+    pub(crate) missed_renames: u64,
 }
 
 pub(crate) struct Samples {
@@ -728,17 +732,29 @@ fn skip(ebpf: &mut Ebpf, skipped: &[Sysno]) -> Result<(), Error> {
 
 fn counted(ebpf: &mut Ebpf, now: u64) -> Result<Counted, Error> {
     let mut take = |name| ebpf.take_map(name).ok_or(Error::Missing(name));
-    let (calls, starts) = (take("CALLS")?, take("STARTS")?);
+    let (calls, starts, names) = (take("CALLS")?, take("STARTS")?, take("NAMES")?);
+    let names: HashMap<MapData, u64, [u8; 16]> =
+        HashMap::try_from(names).map_err(|e| Error::Map("NAMES", e))?;
+    let names = (names.iter().collect::<Result<BTreeMap<_, _>, _>>())
+        .map_err(|e| Error::Map("NAMES", e))?;
+    let missed_renames = sum(ebpf, "MISSED_RENAMES")?;
+    // Some thread's calls are under a name it no longer had, and which
+    // thread's is unknown.
+    let name = |key: u64| match missed_renames {
+        0 => names.get(&key).map(thread_name),
+        _ => None,
+    };
     let calls: HashMap<MapData, CallKey, Calls> =
         HashMap::try_from(calls).map_err(|e| Error::Map("CALLS", e))?;
     let mut rows = BTreeMap::new();
     for entry in calls.iter() {
         let (key, calls) = entry.map_err(|e| Error::Map("CALLS", e))?;
         rows.insert(
-            (key.tgid, key.tid, key.nr),
+            (key.tgid, key.tid, key.name, key.nr),
             row(
                 key.tgid,
                 key.tid,
+                name(key.name),
                 key.nr,
                 calls.calls,
                 calls.ns,
@@ -757,14 +773,22 @@ fn counted(ebpf: &mut Ebpf, now: u64) -> Result<Counted, Error> {
         if start.ns == 0 || !alive || ends.contains(&start.nr) {
             continue;
         }
-        rows.entry((start.tgid, tid, start.nr))
-            .or_insert_with(|| row(start.tgid, tid, start.nr, 0, 0, &[0; uhr_ebpf::BUCKETS]))
+        let empty = [0; uhr_ebpf::BUCKETS];
+        rows.entry((start.tgid, tid, start.name, start.nr))
+            .or_insert_with(|| row(start.tgid, tid, name(start.name), start.nr, 0, 0, &empty))
             .unfinished_ns = Some(now.saturating_sub(start.ns));
     }
     Ok(Counted {
         calls: rows.into_values().collect(),
         lost: sum(ebpf, "LOST")?,
+        missed_renames,
     })
+}
+
+/// A thread's name as the kernel keeps it, which ends at the first zero.
+fn thread_name(comm: &[u8; 16]) -> String {
+    let name = comm.split(|&b| b == 0).next().unwrap_or_default();
+    String::from_utf8_lossy(name).into_owned()
 }
 
 /// The total of a per-CPU counter.
@@ -1130,8 +1154,8 @@ fn load(sampling: Option<&Sampling>, wakeups: bool, layout: Layout) -> Result<Eb
             .override_global("TASK_FLAGS", &task_flags, CAN_SAMPLE)
             .override_global("TASK_EXEC_ID", &exec_id, CAN_SAMPLE)
             .override_global("TASK_THREAD_POINTER", &thread_pointer, CAN_SAMPLE)
-            .override_global("TASK_TGID", &tgid, CAN_SAMPLE)
-            .override_global("TASK_PID", &pid, CAN_SAMPLE)
+            .override_global("TASK_TGID", &tgid, true)
+            .override_global("TASK_PID", &pid, true)
             .override_global("TASK_SOFTIRQS", &softirqs, CAN_SAMPLE)
             .override_global("PER_CPU_OFFSETS", &per_cpu_offsets, CAN_SAMPLE)
             .override_global("PREEMPT_COUNT", &preempt_count, CAN_SAMPLE)
@@ -1177,10 +1201,19 @@ fn check_namespace() -> Result<(), Error> {
     Ok(())
 }
 
-fn row(pid: u32, tid: u32, number: u32, calls: u64, ns: u64, buckets: &[u64]) -> SyscallCalls {
+fn row(
+    pid: u32,
+    tid: u32,
+    thread_name: Option<String>,
+    number: u32,
+    calls: u64,
+    ns: u64,
+    buckets: &[u64],
+) -> SyscallCalls {
     SyscallCalls {
         pid,
         tid,
+        thread_name,
         number,
         name: Sysno::new(number as usize).map(|s| s.name().to_owned()),
         calls,

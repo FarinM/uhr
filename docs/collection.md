@@ -268,8 +268,17 @@ from tracepoints, such as wakeups and syscall latency.
   only, where a tracepoint of the syscall would make every syscall of every
   process take the kernel's slower path for traced ones.
 - They count and time the target's syscalls. At each syscall's entry and
-  exit they add, per thread and syscall, the call, its time and a log2
-  histogram of times in the kernel, so nothing is written per call. Each
+  exit they add, per thread, the name it has then and syscall, the call,
+  its time and a log2 histogram of times in the kernel, so nothing is
+  written per call. Each thread's name is read at its first call and kept
+  as the kernel renames it, at the `task_rename` raw tracepoint, so the
+  calls a thread made before it named itself, as threads do right after
+  they start, count under the name they had. The task renamed says which
+  thread it is, read with the kernel's BTF. Without it they can't follow
+  a thread renamed by another, so if one was, the calls have no thread
+  names. Each name is kept once, by its hash, which the thread's entry
+  holds, so a call that returns as another thread renames this one counts
+  under the old name or the new, not part of each. Each
   call still runs them, which a program making millions of quick calls
   notices, and while they run every process's syscalls take the kernel's
   slower path for traced ones.
@@ -311,8 +320,9 @@ from tracepoints, such as wakeups and syscall latency.
   every traced syscall slower again, so uhr leaves them off. With them on,
   on x86-64, a sample took about half a microsecond, frame walks included,
   which at 999 a second is about 0.05% of a CPU. Counting made each call of
-  16 threads calling getppid in a loop 107 ns slower, in a virtual machine
-  with 32 CPUs, which is 11% of a CPU at a million syscalls a second. Nearly
+  16 threads calling getppid in a loop 110 ns slower, in a virtual machine
+  with 32 CPUs, which is 11% of a CPU at a million syscalls a second, about
+  6 ns of it for keying the counts by the thread's name. Nearly
   half of that is reading the kernel's clock as each call enters and
   leaves, which takes 23 ns a read with the virtual machine's kvm-clock.
   A skipped syscall's calls took 38 ns longer, as they still run the

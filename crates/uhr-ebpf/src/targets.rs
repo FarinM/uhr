@@ -20,6 +20,13 @@ static TARGETS: HashMap<u32, u8> = HashMap::with_max_entries(16384, 0);
 #[map]
 static UNFOLLOWED: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
 
+/// Where a `task_struct` keeps its process's id and its own, which uhr sets
+/// at load from the kernel's BTF.
+#[unsafe(no_mangle)]
+static TASK_TGID: Global<u32> = Global::new(u32::MAX);
+#[unsafe(no_mangle)]
+static TASK_PID: Global<u32> = Global::new(u32::MAX);
+
 /// Whether the capture runs: uhr sets the first value to 1 when it starts
 /// and back to 0 when it stops. The processes are followed all along.
 #[map]
@@ -33,6 +40,20 @@ pub(crate) fn running() -> bool {
 pub(crate) fn current() -> (u32, u32) {
     let pid_tgid = bpf_get_current_pid_tgid();
     ((pid_tgid >> 32) as u32, pid_tgid as u32)
+}
+
+/// The process and thread ids of `task`, where uhr found where they are.
+pub(crate) fn ids(task: *const u8) -> Option<(u32, u32)> {
+    let (tgid, pid) = (TASK_TGID.load(), TASK_PID.load());
+    // An unknown offset reads past the task, where other memory can be
+    // read as the ids.
+    if tgid == u32::MAX || pid == u32::MAX {
+        return None;
+    }
+    let read = |offset: u32| unsafe {
+        bpf_probe_read_kernel(task.wrapping_add(offset as usize).cast::<u32>()).ok()
+    };
+    Some((read(tgid)?, read(pid)?))
 }
 
 /// Whether to count and sample the process `tgid`.

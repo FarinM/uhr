@@ -135,8 +135,10 @@ pub struct SyscallRow {
     pub value: u64,
     pub share: f64,
     /// The calls uhr's eBPF programs counted, for a named syscall. `None`
-    /// without them, or with a filter by time, mode, stack or thread name:
-    /// they count each thread's calls over the whole capture.
+    /// without them, or with a filter by time, mode or stack: they count each
+    /// thread's calls over the whole capture, by the name it had then. A
+    /// recording from before uhr kept the names has none with a filter by
+    /// thread name either.
     pub calls: Option<Counted>,
 }
 

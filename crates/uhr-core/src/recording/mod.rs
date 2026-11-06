@@ -277,6 +277,10 @@ pub struct InterpretedCode {
 pub struct SyscallCalls {
     pub pid: u32,
     pub tid: u32,
+    /// The thread's name when the calls returned: a thread renamed during
+    /// the capture has rows for each name. `None` in a recording from before
+    /// uhr kept it.
+    pub thread_name: Option<String>,
     /// The syscall's number, in the table of the recording's architecture.
     pub number: u32,
     /// `None` for a number that table has no name for.
@@ -896,6 +900,10 @@ impl Recording {
             vec![
                 Column::u32("pid", calls.iter().map(|c| c.pid).collect()),
                 Column::u32("tid", calls.iter().map(|c| c.tid).collect()),
+                Column::optional_string(
+                    "thread_name",
+                    calls.iter().map(|c| c.thread_name.as_deref()).collect(),
+                ),
                 Column::u32("number", calls.iter().map(|c| c.number).collect()),
                 Column::optional_string("name", calls.iter().map(|c| c.name.as_deref()).collect()),
                 Column::u64("calls", calls.iter().map(|c| c.calls).collect()),
@@ -1422,6 +1430,7 @@ fn read_syscall_calls(dir: &Path) -> Result<Vec<SyscallCalls>> {
     let table = Table::read(&dir.join(SYSCALL_CALLS))?;
     let pid = table.u32("pid")?;
     let tid = table.u32("tid")?;
+    let mut thread_name = table.added_string("thread_name")?;
     let number = table.u32("number")?;
     let mut name = table.optional_string("name")?;
     let calls = table.u64("calls")?;
@@ -1432,6 +1441,7 @@ fn read_syscall_calls(dir: &Path) -> Result<Vec<SyscallCalls>> {
         .map(|i| SyscallCalls {
             pid: pid[i],
             tid: tid[i],
+            thread_name: thread_name[i].take(),
             number: number[i],
             name: name[i].take(),
             calls: calls[i],

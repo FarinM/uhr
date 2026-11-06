@@ -311,7 +311,7 @@ impl Filter {
             && (self.thread_names.is_empty() || names.any(|name| self.matches_name(name)))
     }
 
-    fn matches_name(&self, name: &str) -> bool {
+    pub(crate) fn matches_name(&self, name: &str) -> bool {
         let name: Vec<char> = name.chars().collect();
         self.thread_names.iter().any(|pattern| {
             let pattern: Vec<char> = pattern.chars().collect();
