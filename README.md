@@ -65,11 +65,18 @@ uhr query rec --group-by function --metric page-faults  # code that grew memory
 uhr query rec --group-by region --metric page-faults    # heap, files, or mappings?
 uhr call-paths rec --function memcpy               # callers and callees
 uhr flamegraph rec -o cpu.svg                      # a flame graph to open
+uhr export rec --format firefox -o profile.json     # explore in Firefox Profiler
 ```
 
 Add `--json` to any but `record` for output an agent can read. See
 `uhr query --help` for the other groupings and the filters by process, thread,
 mode and time.
+
+Open the exported file at [Firefox Profiler](https://profiler.firefox.com/)
+to select threads, narrow the time range, and explore call trees, flame graphs,
+waits and memory. Export accepts the same filters as queries. `--json` prints
+the export summary; `-o` names a new profile file and never overwrites an
+existing file. See [viewer exports](docs/export.md) for coverage and limits.
 
 Full stacks need frame pointers. `uhr doctor` lists the build flags, or record
 with `--unwind dwarf`, which needs no rebuild but copies the stack in every
@@ -81,6 +88,7 @@ sample.
 - [Model](docs/model.md): recordings, observations, dimensions, levels,
   coverage, storage.
 - [Format](docs/format.md): the on-disk schema of a recording.
+- [Viewer exports](docs/export.md): Firefox Profiler and what it can show.
 - [Collection](docs/collection.md): collectors, runtimes, code origin
   resolution, platforms, privileges.
 - [Agent interface](docs/agent-interface.md): tools, result behavior,

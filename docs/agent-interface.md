@@ -49,7 +49,7 @@ behaviors.
 | `annotate` | Per-line and per-instruction cost of one function, with hardware counters when captured |
 | `timeline` | Thread state intervals with reasons, for selected threads and a time range. Aggregated signals show one value per window |
 | `sql` | Later: direct SQL over a recording's Parquet files. See [storage](model.md#storage) |
-| `export` | Write Perfetto, Firefox Profiler or speedscope files for human review |
+| `export` | Write files for human review: [Firefox Profiler](export.md) is implemented; Perfetto and speedscope remain candidates |
 | `doctor` | For a target on this host: what each collector would capture, what blocks the rest and how to fix it, and which ones `record` would use |
 
 `overview` gives each process's memory from its readings in the window: the

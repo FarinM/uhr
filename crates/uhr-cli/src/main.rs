@@ -17,6 +17,7 @@ use uhr_core::coverage::{Coverage, SymbolCoverage};
 #[cfg(not(target_os = "linux"))]
 use uhr_core::doctor::Check;
 use uhr_core::doctor::{Report, Status};
+use uhr_core::export;
 use uhr_core::filter::Filter;
 use uhr_core::flamegraph::{self, FlameGraph};
 use uhr_core::functions::Function;
@@ -58,6 +59,21 @@ enum Command {
     Record(RecordArgs),
     /// Resolve function names in a recording against the files on this machine
     Symbolize { recording: PathBuf },
+    /// Export a recording for interactive exploration in Firefox Profiler
+    Export {
+        recording: PathBuf,
+        /// Viewer format
+        #[arg(long, value_enum, default_value_t = ExportFormat::Firefox)]
+        format: ExportFormat,
+        /// New file to write; an existing file is not overwritten
+        #[arg(short, long)]
+        output: PathBuf,
+        /// Print the export summary and coverage as JSON
+        #[arg(long)]
+        json: bool,
+        #[command(flatten)]
+        filter: FilterArgs,
+    },
     /// Show CPU time by mode and time off CPU, by process and thread, against
     /// time alive: is it computing or waiting? And how much memory each
     /// process had
@@ -324,6 +340,11 @@ enum ModeArg {
 }
 
 #[derive(Clone, Copy, ValueEnum)]
+enum ExportFormat {
+    Firefox,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
 enum RegionArg {
     /// Grown with brk, where malloc starts
     Heap,
@@ -461,6 +482,13 @@ fn main() -> ExitCode {
             folded,
             json,
         ),
+        Command::Export {
+            recording,
+            output,
+            format,
+            json,
+            filter,
+        } => run_export(&recording, &output, format, filter, json),
         Command::CallPaths {
             recording,
             function,
@@ -905,6 +933,70 @@ fn run_call_paths(
         write_output(|out| writeln!(out, "{text}"))?;
     } else {
         write_output(|out| write_call_paths(out, &result))?;
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn run_export(
+    recording: &Path,
+    output: &Path,
+    format: ExportFormat,
+    filter: FilterArgs,
+    json: bool,
+) -> Result<ExitCode> {
+    let filter = filter.into_filter(recording)?;
+    let profile = match format {
+        ExportFormat::Firefox => export::firefox(recording, &filter)?,
+    };
+    let file = fs::File::create_new(output).with_context(|| {
+        format!(
+            "creating {} (output must not already exist)",
+            output.display()
+        )
+    })?;
+    let mut file = io::BufWriter::new(file);
+    profile
+        .write(&mut file)
+        .and_then(|()| file.flush())
+        .with_context(|| format!("writing {}", output.display()))?;
+    let report = &profile.report;
+    if json {
+        let text = serde_json::to_string_pretty(report)?;
+        write_output(|out| writeln!(out, "{text}"))?;
+    } else {
+        write_output(|out| {
+            writeln!(
+                out,
+                "wrote {}: {} threads, {} CPU samples ({})",
+                output.display(),
+                report.threads,
+                report.samples,
+                seconds(report.cpu_ns)
+            )?;
+            writeln!(
+                out,
+                "  {} off-CPU intervals, {} page-fault samples, {} memory readings",
+                report.observations.off_cpu_intervals,
+                report.observations.page_fault_samples,
+                report.observations.memory_readings
+            )?;
+            writeln!(out, "open the file at https://profiler.firefox.com/")?;
+            if !report.filter.is_empty() {
+                writeln!(out, "filter: {}", describe_filter(&report.filter))?;
+            }
+            writeln!(out, "\ncoverage")?;
+            writeln!(
+                out,
+                "  CPU time with an unnamed frame: {}",
+                seconds(report.unnamed_cpu_ns)
+            )?;
+            write_symbol_coverage(out, &report.symbols)?;
+            write_coverage(out, &report.coverage)?;
+            for limitation in &report.limitations {
+                writeln!(out, "  {limitation}")?;
+            }
+            Ok(())
+        })?;
     }
     Ok(ExitCode::SUCCESS)
 }
