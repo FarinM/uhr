@@ -51,6 +51,30 @@ impl<'a> ThreadNames<'a> {
         }
         names
     }
+
+    /// Names of one lifetime. A reused ID must not inherit a name recorded
+    /// before this thread started.
+    pub(crate) fn of_lifetime(
+        &self,
+        pid: u32,
+        tid: u32,
+        start_ns: Option<u64>,
+        end_ns: u64,
+    ) -> Vec<&'a str> {
+        let Some(start_ns) = start_ns else {
+            return self.during(pid, tid, 0, end_ns);
+        };
+        let Some(history) = self.names.get(&(pid, tid)) else {
+            return Vec::new();
+        };
+        let mut names: Vec<_> = history
+            .iter()
+            .filter(|(time, _)| time.is_some_and(|t| start_ns <= t && t < end_ns))
+            .map(|&(_, name)| name)
+            .collect();
+        names.dedup();
+        names
+    }
 }
 
 #[cfg(test)]

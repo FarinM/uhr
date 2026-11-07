@@ -318,8 +318,8 @@ struct FilterArgs {
     /// Only samples in this syscall, by name, as in read
     #[arg(long = "syscall", value_name = "NAME")]
     syscalls: Vec<String>,
-    /// Only page faults in this kind of region of memory, with --metric
-    /// page-faults
+    /// Only page faults in this kind of memory region; excludes CPU samples
+    /// and off-CPU intervals
     #[arg(long = "region", value_name = "KIND", value_enum)]
     regions: Vec<RegionArg>,
     /// Only samples from this time on: an offset into the recording, such

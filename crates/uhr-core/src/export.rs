@@ -85,6 +85,15 @@ pub fn run(
     samples.sort_by_key(|s| s.time_ns);
     let mut cpu_ns = 0;
     let mut unnamed_cpu_ns = 0;
+    let unnamed: Vec<_> = recording
+        .stacks
+        .iter()
+        .map(|stack| {
+            functions
+                .expand(stack)
+                .any(|f| functions.get(f).name.is_none())
+        })
+        .collect();
     for sample in &samples {
         let thread = builder.thread(sample.pid, sample.tid, sample.time_ns);
         let stack = builder.stack(thread, sample.stack);
@@ -98,10 +107,7 @@ pub fn run(
                 weight: ms(sample.cpu_ns),
             });
         cpu_ns += sample.cpu_ns;
-        if functions
-            .expand(&recording.stacks[sample.stack as usize])
-            .any(|f| functions.get(f).name.is_none())
-        {
+        if unnamed[sample.stack as usize] {
             unnamed_cpu_ns += sample.cpu_ns;
         }
     }
@@ -128,7 +134,7 @@ pub fn run(
         limitations.push("Process memory is omitted because the filter selects threads, modes, stacks, syscalls or regions.".into());
     }
     if observations.memory_readings > 0 {
-        limitations.push("The resident-memory counter shows changes from the first selected reading; memory markers contain absolute readings.".into());
+        limitations.push("Firefox rebases the resident-memory graph to the minimum in the displayed range; memory markers contain absolute readings.".into());
     }
     let wall_time = match wall_clock::utc_of(&recording.manifest, 0) {
         Ok(ns) => ns as f64 / 1e6,
@@ -210,6 +216,8 @@ fn relative_ms(time: u64, start: u64) -> f64 {
     (i128::from(time) - i128::from(start)) as f64 / 1e6
 }
 
+type ThreadKey = (u32, u32, Option<usize>, Option<usize>);
+
 struct Builder<'a> {
     recording: &'a Recording,
     functions: &'a Functions,
@@ -217,7 +225,9 @@ struct Builder<'a> {
     start: u64,
     names: ThreadNames<'a>,
     lifetimes: BTreeMap<(u32, u32), Vec<usize>>,
-    thread_ids: HashMap<(u32, u32, Option<usize>), usize>,
+    thread_ids: HashMap<ThreadKey, usize>,
+    process_ends: HashMap<usize, Option<u64>>,
+    tid_uses: HashMap<u32, usize>,
     threads: Vec<ThreadBuilder>,
     lib_ids: HashMap<(String, Option<String>), usize>,
     libs: Vec<firefox::Library>,
@@ -240,7 +250,7 @@ impl<'a> Builder<'a> {
         for rows in lifetimes.values_mut() {
             rows.sort_by_key(|&i| recording.threads[i].start_ns);
         }
-        Self {
+        let mut builder = Self {
             recording,
             functions,
             labels,
@@ -248,10 +258,34 @@ impl<'a> Builder<'a> {
             names: ThreadNames::new(recording),
             lifetimes,
             thread_ids: HashMap::new(),
+            process_ends: HashMap::new(),
+            tid_uses: HashMap::new(),
             threads: Vec::new(),
             lib_ids: HashMap::new(),
             libs: Vec::new(),
+        };
+        for thread in &recording.threads {
+            *builder.tid_uses.entry(thread.tid).or_default() += 1;
+            if let Some(process) = builder.process_row(thread.pid, thread.start_ns.unwrap_or(start))
+            {
+                builder
+                    .process_ends
+                    .entry(process)
+                    .and_modify(|end| {
+                        *end = end.zip(thread.end_ns).map(|(a, b)| a.max(b));
+                    })
+                    .or_insert(thread.end_ns);
+            }
         }
+        builder
+    }
+
+    fn process_row(&self, pid: u32, time: u64) -> Option<usize> {
+        let rows = self.lifetimes.get(&(pid, pid))?;
+        let end =
+            rows.partition_point(|&i| self.recording.threads[i].start_ns.is_none_or(|t| t <= time));
+        // The main thread may exit while workers keep the process alive.
+        rows.get(end.checked_sub(1)?).copied()
     }
 
     fn lifetime(&self, pid: u32, tid: u32, time: u64) -> Option<usize> {
@@ -267,10 +301,11 @@ impl<'a> Builder<'a> {
 
     fn thread(&mut self, pid: u32, tid: u32, time: u64) -> usize {
         let row = self.lifetime(pid, tid, time);
-        if let Some(&id) = self.thread_ids.get(&(pid, tid, row)) {
+        let leader_row = self.process_row(pid, time);
+        let key = (pid, tid, row, leader_row);
+        if let Some(&id) = self.thread_ids.get(&key) {
             return id;
         }
-        let leader_row = self.lifetime(pid, pid, time);
         let thread = row.map(|i| &self.recording.threads[i]);
         let leader = leader_row.map(|i| &self.recording.threads[i]);
         let from = thread.and_then(|t| t.start_ns).unwrap_or(self.start);
@@ -278,9 +313,26 @@ impl<'a> Builder<'a> {
             .and_then(|t| t.end_ns)
             .or(self.recording.manifest.end_ns)
             .unwrap_or(u64::MAX);
+        let rows = self
+            .lifetimes
+            .get(&(pid, tid))
+            .map_or(&[][..], Vec::as_slice);
+        let after =
+            rows.partition_point(|&i| self.recording.threads[i].start_ns.is_none_or(|t| t <= time));
+        let previous_end = after
+            .checked_sub(1)
+            .and_then(|i| self.recording.threads[rows[i]].end_ns);
+        let name_start = match thread {
+            Some(thread) => thread.start_ns,
+            None => previous_end.map(|t| t.saturating_add(1)),
+        };
+        let name_end = rows
+            .get(after)
+            .and_then(|&i| self.recording.threads[i].start_ns)
+            .map_or(to.saturating_add(1), |next| next.min(to.saturating_add(1)));
         let name = self
             .names
-            .during(pid, tid, from, to.saturating_add(1))
+            .of_lifetime(pid, tid, name_start, name_end)
             .join(" → ");
         let name = if name.is_empty() {
             format!("Thread {tid}")
@@ -291,15 +343,26 @@ impl<'a> Builder<'a> {
             Some(row) if reused => format!("{id}@{row}"),
             _ => id.to_string(),
         };
-        let reused = |id| self.lifetimes.get(&(pid, id)).is_some_and(|v| v.len() > 1);
+        let reused = |id| self.tid_uses.get(&id).is_some_and(|&n| n > 1);
         let data = firefox::Thread {
             name,
             pid: unique(pid, leader_row, reused(pid)),
-            tid: unique(tid, row, reused(tid)),
+            tid: match row {
+                None if self.tid_uses.contains_key(&tid) || leader_row.is_some() => {
+                    format!("{tid}@untracked-{}", self.threads.len())
+                }
+                _ => unique(tid, row, reused(tid)),
+            },
             process_name: self
                 .names
-                .at(pid, pid, time)
-                .map(str::to_owned)
+                .of_lifetime(
+                    pid,
+                    pid,
+                    leader.and_then(|t| t.start_ns),
+                    time.saturating_add(1),
+                )
+                .last()
+                .map(|name| (*name).to_owned())
                 .unwrap_or_else(|| format!("Process {pid}")),
             is_main_thread: pid == tid,
             process_type: "default",
@@ -307,8 +370,8 @@ impl<'a> Builder<'a> {
                 leader.and_then(|t| t.start_ns).unwrap_or(self.start),
                 self.start,
             ),
-            process_shutdown_time: leader
-                .and_then(|t| t.end_ns)
+            process_shutdown_time: leader_row
+                .and_then(|row| self.process_ends[&row])
                 .map(|t| relative_ms(t, self.start)),
             register_time: relative_ms(from, self.start),
             unregister_time: thread
@@ -330,7 +393,7 @@ impl<'a> Builder<'a> {
             data,
             ..Default::default()
         });
-        self.thread_ids.insert((pid, tid, row), id);
+        self.thread_ids.insert(key, id);
         id
     }
 
@@ -369,16 +432,19 @@ impl<'a> Builder<'a> {
             let frame = if let Some(&id) = t.frames.get(&step) {
                 id
             } else {
-                let function = if let Some(&id) = t.functions.get(&step.function) {
+                let source = step
+                    .line
+                    .map(|l| self.functions.line(l).file.as_str())
+                    .or(f.file.as_deref());
+                let file = source.map(|file| t.string(file));
+                let key = (step.function, file);
+                let function = if let Some(&id) = t.functions.get(&key) {
                     id
                 } else {
                     let name = t.string(&self.labels[step.function as usize]);
-                    let file = f
-                        .file
-                        .as_deref()
-                        .or_else(|| step.line.map(|l| self.functions.line(l).file.as_str()))
-                        .map(|file| t.string(file));
-                    let place = self.functions.start(step.function);
+                    let place = (source == f.file.as_deref())
+                        .then(|| self.functions.start(step.function))
+                        .flatten();
                     let (line, column) = place
                         .as_deref()
                         .map(|s| s.split_once(':').map_or((s, None), |(l, c)| (l, Some(c))))
@@ -397,7 +463,7 @@ impl<'a> Builder<'a> {
                         line,
                         column,
                     });
-                    t.functions.insert(step.function, id);
+                    t.functions.insert(key, id);
                     id
                 };
                 let id = t.data.frame_table.0.len();
@@ -426,7 +492,7 @@ impl<'a> Builder<'a> {
 struct ThreadBuilder {
     data: firefox::Thread,
     strings: HashMap<String, usize>,
-    functions: HashMap<u32, usize>,
+    functions: HashMap<(u32, Option<usize>), usize>,
     frames: HashMap<Step, usize>,
     stacks: HashMap<u32, Option<usize>>,
     prefixes: HashMap<(Option<usize>, usize), usize>,

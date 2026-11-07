@@ -32,15 +32,17 @@ million. These are estimates of CPU cost, not measured call durations.
 of a thread's CPU consumption between successive timestamps.
 
 Threads are separate tracks, including separate lifetimes of reused thread
-IDs. A thread's label lists the names it had during its lifetime. Processes
-are separated by the main thread's lifetime where that was recorded. Unknown
-lifetimes use the observed process/thread IDs.
+IDs. A thread's label lists the names recorded during its lifetime, without
+inheriting a previous lifetime's name. Processes are separated by the main
+thread's start where that was recorded; workers can outlive the main thread.
+Unknown lifetimes use the observed IDs, with a suffix when needed to avoid
+merging them with known lifetimes.
 
 Stacks use uhr's resolved functions, with inline frames expanded and native,
 kernel, JIT, interpreted and unresolved code categorized. Functions sharing a
 name are labelled distinctly so the viewer does not merge them. Unnamed
 frames remain visible. Source file and line information is included when
-known; source text and disassembly are not embedded or served.
+known, including lines in files other than a function's declaration; source text and disassembly are not embedded or served.
 
 The profile is marked symbolicated so the viewer uses the exported names.
 This does not claim every frame is named: the export report in the viewer's
@@ -57,8 +59,9 @@ Page faults appear as instant markers with their stacks, sampled fault weight,
 CPU mode and fault address. They are not allocation samples. Addresses are
 hex strings so JavaScript cannot round large addresses.
 
-Resident-memory counters show changes from the first selected reading.
-Firefox rebases memory counters; accompanying markers carry the absolute RSS,
+Resident-memory counters store changes between consecutive selected readings.
+Firefox rebases the displayed graph to its minimum; accompanying markers carry
+the absolute RSS,
 its anonymous/file/shared breakdown, swap, and peak RSS. Memory is per process
 and is omitted with filters by thread, mode, stack, syscall or memory region.
 

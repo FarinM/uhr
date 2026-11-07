@@ -58,7 +58,10 @@ impl Builder<'_> {
                 );
             }
             if let Some(wakeup) = &interval.wakeup
-                && (start..end).contains(&wakeup.time_ns)
+                && (start..=end).contains(&wakeup.time_ns)
+                && filter
+                    .to_ns
+                    .is_none_or(|to| wakeup.time_ns < self.start.saturating_add(to))
             {
                 self.marker(thread, "Wakeup", wakeup.time_ns, None, wakeup.stack, json!({
                     "type": "UhrWakeup", "waker": waker,
@@ -96,7 +99,7 @@ impl Builder<'_> {
                     let id = counters.len();
                     counters.push(firefox::Counter {
                         name: "Resident memory change", category: "Memory",
-                        description: "Change in resident bytes since the first selected reading. Absolute readings are in Resident memory markers.",
+                        description: "Changes in resident bytes; Firefox displays values relative to the minimum in the visible range. Absolute readings are in Resident memory markers.",
                         pid: self.threads[thread].data.pid.clone(), main_thread_index: thread,
                         samples: Default::default(),
                     });

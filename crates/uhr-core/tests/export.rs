@@ -516,3 +516,153 @@ fn keeps_reused_process_ids_separate() {
         assert_eq!(t["pid"], counter["pid"]);
     }
 }
+
+#[test]
+fn does_not_inherit_a_name_from_an_earlier_thread_lifetime() {
+    let (mut recording, symbols) = recording();
+    recording.thread_names.retain(|n| n.name != "new-worker");
+    let profile = json(&recording, Some(&symbols), &Filter::default());
+    let threads = profile["threads"].as_array().unwrap();
+    let reused = threads.iter().find(|t| t["registerTime"] == 6.0).unwrap();
+    assert_eq!(reused["name"], "Thread 2");
+}
+
+#[test]
+fn keeps_workers_in_their_process_after_the_main_thread_exits() {
+    let (mut recording, symbols) = recording();
+    recording.threads = vec![
+        thread(1, None, Some(START + 5_000_000)),
+        thread(2, None, Some(START + 12_000_000)),
+    ];
+    recording.samples = vec![sample(1, 1_000_000, 0, 100), sample(2, 9_000_000, 0, 200)];
+    let profile = json(&recording, Some(&symbols), &Filter::default());
+    let threads = profile["threads"].as_array().unwrap();
+    assert_eq!(threads[0]["pid"], threads[1]["pid"]);
+    assert_eq!(threads[0]["processShutdownTime"], 12.0);
+    assert_eq!(threads[1]["processShutdownTime"], 12.0);
+    assert_eq!(threads[0]["unregisterTime"], 5.0);
+}
+
+#[test]
+fn keeps_line_numbers_with_the_file_the_debug_info_names() {
+    let (mut recording, mut symbols) = recording();
+    symbols.inline[1] = vec![
+        InlineFrame {
+            function: Some("inline".into()),
+            file: Some("/src/generated.rs".into()),
+            line: Some(90),
+            decl_file: Some("/src/app.rs".into()),
+            decl_line: Some(40),
+        },
+        InlineFrame {
+            function: Some("work".into()),
+            file: Some("/src/app.rs".into()),
+            line: Some(17),
+            decl_file: Some("/src/app.rs".into()),
+            decl_line: Some(10),
+        },
+    ];
+    recording.samples.truncate(1);
+    let profile = json(&recording, Some(&symbols), &Filter::default());
+    let t = &profile["threads"][0];
+    let frame = t["frameTable"]["line"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .position(|l| *l == 90)
+        .unwrap();
+    let function = t["frameTable"]["func"][frame].as_u64().unwrap() as usize;
+    let file = t["funcTable"]["fileName"][function].as_u64().unwrap() as usize;
+    assert_eq!(t["stringArray"][file], "/src/generated.rs");
+    assert_eq!(
+        t["funcTable"]["lineNumber"][function],
+        Value::Null,
+        "the declaration is in a different file"
+    );
+}
+
+#[test]
+fn includes_a_wakeup_at_switch_in_unless_the_time_filter_excludes_it() {
+    let (mut recording, symbols) = with_observations();
+    recording.samples.clear();
+    recording.off_cpu[0].wakeup.as_mut().unwrap().time_ns = START + 6_000_000;
+    let profile = json(&recording, Some(&symbols), &Filter::default());
+    let has_wakeup = |p: &Value| {
+        p["threads"].as_array().unwrap().iter().any(|t| {
+            t["markers"]["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|m| m["type"] == "UhrWakeup")
+        })
+    };
+    assert!(has_wakeup(&profile));
+    let filter = Filter {
+        to_ns: Some(6_000_000),
+        ..Default::default()
+    };
+    assert!(!has_wakeup(&json(&recording, Some(&symbols), &filter)));
+}
+
+#[test]
+fn gives_process_memory_after_main_thread_exit_a_distinct_track() {
+    let (mut recording, symbols) = with_observations();
+    recording.threads[0].end_ns = Some(START + 2_500_000);
+    let profile = json(&recording, Some(&symbols), &Filter::default());
+    let ids: Vec<_> = profile["threads"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["tid"].as_str().unwrap())
+        .collect();
+    let unique: std::collections::HashSet<_> = ids.iter().collect();
+    assert_eq!(ids.len(), unique.len());
+}
+
+#[test]
+fn uses_wall_clock_only_when_the_calibration_is_consistent() {
+    let (mut recording, symbols) = recording();
+    let epoch = 1_700_000_000_000_000_000;
+    recording.manifest.wall_clock = Some(WallClock {
+        start: ClockReading {
+            time_ns: START,
+            realtime_ns: epoch,
+        },
+        end: ClockReading {
+            time_ns: START + 20_000_000,
+            realtime_ns: epoch + 20_000_000,
+        },
+    });
+    let profile = json(&recording, Some(&symbols), &Filter::default());
+    assert_eq!(profile["meta"]["startTime"], 1_700_000_000_000.0);
+    recording
+        .manifest
+        .wall_clock
+        .as_mut()
+        .unwrap()
+        .end
+        .realtime_ns += 2_000_000;
+    let profile = json(&recording, Some(&symbols), &Filter::default());
+    assert_eq!(profile["meta"]["startTime"], 0.0);
+    assert!(
+        profile["meta"]["extra"]
+            .to_string()
+            .contains("system clock was set")
+    );
+}
+
+#[test]
+fn limits_names_to_a_lifetime_even_when_its_exit_was_lost() {
+    let (mut recording, symbols) = recording();
+    recording.threads[1].end_ns = None;
+    let profile = json(&recording, Some(&symbols), &Filter::default());
+    assert_eq!(profile["threads"][0]["name"], "old-worker");
+}
+
+#[test]
+fn does_not_name_untracked_threads_after_an_exited_thread() {
+    let (mut recording, symbols) = recording();
+    recording.samples = vec![sample(2, 5_500_000, 0, 100)];
+    let profile = json(&recording, Some(&symbols), &Filter::default());
+    assert_eq!(profile["threads"][0]["name"], "Thread 2");
+}
