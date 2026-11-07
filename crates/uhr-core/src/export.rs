@@ -16,6 +16,7 @@ use crate::threads::ThreadNames;
 use crate::wall_clock;
 
 mod firefox;
+mod observations;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -37,10 +38,20 @@ pub struct Report {
     pub cpu_ns: u64,
     /// CPU time whose sampled stack contains at least one unnamed frame.
     pub unnamed_cpu_ns: u64,
+    #[serde(flatten)]
+    pub observations: ObservationCounts,
     pub filter: Filter,
     pub symbols: SymbolCoverage,
     pub coverage: Coverage,
     pub limitations: Vec<String>,
+}
+
+#[derive(Debug, Default, Serialize)]
+pub struct ObservationCounts {
+    pub off_cpu_intervals: usize,
+    pub off_cpu_ns: u64,
+    pub page_fault_samples: usize,
+    pub memory_readings: usize,
 }
 
 pub struct FirefoxProfile {
@@ -94,21 +105,30 @@ pub fn run(
             unnamed_cpu_ns += sample.cpu_ns;
         }
     }
-    if samples.is_empty() {
+    let (observations, counters) = builder.observations(filter)?;
+    if samples.is_empty()
+        && observations.off_cpu_intervals == 0
+        && observations.page_fault_samples == 0
+        && observations.memory_readings == 0
+    {
         return Err(Error::Empty);
     }
     let mut limitations = vec![
         "CPU weights are sampled estimates, not measured durations of individual calls; per-thread CPU deltas were not recorded.".into(),
         "Source locations are included when known; source text and disassembly are not embedded.".into(),
     ];
-    if !recording.off_cpu.is_empty()
-        || !recording.page_faults.is_empty()
-        || !recording.memory.is_empty()
-    {
-        limitations.push(
-            "This export contains CPU samples only; other recorded observations are not exported."
-                .into(),
-        );
+    if !recording.syscall_calls.is_empty() {
+        limitations
+            .push("Syscall aggregates are not exported; use uhr query --group-by syscall.".into());
+    }
+    if !recording.region_memory.is_empty() {
+        limitations.push("Per-region resident-memory readings are not exported.".into());
+    }
+    if !recording.memory.is_empty() && filter.memory(recording).is_none() {
+        limitations.push("Process memory is omitted because the filter selects threads, modes, stacks, syscalls or regions.".into());
+    }
+    if observations.memory_readings > 0 {
+        limitations.push("The resident-memory counter shows changes from the first selected reading; memory markers contain absolute readings.".into());
     }
     let wall_time = match wall_clock::utc_of(&recording.manifest, 0) {
         Ok(ns) => ns as f64 / 1e6,
@@ -123,6 +143,7 @@ pub fn run(
         samples: samples.len(),
         cpu_ns,
         unnamed_cpu_ns,
+        observations,
         filter: filter.clone(),
         symbols: SymbolCoverage::of(recording, symbols),
         coverage: Coverage::of(recording),
@@ -160,13 +181,21 @@ pub fn run(
                 {"name": "JIT", "color": "purple", "subcategories": ["Other"]},
                 {"name": "Interpreted", "color": "green", "subcategories": ["Other"]}
             ],
-            "markerSchema": [],
+            "markerSchema": observations::schemas(),
             "extra": [{"label": "uhr export", "entries": [
                 {"label": "Coverage and limitations", "format": "string", "value": serde_json::to_string_pretty(&report).expect("report contains only JSON values")}
             ]}]
         }),
         libs: builder.libs,
-        threads: builder.threads.into_iter().map(|t| t.data).collect(),
+        counters,
+        threads: builder
+            .threads
+            .into_iter()
+            .map(|mut t| {
+                t.data.markers.0.sort_by(|a, b| a.start.total_cmp(&b.start));
+                t.data
+            })
+            .collect(),
         pages: Vec::new(),
     };
     Ok(FirefoxProfile { report, profile })
@@ -293,7 +322,8 @@ impl<'a> Builder<'a> {
             func_table: Default::default(),
             resource_table: Default::default(),
             native_symbols: json!({"length": 0, "libIndex": [], "address": [], "name": [], "functionSize": []}),
-            markers: json!({"length": 0, "name": [], "startTime": [], "endTime": [], "phase": [], "category": [], "data": []}),
+            markers: Default::default(),
+            show_markers_in_timeline: true,
         };
         let id = self.threads.len();
         self.threads.push(ThreadBuilder {

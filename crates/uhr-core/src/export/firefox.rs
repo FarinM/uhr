@@ -13,6 +13,7 @@ pub(super) struct Profile {
     pub libs: Vec<Library>,
     pub threads: Vec<Thread>,
     pub pages: Vec<()>,
+    pub counters: Vec<Counter>,
 }
 
 #[derive(Serialize)]
@@ -48,7 +49,54 @@ pub(super) struct Thread {
     pub func_table: Functions,
     pub resource_table: Resources,
     pub native_symbols: Value,
-    pub markers: Value,
+    pub markers: Markers,
+    pub show_markers_in_timeline: bool,
+}
+
+#[derive(Default)]
+pub(super) struct Markers(pub Vec<Marker>);
+pub(super) struct Marker {
+    pub name: usize,
+    pub start: f64,
+    pub end: Option<f64>,
+    pub data: Value,
+}
+impl Serialize for Markers {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let mut m = s.serialize_map(None)?;
+        m.serialize_entry("length", &self.0.len())?;
+        m.serialize_entry("name", &column(&self.0, |r| r.name))?;
+        m.serialize_entry("startTime", &column(&self.0, |r| r.start))?;
+        m.serialize_entry("endTime", &column(&self.0, |r| r.end))?;
+        m.serialize_entry("phase", &column(&self.0, |r| u8::from(r.end.is_some())))?;
+        m.serialize_entry("category", &repeat(0, self.0.len()))?;
+        let data: Vec<_> = self.0.iter().map(|r| &r.data).collect();
+        m.serialize_entry("data", &data)?;
+        m.end()
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct Counter {
+    pub name: &'static str,
+    pub category: &'static str,
+    pub description: &'static str,
+    pub pid: String,
+    pub main_thread_index: usize,
+    pub samples: CounterSamples,
+}
+
+#[derive(Default)]
+pub(super) struct CounterSamples(pub Vec<(f64, f64)>);
+impl Serialize for CounterSamples {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let mut m = s.serialize_map(None)?;
+        m.serialize_entry("length", &self.0.len())?;
+        m.serialize_entry("time", &column(&self.0, |r| r.0))?;
+        m.serialize_entry("count", &column(&self.0, |r| r.1))?;
+        m.end()
+    }
 }
 
 #[derive(Default)]

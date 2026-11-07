@@ -353,3 +353,166 @@ fn reads_an_existing_recording_without_modifying_it() {
         manifest
     );
 }
+
+fn with_observations() -> (Recording, Symbols) {
+    let (mut recording, symbols) = recording();
+    recording.off_cpu = vec![OffCPUInterval {
+        pid: 1,
+        tid: 1,
+        start_ns: START + 2_000_000,
+        end_ns: START + 6_000_000,
+        state: ThreadState::Blocked,
+        stack: Some(0),
+        wakeup: Some(Wakeup {
+            time_ns: START + 4_000_000,
+            waker: Waker::Thread {
+                pid: 8,
+                tid: 9,
+                name: "waker".into(),
+            },
+            stack: Some(1),
+        }),
+    }];
+    recording.page_faults = vec![FaultSample {
+        time_ns: START + 3_000_000,
+        pid: 1,
+        tid: 1,
+        cpu: Some(2),
+        mode: Mode::User,
+        stack: 1,
+        faults: 100,
+        address: u64::MAX - 1,
+    }];
+    recording.memory = [1_000_000, 100, 200]
+        .into_iter()
+        .enumerate()
+        .map(|(i, bytes)| MemoryReading {
+            time_ns: START + (i as u64 + 1) * 1_000_000,
+            pid: 1,
+            rss_anon_bytes: bytes,
+            rss_file_bytes: 50,
+            rss_shmem_bytes: 5,
+            swap_bytes: 2,
+            peak_rss_bytes: 1_000_055,
+        })
+        .collect();
+    (recording, symbols)
+}
+
+#[test]
+fn shows_waits_and_faults_without_adding_them_to_cpu_time() {
+    let (recording, symbols) = with_observations();
+    let exported = export::run(&recording, Some(&symbols), &Filter::default()).unwrap();
+    assert_eq!(exported.report.cpu_ns, 2_534_691);
+    assert_eq!(exported.report.observations.off_cpu_ns, 4_000_000);
+    let profile = json(&recording, Some(&symbols), &Filter::default());
+    let main = profile["threads"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["tid"] == "1")
+        .unwrap();
+    let markers = &main["markers"];
+    let data = markers["data"].as_array().unwrap();
+    let blocked = data.iter().position(|m| m["state"] == "blocked").unwrap();
+    let runnable = data.iter().position(|m| m["state"] == "runnable").unwrap();
+    assert_eq!(markers["startTime"][blocked], 2.0);
+    assert_eq!(markers["endTime"][blocked], 4.0);
+    assert_eq!(markers["startTime"][runnable], 4.0);
+    assert_eq!(markers["endTime"][runnable], 6.0);
+    let wakeup = data.iter().find(|m| m["type"] == "UhrWakeup").unwrap();
+    assert_eq!(wakeup["waker"], "waker (pid 8, tid 9)");
+    let sleeping = chain(
+        main,
+        data[blocked]["cause"]["stack"].as_u64().unwrap() as usize,
+    );
+    let waking = chain(main, wakeup["cause"]["stack"].as_u64().unwrap() as usize);
+    assert_ne!(sleeping, waking, "the wakeup carries the waker's stack");
+    let fault = data.iter().find(|m| m["type"] == "UhrPageFault").unwrap();
+    assert_eq!(fault["faults"], 100);
+    assert_eq!(fault["address"], "0xfffffffffffffffe");
+    let times: Vec<_> = markers["startTime"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t.as_f64().unwrap())
+        .collect();
+    assert!(times.windows(2).all(|w| w[0] <= w[1]));
+}
+
+#[test]
+fn clips_waits_and_retains_unknown_stacks() {
+    let (mut recording, symbols) = with_observations();
+    recording.samples.clear();
+    recording.off_cpu[0].stack = None;
+    let filter = Filter {
+        from_ns: Some(5_000_000),
+        to_ns: Some(5_500_000),
+        ..Default::default()
+    };
+    let profile = json(&recording, Some(&symbols), &filter);
+    let markers = &profile["threads"][0]["markers"];
+    assert_eq!(markers["length"], 1);
+    assert_eq!(markers["startTime"][0], 5.0);
+    assert_eq!(markers["endTime"][0], 5.5);
+    assert_eq!(markers["data"][0]["state"], "runnable");
+    assert_eq!(markers["data"][0]["stackStatus"], "not recorded");
+    assert!(markers["data"][0].get("cause").is_none());
+    assert_eq!(profile["threads"][0]["samples"]["length"], 0);
+}
+
+#[test]
+fn exports_memory_only_with_deltas_and_absolute_readings() {
+    let (mut recording, symbols) = with_observations();
+    recording.samples.clear();
+    recording.off_cpu.clear();
+    recording.page_faults.clear();
+    let profile = json(&recording, Some(&symbols), &Filter::default());
+    let counter = &profile["counters"][0];
+    assert_eq!(
+        counter["samples"]["count"],
+        serde_json::json!([0.0, -999900.0, 100.0])
+    );
+    let thread = &profile["threads"][counter["mainThreadIndex"].as_u64().unwrap() as usize];
+    assert_eq!(thread["pid"], counter["pid"]);
+    assert_eq!(thread["markers"]["data"][0]["rss"], 1_000_055);
+    assert_eq!(thread["markers"]["data"][1]["rss"], 155);
+    let filter = Filter {
+        tids: vec![1],
+        ..Default::default()
+    };
+    assert!(matches!(
+        export::run(&recording, Some(&symbols), &filter),
+        Err(Error::Empty)
+    ));
+    let filter = Filter {
+        from_ns: Some(2_000_000),
+        ..Default::default()
+    };
+    let profile = json(&recording, Some(&symbols), &filter);
+    assert_eq!(
+        profile["counters"][0]["samples"]["count"],
+        serde_json::json!([0.0, 100.0])
+    );
+}
+
+#[test]
+fn keeps_reused_process_ids_separate() {
+    let (mut recording, symbols) = with_observations();
+    recording.threads[0].end_ns = Some(START + 5_000_000);
+    recording
+        .threads
+        .push(thread(1, Some(START + 6_000_000), None));
+    recording.memory.push(MemoryReading {
+        time_ns: START + 7_000_000,
+        ..recording.memory[2].clone()
+    });
+    let profile = json(&recording, Some(&symbols), &Filter::default());
+    let counters = profile["counters"].as_array().unwrap();
+    assert_eq!(counters.len(), 2);
+    assert_ne!(counters[0]["pid"], counters[1]["pid"]);
+    for counter in counters {
+        let t = &profile["threads"][counter["mainThreadIndex"].as_u64().unwrap() as usize];
+        assert_eq!(t["pid"], counter["pid"]);
+    }
+}

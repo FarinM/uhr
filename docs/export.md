@@ -36,8 +36,24 @@ extra information contains symbol coverage, recording coverage, filters and
 limitations. If the wall clock is unknown or changed during the capture,
 relative timestamps still work; the absolute epoch is a documented placeholder.
 
-At present only CPU samples are exported. Other captured signals remain in
-the recording.
+Off-CPU intervals appear as markers, clipped to the selected time range. A
+known wakeup splits an interval into blocked time and runnable time. Switch-out
+stacks attach to the intervals; a separate wakeup marker carries the waker's
+stack and identity. Unknown stacks and wakeups are labelled as unknown.
+
+Page faults appear as instant markers with their stacks, sampled fault weight,
+CPU mode and fault address. They are not allocation samples. Addresses are
+hex strings so JavaScript cannot round large addresses.
+
+Resident-memory counters show changes from the first selected reading.
+Firefox rebases memory counters; accompanying markers carry the absolute RSS,
+its anonymous/file/shared breakdown, swap, and peak RSS. Memory is per process
+and is omitted with filters by thread, mode, stack, syscall or memory region.
+
+Syscall aggregates and per-region resident-memory readings are not exported;
+the export report lists these omissions when those signals were recorded.
+The recording retains them for uhr's queries. No per-call events are inferred
+from aggregates.
 
 The format definitions and importer are maintained by Firefox Profiler:
 
