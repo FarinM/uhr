@@ -72,9 +72,9 @@ Add `--json` to any but `record` for output an agent can read. See
 `uhr query --help` for the other groupings and the filters by process, thread,
 mode and time.
 
-An agent can also read a recording over MCP: `uhr mcp` serves `overview` on
-stdin and stdout. Register it with the agent's client, as with `claude mcp add
-uhr -- uhr mcp`. See the [agent
+An agent can also read a recording over MCP: `uhr mcp` serves `overview` and
+`query` on stdin and stdout. Register it with the agent's client, as with
+`claude mcp add uhr -- uhr mcp`. See the [agent
 interface](docs/agent-interface.md#mcp-server).
 
 Open the exported file at [Firefox Profiler](https://profiler.firefox.com/)

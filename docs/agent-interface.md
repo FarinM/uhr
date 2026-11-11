@@ -160,14 +160,15 @@ timeline(threads="pool-*", filter={syscall: futex})     14 threads waiting on on
 ## MCP server
 
 `uhr mcp` serves the tools that read a recording over MCP, on stdin and
-stdout. So far that is `overview`. Recording stays with the CLI. A client
-is told the command to start, as Claude Code is with `claude mcp add uhr --
-uhr mcp`.
+stdout. So far those are `overview` and `query`. Recording stays with the
+CLI. A client is told the command to start, as Claude Code is with `claude
+mcp add uhr -- uhr mcp`.
 
 - A tool takes the path of a recording and what its CLI command takes, under
-  the names results use: `top`, and a `filter` of `pids`, `tids`,
-  `thread_names`, `modes`, `under`, `syscalls`, `regions`, `from` and `to`.
-  The client gets them as a schema, so a model needs no `--help`.
+  the names results use: `group_by`, `metric`, `top`, and a `filter` of
+  `pids`, `tids`, `thread_names`, `modes`, `under`, `syscalls`, `regions`,
+  `from` and `to`. The client gets them as a schema, so a model needs no
+  `--help`.
 - An argument a tool does not know is refused, not dropped: a filter
   dropped would give a result of more than was asked for.
 - A result is the text the CLI prints, which a model reads at a fraction of

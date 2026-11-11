@@ -268,14 +268,11 @@ fn its_tools_only_read_and_take_a_recording() {
     let listed = client.request("tools/list", json!({}));
     let tools = listed["tools"].as_array().unwrap();
     let names: Vec<_> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-    assert_eq!(names, ["overview"]);
+    assert_eq!(names, ["overview", "query"]);
     for tool in tools {
         assert_eq!(tool["annotations"]["readOnlyHint"], true, "{tool}");
-        assert_eq!(
-            tool["inputSchema"]["required"],
-            json!(["recording"]),
-            "{tool}"
-        );
+        let required = tool["inputSchema"]["required"].as_array().unwrap();
+        assert!(required.contains(&json!("recording")), "{tool}");
         assert!(!tool["description"].as_str().unwrap().is_empty(), "{tool}");
     }
 }
@@ -307,6 +304,55 @@ fn overview_says_where_the_time_went() {
     assert!(text.contains("0.003s of CPU time"), "{text}");
 }
 
+/// The functions of a query's rows, in order.
+fn functions(text: &str) -> Vec<&str> {
+    text.lines()
+        .skip_while(|line| !line.trim_start().starts_with("self"))
+        .skip(1)
+        .take_while(|line| line.contains('%'))
+        .map(|line| line.split_whitespace().nth(2).unwrap())
+        .collect()
+}
+
+#[test]
+fn query_ranks_what_passes_the_filter() {
+    let recording = recording("mcp_query");
+    let mut client = Client::start();
+    let by_function = json!({"recording": recording, "group_by": "function"});
+    let text = client.call("query", by_function).unwrap();
+    assert!(
+        text.starts_with("3 samples, 0.01 s of CPU time, by function"),
+        "{text}"
+    );
+    assert_eq!(functions(&text), ["parse", "render", "main"]);
+    assert!(
+        text.contains("time with a named leaf frame: 100.0%"),
+        "{text}"
+    );
+
+    let top = json!({"recording": recording, "group_by": "function", "top": 1});
+    let text = client.call("query", top).unwrap();
+    assert_eq!(functions(&text), ["parse"]);
+    assert!(text.contains("(2 more rows"), "{text}");
+
+    let under = json!({
+        "recording": recording,
+        "group_by": "function",
+        "filter": {"under": ["render"]},
+    });
+    let text = client.call("query", under).unwrap();
+    assert_eq!(functions(&text), ["render", "main"]);
+    assert!(text.contains("filter: under render"), "{text}");
+
+    let waiting = json!({"recording": recording, "group_by": "function", "metric": "off_cpu"});
+    let text = client.call("query", waiting).unwrap();
+    assert!(
+        text.starts_with("1 off-CPU intervals, 0.01 s off CPU"),
+        "{text}"
+    );
+    assert_eq!(functions(&text), ["main"]);
+}
+
 #[test]
 fn a_tool_that_fails_says_why() {
     let recording = recording("mcp_errors");
@@ -326,6 +372,21 @@ fn a_tool_that_fails_says_why() {
     let unitless = json!({"recording": recording, "filter": {"from": "5"}});
     let error = client.call("overview", unitless).unwrap_err();
     assert!(error.starts_with("from: needs a unit"), "{error}");
+
+    let regions = json!({"recording": recording, "group_by": "region"});
+    let error = client.call("query", regions).unwrap_err();
+    assert!(
+        error.starts_with("only page faults were in regions"),
+        "{error}"
+    );
+
+    let ungrouped = client
+        .call("query", json!({"recording": recording}))
+        .unwrap_err();
+    assert!(
+        ungrouped.contains("missing field `group_by`"),
+        "{ungrouped}"
+    );
 }
 
 #[test]

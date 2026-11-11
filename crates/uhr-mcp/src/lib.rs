@@ -9,10 +9,12 @@ use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabiliti
 use rmcp::schemars::{self, JsonSchema};
 use rmcp::service::ServerInitializeError;
 use rmcp::{ServerHandler, ServiceExt, tool, tool_handler, tool_router};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::task::JoinError;
 use uhr_core::filter::Filter;
+use uhr_core::metric::Metric;
 use uhr_core::overview;
+use uhr_core::query::{self, GroupBy, Query};
 use uhr_core::recording::{self, Manifest, Mode, Recording, RegionKind};
 use uhr_core::symbols::Symbols;
 use uhr_core::text;
@@ -26,7 +28,13 @@ directory the uhr CLI made, with `uhr record -o DIR -- COMMAND` or `uhr record -
 
 1. Call `overview` first. It says whether the program was computing or waiting, and what the \
 recording could not see.
-2. Read the coverage at the end of each result before trusting its numbers: frames without \
+2. Then `query`. Computing: metric `cpu` by `function`, `line` or `module`. Waiting: metric \
+`off_cpu` by `syscall` or `function`, or by `waker` for what ended the waits. Memory growing: \
+metric `page_faults` by `function` or `region`.
+3. Narrow with the filter instead of reading more rows: `under` keeps the stacks through a \
+function, `syscalls` those in a syscall, `thread_names`, `from` and `to` pick threads and a time \
+range.
+4. Read the coverage at the end of each result before trusting its numbers: frames without \
 names, lost events and cut stacks say what they leave out.";
 
 /// Why the server could not start, or stopped.
@@ -54,6 +62,8 @@ enum ToolError {
     TimeRange(#[from] wall_clock::Error),
     #[error(transparent)]
     Overview(#[from] overview::Error),
+    #[error(transparent)]
+    Query(#[from] query::Error),
     #[error("writing the result")]
     Write(#[from] io::Error),
 }
@@ -168,6 +178,60 @@ fn parse_time(parameter: &'static str, text: Option<String>) -> Result<Option<Ti
         .map_err(|source| ToolError::Time { parameter, source })
 }
 
+#[derive(Clone, Copy, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+#[schemars(inline)]
+enum GroupByParam {
+    Function,
+    Line,
+    Module,
+    Syscall,
+    Region,
+    Waker,
+    WakerFunction,
+}
+
+impl From<GroupByParam> for GroupBy {
+    fn from(group_by: GroupByParam) -> Self {
+        match group_by {
+            GroupByParam::Function => GroupBy::Function,
+            GroupByParam::Line => GroupBy::Line,
+            GroupByParam::Module => GroupBy::Module,
+            GroupByParam::Syscall => GroupBy::Syscall,
+            GroupByParam::Region => GroupBy::Region,
+            GroupByParam::Waker => GroupBy::Waker,
+            GroupByParam::WakerFunction => GroupBy::WakerFunction,
+        }
+    }
+}
+
+/// What stacks are weighed by. `cpu`: CPU time. `off_cpu`: the time threads
+/// were switched out, runnable or blocked. `wall`: both, all the time
+/// threads were alive. `page_faults`: page faults, which show the code that
+/// first touched memory.
+// Written too, for the schema to say which is the default.
+#[derive(Clone, Copy, Default, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+#[schemars(inline)]
+enum MetricParam {
+    #[default]
+    Cpu,
+    OffCpu,
+    Wall,
+    PageFaults,
+}
+
+impl From<MetricParam> for Metric {
+    fn from(metric: MetricParam) -> Self {
+        match metric {
+            MetricParam::Cpu => Metric::OnCPU,
+            MetricParam::OffCpu => Metric::OffCPU,
+            MetricParam::Wall => Metric::Wall,
+            MetricParam::PageFaults => Metric::PageFaults,
+        }
+    }
+}
+
 fn default_top() -> usize {
     20
 }
@@ -178,6 +242,29 @@ struct OverviewParams {
     /// Path of the recording directory.
     recording: PathBuf,
     /// Processes and threads to list, by CPU time, and processes by memory.
+    #[serde(default = "default_top")]
+    top: usize,
+    #[serde(default)]
+    filter: FilterParams,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct QueryParams {
+    /// Path of the recording directory.
+    recording: PathBuf,
+    /// What a row is. `function`, or `line` for a function's source line:
+    /// code, ranked by the amount in it, with the amount in it and all it
+    /// called beside it. `module`: a binary, a library or the kernel.
+    /// `syscall`: the syscall a thread was in. `region`: the kind of memory
+    /// a page fault was in, with the metric `page_faults` only. `waker`:
+    /// the thread or interrupt that ended each wait, and `waker_function`:
+    /// the functions on the stacks of those wakeups, both with the metric
+    /// `off_cpu` only.
+    group_by: GroupByParam,
+    #[serde(default)]
+    metric: MetricParam,
+    /// Rows to return.
     #[serde(default = "default_top")]
     top: usize,
     #[serde(default)]
@@ -200,6 +287,18 @@ fn overview(params: OverviewParams) -> Result<String, ToolError> {
     let filter = params.filter.into_filter(&recording.manifest)?;
     let result = overview::run(&recording, symbols.as_ref(), &filter, params.top)?;
     render(|out| text::write_overview(out, &result))
+}
+
+fn query(params: QueryParams) -> Result<String, ToolError> {
+    let Loaded { recording, symbols } = load(&params.recording)?;
+    let query = Query {
+        group_by: params.group_by.into(),
+        metric: params.metric.into(),
+        top: params.top,
+        filter: params.filter.into_filter(&recording.manifest)?,
+    };
+    let result = query::run(&recording, symbols.as_ref(), &query)?;
+    render(|out| text::write_query(out, &result))
 }
 
 /// The text form of a result: a model reads it at a fraction of the size of
@@ -253,6 +352,22 @@ impl Server {
     ))]
     async fn overview(&self, Parameters(params): Parameters<OverviewParams>) -> CallToolResult {
         respond(move || overview(params)).await
+    }
+
+    /// Rank what a recording's CPU time, time off CPU or page faults went
+    /// to: group them by function, source line, module, syscall, region of
+    /// memory or waker, keep what passes a filter, and get the top rows
+    /// with their shares, and the coverage. Group and filter the same
+    /// recording again to move between levels: by `syscall`, and then by
+    /// `function` with that syscall in the filter, shows the code that
+    /// makes it.
+    #[tool(annotations(
+        title = "Query a recording",
+        read_only_hint = true,
+        open_world_hint = false
+    ))]
+    async fn query(&self, Parameters(params): Parameters<QueryParams>) -> CallToolResult {
+        respond(move || query(params)).await
     }
 }
 
