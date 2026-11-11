@@ -51,12 +51,15 @@ Early implementation, on Linux only. The code covers only part of the design;
   and the text form of their results, and builds on every platform: nothing in
   it depends on Linux, so a recording can be read anywhere. `uhr-linux`
   records on Linux: perf, launching and attaching, kernel symbols and the
-  Linux `doctor` checks. Elsewhere it is empty. `uhr-cli` is the `uhr` binary.
-  Put new tools in the core, so the CLI and a later MCP server share them, and
-  code for one platform in that platform's crate. Each runtime uhr supports is
-  a module of `uhr-core/src/runtimes`.
-- Core returns typed errors, one `thiserror` enum per module, so callers can
-  tell failures apart. Only the CLI uses `anyhow`, to print them.
+  Linux `doctor` checks. Elsewhere it is empty. `uhr-mcp` is the MCP server,
+  which gives an agent the tools that read a recording. `uhr-cli` is the `uhr`
+  binary, and its `uhr mcp` runs the server. Put new tools in the core, so the
+  CLI and the MCP server share them, and code for one platform in that
+  platform's crate. Each runtime uhr supports is a module of
+  `uhr-core/src/runtimes`.
+- The libraries return typed errors, one `thiserror` enum per module, so
+  callers can tell failures apart. Only the CLI uses `anyhow`, to print
+  them.
 - Diagnostics go through `tracing` to stderr. Command results go to stdout
   through `write_output`, never `println!`, which panics when a reader such
   as `head` stops early.

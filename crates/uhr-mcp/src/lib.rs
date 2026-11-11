@@ -1,0 +1,282 @@
+//! The MCP server: the tools that read a recording, for an agent, over
+//! stdin and stdout.
+
+use std::io;
+use std::path::{Path, PathBuf};
+
+use rmcp::handler::server::wrapper::Parameters;
+use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerConfig};
+use rmcp::schemars::{self, JsonSchema};
+use rmcp::service::ServerInitializeError;
+use rmcp::{ServerHandler, ServiceExt, tool, tool_handler, tool_router};
+use serde::Deserialize;
+use tokio::task::JoinError;
+use uhr_core::filter::Filter;
+use uhr_core::overview;
+use uhr_core::recording::{self, Manifest, Mode, Recording, RegionKind};
+use uhr_core::symbols::Symbols;
+use uhr_core::text;
+use uhr_core::wall_clock::{self, Time};
+
+/// The method, which a client gives its model before any tool is called.
+const INSTRUCTIONS: &str = "\
+uhr reads profiling recordings: where a program's time and memory went. A recording is a \
+directory the uhr CLI made, with `uhr record -o DIR -- COMMAND` or `uhr record -o DIR --pid PID \
+--duration 10s`. Every tool takes the path of one.
+
+1. Call `overview` first. It says whether the program was computing or waiting, and what the \
+recording could not see.
+2. Read the coverage at the end of each result before trusting its numbers: frames without \
+names, lost events and cut stacks say what they leave out.";
+
+/// Why the server could not start, or stopped.
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error("starting the async runtime")]
+    Runtime(#[source] io::Error),
+    #[error("starting the MCP session")]
+    Initialize(#[source] Box<ServerInitializeError>),
+    #[error("serving MCP")]
+    Serve(#[source] JoinError),
+}
+
+/// Why a tool has no result.
+#[derive(Debug, thiserror::Error)]
+enum ToolError {
+    #[error(transparent)]
+    Recording(#[from] recording::Error),
+    #[error("{parameter}")]
+    Time {
+        parameter: &'static str,
+        source: wall_clock::Error,
+    },
+    #[error(transparent)]
+    TimeRange(#[from] wall_clock::Error),
+    #[error(transparent)]
+    Overview(#[from] overview::Error),
+    #[error("writing the result")]
+    Write(#[from] io::Error),
+}
+
+/// Which samples and off-CPU intervals a result covers. The values in one
+/// list are alternatives, and every list given has to match.
+#[derive(Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(inline)]
+struct FilterParams {
+    /// Process ids.
+    #[serde(default)]
+    pids: Vec<u32>,
+    /// Thread ids.
+    #[serde(default)]
+    tids: Vec<u32>,
+    /// Patterns for the name a thread had at the time. `*` matches any
+    /// characters, `?` one.
+    #[serde(default)]
+    thread_names: Vec<String>,
+    /// CPU modes. Time off CPU has none, so any mode leaves it out.
+    #[serde(default)]
+    modes: Vec<ModeParam>,
+    /// Functions, each by its name where only one function has it, or by
+    /// its id. Keeps the stacks that contain one of them.
+    #[serde(default)]
+    under: Vec<String>,
+    /// Syscall names, as `read`. Keeps the stacks in one of them.
+    #[serde(default)]
+    syscalls: Vec<String>,
+    /// Kinds of memory region. Only page faults were in one, so any leaves
+    /// out CPU samples and time off CPU.
+    #[serde(default)]
+    regions: Vec<RegionParam>,
+    /// Start of a time range: an offset into the recording, as `1.5s` or
+    /// `200ms`, or a time of day with a date and a UTC offset, as
+    /// `2026-11-06T12:34:56.7Z`.
+    from: Option<String>,
+    /// End of the time range, not included, given as `from`.
+    to: Option<String>,
+}
+
+#[derive(Clone, Copy, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+#[schemars(inline)]
+enum ModeParam {
+    User,
+    Kernel,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+#[schemars(inline)]
+enum RegionParam {
+    Heap,
+    Stack,
+    Anonymous,
+    AnonymousCode,
+    Shared,
+    Code,
+    File,
+    Kernel,
+}
+
+impl FilterParams {
+    /// `manifest` has the times of day that `from` and `to` can be.
+    fn into_filter(self, manifest: &Manifest) -> Result<Filter, ToolError> {
+        let (from_ns, to_ns) = wall_clock::offsets(
+            manifest,
+            parse_time("from", self.from)?,
+            parse_time("to", self.to)?,
+        )?;
+        Ok(Filter {
+            pids: self.pids,
+            tids: self.tids,
+            thread_names: self.thread_names,
+            modes: self
+                .modes
+                .into_iter()
+                .map(|mode| match mode {
+                    ModeParam::User => Mode::User,
+                    ModeParam::Kernel => Mode::Kernel,
+                    ModeParam::Unknown => Mode::Unknown,
+                })
+                .collect(),
+            under: self.under,
+            syscalls: self.syscalls,
+            regions: self
+                .regions
+                .into_iter()
+                .map(|region| match region {
+                    RegionParam::Heap => RegionKind::Heap,
+                    RegionParam::Stack => RegionKind::Stack,
+                    RegionParam::Anonymous => RegionKind::Anonymous,
+                    RegionParam::AnonymousCode => RegionKind::AnonymousCode,
+                    RegionParam::Shared => RegionKind::Shared,
+                    RegionParam::Code => RegionKind::Code,
+                    RegionParam::File => RegionKind::File,
+                    RegionParam::Kernel => RegionKind::Kernel,
+                })
+                .collect(),
+            from_ns,
+            to_ns,
+        })
+    }
+}
+
+fn parse_time(parameter: &'static str, text: Option<String>) -> Result<Option<Time>, ToolError> {
+    text.map(|text| text.parse())
+        .transpose()
+        .map_err(|source| ToolError::Time { parameter, source })
+}
+
+fn default_top() -> usize {
+    20
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct OverviewParams {
+    /// Path of the recording directory.
+    recording: PathBuf,
+    /// Processes and threads to list, by CPU time, and processes by memory.
+    #[serde(default = "default_top")]
+    top: usize,
+    #[serde(default)]
+    filter: FilterParams,
+}
+
+struct Loaded {
+    recording: Recording,
+    symbols: Option<Symbols>,
+}
+
+fn load(dir: &Path) -> Result<Loaded, ToolError> {
+    let recording = Recording::read(dir)?;
+    let symbols = Symbols::read(dir, &recording)?;
+    Ok(Loaded { recording, symbols })
+}
+
+fn overview(params: OverviewParams) -> Result<String, ToolError> {
+    let Loaded { recording, symbols } = load(&params.recording)?;
+    let filter = params.filter.into_filter(&recording.manifest)?;
+    let result = overview::run(&recording, symbols.as_ref(), &filter, params.top)?;
+    render(|out| text::write_overview(out, &result))
+}
+
+/// The text form of a result: a model reads it at a fraction of the size of
+/// the JSON.
+fn render(write: impl FnOnce(&mut Vec<u8>) -> io::Result<()>) -> Result<String, ToolError> {
+    let mut text = Vec::new();
+    write(&mut text)?;
+    Ok(String::from_utf8_lossy(&text).into_owned())
+}
+
+/// A tool that fails says why in its result, where the model can read it
+/// and try again.
+async fn respond(
+    run: impl FnOnce() -> Result<String, ToolError> + Send + 'static,
+) -> CallToolResult {
+    // Off the thread that answers the client: reading a large recording
+    // takes seconds.
+    let error = match tokio::task::spawn_blocking(run).await {
+        Ok(Ok(text)) => return CallToolResult::success(vec![ContentBlock::text(text)]),
+        Ok(Err(error)) => with_causes(&error),
+        Err(error) => format!("the tool did not finish: {error}"),
+    };
+    CallToolResult::error(vec![ContentBlock::text(error)])
+}
+
+/// An error and what caused it, on one line.
+fn with_causes(error: &dyn std::error::Error) -> String {
+    let mut text = error.to_string();
+    let mut cause = error.source();
+    while let Some(error) = cause {
+        text.push_str(": ");
+        text.push_str(&error.to_string());
+        cause = error.source();
+    }
+    text
+}
+
+struct Server;
+
+#[tool_router]
+impl Server {
+    /// Where a recording's time and memory went, at the top level: CPU time
+    /// in user and kernel mode, time off CPU runnable and blocked, by
+    /// process and thread, each process's resident memory, and what the
+    /// recording could not see. Call it first: whether the program was
+    /// computing or waiting decides what to look at next.
+    #[tool(annotations(
+        title = "Overview of a recording",
+        read_only_hint = true,
+        open_world_hint = false
+    ))]
+    async fn overview(&self, Parameters(params): Parameters<OverviewParams>) -> CallToolResult {
+        respond(move || overview(params)).await
+    }
+}
+
+#[tool_handler]
+impl ServerHandler for Server {
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(Implementation::new("uhr", env!("CARGO_PKG_VERSION")))
+            .with_instructions(INSTRUCTIONS)
+    }
+}
+
+/// Serves until the client closes stdin.
+pub fn serve() -> Result<(), Error> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(Error::Runtime)?;
+    runtime.block_on(async {
+        let service = Server
+            .serve(rmcp::transport::stdio())
+            .await
+            .map_err(|error| Error::Initialize(Box::new(error)))?;
+        service.waiting().await.map_err(Error::Serve)?;
+        Ok(())
+    })
+}

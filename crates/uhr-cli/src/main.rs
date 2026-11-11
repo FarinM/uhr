@@ -150,6 +150,9 @@ enum Command {
         #[command(flatten)]
         filter: FilterArgs,
     },
+    /// Serve the tools that read a recording to an agent, over MCP on stdin
+    /// and stdout
+    Mcp,
 }
 
 #[derive(Args)]
@@ -476,6 +479,7 @@ fn main() -> ExitCode {
             filter,
             json,
         ),
+        Command::Mcp => run_mcp(),
     };
     result.unwrap_or_else(|error| {
         tracing::error!("{error:#}");
@@ -484,10 +488,11 @@ fn main() -> ExitCode {
 }
 
 fn init_logging() {
+    // The MCP SDK logs every session's start and end at info.
+    let directives = std::env::var("UHR_LOG").unwrap_or_else(|_| "info,rmcp=warn".into());
     let filter = EnvFilter::builder()
         .with_default_directive(LevelFilter::INFO.into())
-        .with_env_var("UHR_LOG")
-        .from_env_lossy();
+        .parse_lossy(directives);
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
@@ -598,6 +603,11 @@ fn run_record(args: RecordArgs) -> Result<ExitCode> {
 #[cfg(not(target_os = "linux"))]
 fn run_record(_: RecordArgs) -> Result<ExitCode> {
     bail!("uhr records on Linux only, so far")
+}
+
+fn run_mcp() -> Result<ExitCode> {
+    uhr_mcp::serve()?;
+    Ok(ExitCode::SUCCESS)
 }
 
 fn run_symbolize(recording: &Path) -> Result<ExitCode> {

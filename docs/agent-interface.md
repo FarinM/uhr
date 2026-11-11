@@ -157,6 +157,28 @@ query(filter={syscall: futex}, group_by=user_function)  Pool.acquire 28%
 timeline(threads="pool-*", filter={syscall: futex})     14 threads waiting on one lock
 ```
 
+## MCP server
+
+`uhr mcp` serves the tools that read a recording over MCP, on stdin and
+stdout. So far that is `overview`. Recording stays with the CLI. A client
+is told the command to start, as Claude Code is with `claude mcp add uhr --
+uhr mcp`.
+
+- A tool takes the path of a recording and what its CLI command takes, under
+  the names results use: `top`, and a `filter` of `pids`, `tids`,
+  `thread_names`, `modes`, `under`, `syscalls`, `regions`, `from` and `to`.
+  The client gets them as a schema, so a model needs no `--help`.
+- An argument a tool does not know is refused, not dropped: a filter
+  dropped would give a result of more than was asked for.
+- A result is the text the CLI prints, which a model reads at a fraction of
+  the size of the JSON. A program that wants the JSON has the CLI's `--json`.
+- A tool that fails says why in its result, where the model reads it and can
+  call again.
+- The tools are marked as only reading, so a client can run them without
+  asking.
+- The server gives the client the method to follow, starting with
+  `overview`, as the [agent skill](#agent-skill) would.
+
 ## Code on runtimes
 
 Python, Node, Bun and Lua programs are profiled with the same commands as
