@@ -1,3 +1,5 @@
+use std::str::FromStr;
+
 use chrono::{DateTime, SecondsFormat, Utc};
 
 use crate::recording::{ClockReading, Manifest, WallClock};
@@ -31,6 +33,10 @@ pub enum Error {
     BeforeStart { time: String, start: String },
     #[error("the start of the time range must be before its end")]
     Empty,
+    #[error("needs a unit: ns, us, ms or s, as in 1.5s")]
+    NoUnit,
+    #[error("{0:?} is not a non-negative number")]
+    NotANumber(String),
 }
 
 /// A bound of a time range.
@@ -40,6 +46,34 @@ pub enum Time {
     Offset(u64),
     /// Nanoseconds since 1970 began in UTC, as CLOCK_REALTIME counts them.
     Utc(i64),
+}
+
+/// An offset, or a time of day where it has the shape of one.
+impl FromStr for Time {
+    type Err = Error;
+
+    fn from_str(text: &str) -> Result<Self, Error> {
+        if text.contains([':', 'T']) || text.get(4..5) == Some("-") {
+            parse(text).map(Time::Utc)
+        } else {
+            parse_offset(text).map(Time::Offset)
+        }
+    }
+}
+
+/// A duration with a unit, in nanoseconds.
+pub fn parse_offset(text: &str) -> Result<u64, Error> {
+    let units = [("ns", 1.0), ("us", 1e3), ("ms", 1e6), ("s", 1e9)];
+    let Some((number, scale)) = units
+        .iter()
+        .find_map(|&(unit, scale)| text.strip_suffix(unit).map(|n| (n, scale)))
+    else {
+        return Err(Error::NoUnit);
+    };
+    match number.parse::<f64>() {
+        Ok(value) if value.is_finite() && value >= 0.0 => Ok((value * scale).round() as u64),
+        _ => Err(Error::NotANumber(number.to_owned())),
+    }
 }
 
 /// Reads an RFC 3339 time, which has a date and a UTC offset: a time

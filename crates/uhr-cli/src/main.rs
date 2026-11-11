@@ -219,7 +219,7 @@ struct RecordArgs {
     pid: Option<u32>,
     /// With --pid, stop after this long, such as 10s or 500ms, rather
     /// than at Ctrl-C or when the process exits
-    #[arg(long, value_name = "DURATION", requires = "pid", value_parser = parse_offset)]
+    #[arg(long, value_name = "DURATION", requires = "pid", value_parser = wall_clock::parse_offset)]
     duration: Option<u64>,
     /// Command to profile, after `--`
     #[arg(required_unless_present = "pid", last = true)]
@@ -321,10 +321,10 @@ struct FilterArgs {
     /// Only samples from this time on: an offset into the recording, such
     /// as 1.5s or 200ms, or a time of day with a date and a UTC offset, such
     /// as 2026-11-06T12:34:56.7Z
-    #[arg(long, value_name = "TIME", value_parser = parse_time)]
+    #[arg(long, value_name = "TIME")]
     from: Option<Time>,
     /// Only samples before this time, given as for --from
-    #[arg(long, value_name = "TIME", value_parser = parse_time)]
+    #[arg(long, value_name = "TIME")]
     to: Option<Time>,
 }
 
@@ -403,32 +403,6 @@ impl FilterArgs {
             from_ns,
             to_ns,
         })
-    }
-}
-
-/// An offset, or a time of day where it has the shape of one.
-fn parse_time(text: &str) -> Result<Time, String> {
-    if text.contains([':', 'T']) || text.get(4..5) == Some("-") {
-        wall_clock::parse(text)
-            .map(Time::Utc)
-            .map_err(|e| e.to_string())
-    } else {
-        parse_offset(text).map(Time::Offset)
-    }
-}
-
-/// A duration with a unit, in nanoseconds.
-fn parse_offset(text: &str) -> Result<u64, String> {
-    let units = [("ns", 1.0), ("us", 1e3), ("ms", 1e6), ("s", 1e9)];
-    let Some((number, scale)) = units
-        .iter()
-        .find_map(|&(unit, scale)| text.strip_suffix(unit).map(|n| (n, scale)))
-    else {
-        return Err("needs a unit: ns, us, ms or s, as in 1.5s".into());
-    };
-    match number.parse::<f64>() {
-        Ok(value) if value.is_finite() && value >= 0.0 => Ok((value * scale).round() as u64),
-        _ => Err(format!("{number:?} is not a non-negative number")),
     }
 }
 

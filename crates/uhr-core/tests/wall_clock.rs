@@ -1,5 +1,5 @@
 use uhr_core::recording::*;
-use uhr_core::wall_clock::{self, Error, Time, format, offsets, parse, utc_of};
+use uhr_core::wall_clock::{self, Error, Time, format, offsets, parse, parse_offset, utc_of};
 
 const S: u64 = 1_000_000_000;
 
@@ -53,6 +53,33 @@ fn reads_times_of_day_with_their_offset_from_utc() {
     assert_eq!(utc("2026-11-06T12:00:00.5Z"), noon + 500_000_000);
     for local in ["2026-11-06T12:00:00", "2026-11-06", "12:00:00Z", "1.5s"] {
         assert!(matches!(parse(local), Err(Error::Parse(_))), "{local}");
+    }
+}
+
+#[test]
+fn reads_offsets_with_their_unit() {
+    assert_eq!(parse_offset("1.5s").unwrap(), 3 * S / 2);
+    assert_eq!(parse_offset("200ms").unwrap(), S / 5);
+    assert_eq!(parse_offset("7us").unwrap(), 7_000);
+    assert_eq!(parse_offset("0ns").unwrap(), 0);
+    assert!(matches!(parse_offset("5"), Err(Error::NoUnit)));
+    for number in ["-1", "x", "inf", ""] {
+        let text = format!("{number}s");
+        assert!(
+            matches!(parse_offset(&text), Err(Error::NotANumber(n)) if n == number),
+            "{text}"
+        );
+    }
+}
+
+#[test]
+fn a_time_is_an_offset_or_a_time_of_day_by_its_shape() {
+    assert_eq!("1.5s".parse::<Time>().unwrap(), Time::Offset(3 * S / 2));
+    let noon = "2026-11-06T12:00:00Z";
+    assert_eq!(noon.parse::<Time>().unwrap(), Time::Utc(utc(noon)));
+    // Without a UTC offset it is still a time of day, one that says so.
+    for text in ["2026-11-06 12:00", "12:00:00", "2026-11-06"] {
+        assert!(matches!(text.parse::<Time>(), Err(Error::Parse(t)) if t == text));
     }
 }
 
