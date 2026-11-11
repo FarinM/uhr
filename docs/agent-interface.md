@@ -175,6 +175,11 @@ as Claude Code is with `claude mcp add uhr -- uhr mcp`.
   the size of the JSON. A program that wants the JSON has the CLI's `--json`.
 - A tool that fails says why in its result, where the model reads it and can
   call again.
+- `overview` lists the known biases of how the recording was made. `query`
+  and `call_paths` say how many there are and that `overview` lists them:
+  they are the same in every result of a recording, and most of each, about
+  a thousand tokens of a recording made with uhr's eBPF programs. The rest
+  of the coverage, which differs by result, is in each.
 - The tools are marked as only reading, so a client can run them without
   asking.
 - The server gives the client the method to follow, starting with

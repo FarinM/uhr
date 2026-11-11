@@ -375,6 +375,31 @@ fn call_paths_show_callers_and_callees() {
 }
 
 #[test]
+fn only_overview_lists_the_known_biases() {
+    let recording = recording("mcp_biases");
+    let mut client = Client::start();
+    let bias = "Samples can land a few instructions late.";
+    let overview = client
+        .call("overview", json!({"recording": recording}))
+        .unwrap();
+    assert!(overview.contains(&format!("  bias: {bias}")), "{overview}");
+
+    let by_function = json!({"recording": recording, "group_by": "function"});
+    let of_main = json!({"recording": recording, "function": "main"});
+    for (tool, arguments) in [("query", by_function), ("call_paths", of_main)] {
+        let text = client.call(tool, arguments).unwrap();
+        assert!(!text.contains(bias), "{text}");
+        let coverage = text.split_once("\ncoverage\n").unwrap().1;
+        assert!(
+            coverage.ends_with(
+                "  known biases: 1, of how the recording was made. `overview` lists them\n"
+            ),
+            "{text}"
+        );
+    }
+}
+
+#[test]
 fn a_tool_that_fails_says_why() {
     let recording = recording("mcp_errors");
     let mut client = Client::start();

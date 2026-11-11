@@ -1,7 +1,7 @@
 //! The MCP server: the tools that read a recording, for an agent, over
 //! stdin and stdout.
 
-use std::io;
+use std::io::{self, Write};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
@@ -13,6 +13,7 @@ use rmcp::{ServerHandler, ServiceExt, tool, tool_handler, tool_router};
 use serde::{Deserialize, Serialize};
 use tokio::task::JoinError;
 use uhr_core::call_paths;
+use uhr_core::coverage::Coverage;
 use uhr_core::filter::Filter;
 use uhr_core::metric::Metric;
 use uhr_core::overview;
@@ -37,7 +38,8 @@ metric `page_faults` by `function` or `region`.
 function, `syscalls` those in a syscall, `thread_names`, `from` and `to` pick threads and a time \
 range. `call_paths` shows who calls a function and what it calls.
 4. Read the coverage at the end of each result before trusting its numbers: frames without \
-names, lost events and cut stacks say what they leave out.";
+names, lost events and cut stacks say what they leave out. The known biases of how the recording \
+was made hold for every result, and only `overview` lists them.";
 
 /// Why the server could not start, or stopped.
 #[derive(Debug, thiserror::Error)]
@@ -332,8 +334,12 @@ fn query(params: QueryParams) -> Result<String, ToolError> {
         top: params.top,
         filter: params.filter.into_filter(&recording.manifest)?,
     };
-    let result = query::run(&recording, symbols.as_ref(), &query)?;
-    render(|out| text::write_query(out, &result))
+    let mut result = query::run(&recording, symbols.as_ref(), &query)?;
+    let biases = take_biases(&mut result.coverage.recording);
+    render(|out| {
+        text::write_query(out, &result)?;
+        write_biases(out, biases)
+    })
 }
 
 fn call_paths(params: CallPathsParams) -> Result<String, ToolError> {
@@ -345,8 +351,31 @@ fn call_paths(params: CallPathsParams) -> Result<String, ToolError> {
         metric: params.metric.into(),
         filter: params.filter.into_filter(&recording.manifest)?,
     };
-    let result = call_paths::run(&recording, symbols.as_ref(), &query)?;
-    render(|out| text::write_call_paths(out, &result))
+    let mut result = call_paths::run(&recording, symbols.as_ref(), &query)?;
+    let biases = take_biases(&mut result.coverage.recording);
+    render(|out| {
+        text::write_call_paths(out, &result)?;
+        write_biases(out, biases)
+    })
+}
+
+/// How many biases a result's coverage has, which it then has none of. A
+/// recording's are the same in every result, and most of each: a model
+/// that reads them once, in `overview`, has several times the room for
+/// results.
+fn take_biases(coverage: &mut Coverage) -> usize {
+    std::mem::take(&mut coverage.known_biases).len()
+}
+
+/// Ends the coverage a result was written with.
+fn write_biases(out: &mut impl Write, biases: usize) -> io::Result<()> {
+    if biases > 0 {
+        writeln!(
+            out,
+            "  known biases: {biases}, of how the recording was made. `overview` lists them"
+        )?;
+    }
+    Ok(())
 }
 
 /// The text form of a result: a model reads it at a fraction of the size of

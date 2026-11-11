@@ -156,6 +156,10 @@ Every recording, stream and query result must carry coverage. At minimum:
 Missing coverage is "unknown", never zero. A result whose coverage cannot be
 computed must say so.
 
+The known biases are the same in every result of a recording. Where one
+reader asks many questions of it, as a model does over MCP, the results may
+say where the biases are listed instead of repeating them.
+
 ## Storage
 
 A recording is a directory of Parquet files in our own schema, plus a JSON
