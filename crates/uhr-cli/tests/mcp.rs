@@ -268,7 +268,7 @@ fn its_tools_only_read_and_take_a_recording() {
     let listed = client.request("tools/list", json!({}));
     let tools = listed["tools"].as_array().unwrap();
     let names: Vec<_> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-    assert_eq!(names, ["overview", "query"]);
+    assert_eq!(names, ["call_paths", "overview", "query"]);
     for tool in tools {
         assert_eq!(tool["annotations"]["readOnlyHint"], true, "{tool}");
         let required = tool["inputSchema"]["required"].as_array().unwrap();
@@ -354,6 +354,27 @@ fn query_ranks_what_passes_the_filter() {
 }
 
 #[test]
+fn call_paths_show_callers_and_callees() {
+    let recording = recording("mcp_call_paths");
+    let mut client = Client::start();
+    let of_main = json!({"recording": recording, "function": "main"});
+    let text = client.call("call_paths", of_main).unwrap();
+    assert!(
+        text.contains("On the stack for 100.0% of it, its own for 10.0%"),
+        "{text}"
+    );
+    let (callers, callees) = text.split_once("\ncallees\n").unwrap();
+    assert!(callers.contains("100.0%  (no caller"), "{text}");
+    assert!(callees.contains("60.0%  parse"), "{text}");
+    assert!(callees.contains("30.0%  render"), "{text}");
+
+    let of_parse = json!({"recording": recording, "function": "parse", "top": 1});
+    let text = client.call("call_paths", of_parse).unwrap();
+    let (callers, _) = text.split_once("\ncallees\n").unwrap();
+    assert!(callers.contains("60.0%  main"), "{text}");
+}
+
+#[test]
 fn a_tool_that_fails_says_why() {
     let recording = recording("mcp_errors");
     let mut client = Client::start();
@@ -387,6 +408,17 @@ fn a_tool_that_fails_says_why() {
         ungrouped.contains("missing field `group_by`"),
         "{ungrouped}"
     );
+
+    let unknown = json!({"recording": recording, "function": "nope"});
+    let error = client.call("call_paths", unknown).unwrap_err();
+    assert!(
+        error.starts_with("no function in the recorded stacks"),
+        "{error}"
+    );
+
+    let shallow = json!({"recording": recording, "function": "main", "depth": 0});
+    let error = client.call("call_paths", shallow).unwrap_err();
+    assert!(error.contains("expected a nonzero"), "{error}");
 }
 
 #[test]

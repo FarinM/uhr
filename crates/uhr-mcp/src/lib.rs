@@ -2,6 +2,7 @@
 //! stdin and stdout.
 
 use std::io;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
 use rmcp::handler::server::wrapper::Parameters;
@@ -11,6 +12,7 @@ use rmcp::service::ServerInitializeError;
 use rmcp::{ServerHandler, ServiceExt, tool, tool_handler, tool_router};
 use serde::{Deserialize, Serialize};
 use tokio::task::JoinError;
+use uhr_core::call_paths;
 use uhr_core::filter::Filter;
 use uhr_core::metric::Metric;
 use uhr_core::overview;
@@ -33,7 +35,7 @@ recording could not see.
 metric `page_faults` by `function` or `region`.
 3. Narrow with the filter instead of reading more rows: `under` keeps the stacks through a \
 function, `syscalls` those in a syscall, `thread_names`, `from` and `to` pick threads and a time \
-range.
+range. `call_paths` shows who calls a function and what it calls.
 4. Read the coverage at the end of each result before trusting its numbers: frames without \
 names, lost events and cut stacks say what they leave out.";
 
@@ -64,6 +66,8 @@ enum ToolError {
     Overview(#[from] overview::Error),
     #[error(transparent)]
     Query(#[from] query::Error),
+    #[error(transparent)]
+    CallPaths(#[from] call_paths::Error),
     #[error("writing the result")]
     Write(#[from] io::Error),
 }
@@ -88,7 +92,8 @@ struct FilterParams {
     #[serde(default)]
     modes: Vec<ModeParam>,
     /// Functions, each by its name where only one function has it, or by
-    /// its id. Keeps the stacks that contain one of them.
+    /// its id, which the error lists where several share the name. Keeps
+    /// the stacks that contain one of them.
     #[serde(default)]
     under: Vec<String>,
     /// Syscall names, as `read`. Keeps the stacks in one of them.
@@ -271,6 +276,36 @@ struct QueryParams {
     filter: FilterParams,
 }
 
+const DEPTH: NonZeroUsize = NonZeroUsize::new(3).unwrap();
+
+fn default_depth() -> NonZeroUsize {
+    DEPTH
+}
+
+fn default_children() -> usize {
+    5
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct CallPathsParams {
+    /// Path of the recording directory.
+    recording: PathBuf,
+    /// The function, by its name where only one function has it, or by its
+    /// id, which the error lists where several share the name.
+    function: String,
+    #[serde(default)]
+    metric: MetricParam,
+    /// Levels of callers and of callees to follow.
+    #[serde(default = "default_depth")]
+    depth: NonZeroUsize,
+    /// Callers or callees to show of each function. The rest are summed.
+    #[serde(default = "default_children")]
+    top: usize,
+    #[serde(default)]
+    filter: FilterParams,
+}
+
 struct Loaded {
     recording: Recording,
     symbols: Option<Symbols>,
@@ -299,6 +334,19 @@ fn query(params: QueryParams) -> Result<String, ToolError> {
     };
     let result = query::run(&recording, symbols.as_ref(), &query)?;
     render(|out| text::write_query(out, &result))
+}
+
+fn call_paths(params: CallPathsParams) -> Result<String, ToolError> {
+    let Loaded { recording, symbols } = load(&params.recording)?;
+    let query = call_paths::Query {
+        function: params.function,
+        depth: params.depth.get(),
+        top: params.top,
+        metric: params.metric.into(),
+        filter: params.filter.into_filter(&recording.manifest)?,
+    };
+    let result = call_paths::run(&recording, symbols.as_ref(), &query)?;
+    render(|out| text::write_call_paths(out, &result))
 }
 
 /// The text form of a result: a model reads it at a fraction of the size of
@@ -368,6 +416,20 @@ impl Server {
     ))]
     async fn query(&self, Parameters(params): Parameters<QueryParams>) -> CallToolResult {
         respond(move || query(params)).await
+    }
+
+    /// Who calls a function and what it calls: two trees from the function
+    /// outward, its callers and its callees, each path with its share of
+    /// the recording's CPU time, time off CPU or page faults. For a
+    /// function `query` ranked high: the callers say why it runs, and the
+    /// callees where its time goes.
+    #[tool(annotations(
+        title = "Callers and callees of a function",
+        read_only_hint = true,
+        open_world_hint = false
+    ))]
+    async fn call_paths(&self, Parameters(params): Parameters<CallPathsParams>) -> CallToolResult {
+        respond(move || call_paths(params)).await
     }
 }
 
