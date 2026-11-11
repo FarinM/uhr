@@ -1,9 +1,13 @@
 //! The MCP server: the tools that read a recording, for an agent, over
 //! stdin and stdout.
 
+use std::ffi::OsString;
+use std::fs;
 use std::io::{self, Write};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::SystemTime;
 
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerConfig};
@@ -313,28 +317,78 @@ struct Loaded {
     symbols: Option<Symbols>,
 }
 
-fn load(dir: &Path) -> Result<Loaded, ToolError> {
-    let recording = Recording::read(dir)?;
-    let symbols = Symbols::read(dir, &recording)?;
-    Ok(Loaded { recording, symbols })
+/// The recording the tools read last. A model asks many questions of one
+/// recording, and reading it is most of what a question takes. It stays in
+/// memory as long as the server runs, so only one is kept.
+#[derive(Default)]
+struct Cache {
+    last: Mutex<Option<(Files, Arc<Loaded>)>>,
 }
 
-fn overview(params: OverviewParams) -> Result<String, ToolError> {
-    let Loaded { recording, symbols } = load(&params.recording)?;
+/// A recording's directory and what was in it: `uhr symbolize` adds files
+/// to a recording, and another can be made where one was.
+#[derive(PartialEq, Eq)]
+struct Files {
+    dir: PathBuf,
+    /// By name, each with its size and when it was last written.
+    files: Vec<(OsString, u64, SystemTime)>,
+}
+
+impl Files {
+    fn of(dir: &Path) -> io::Result<Self> {
+        let mut files = Vec::new();
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let metadata = entry.metadata()?;
+            files.push((entry.file_name(), metadata.len(), metadata.modified()?));
+        }
+        files.sort();
+        Ok(Self {
+            dir: dir.to_owned(),
+            files,
+        })
+    }
+}
+
+impl Cache {
+    fn load(&self, dir: &Path) -> Result<Arc<Loaded>, ToolError> {
+        // Held while reading, so that calls a client makes at once of one
+        // recording read it once. What it guards is whole even after a
+        // panic: it is only ever replaced.
+        let mut last = self.last.lock().unwrap_or_else(PoisonError::into_inner);
+        // A directory that cannot be listed is for reading it to refuse.
+        let files = Files::of(dir).ok();
+        if let (Some(files), Some((read, loaded))) = (&files, &*last)
+            && files == read
+        {
+            return Ok(loaded.clone());
+        }
+        // Dropped first, so that reading the next needs no room for both.
+        *last = None;
+        let recording = Recording::read(dir)?;
+        let symbols = Symbols::read(dir, &recording)?;
+        let loaded = Arc::new(Loaded { recording, symbols });
+        *last = files.map(|files| (files, loaded.clone()));
+        Ok(loaded)
+    }
+}
+
+fn overview(cache: &Cache, params: OverviewParams) -> Result<String, ToolError> {
+    let Loaded { recording, symbols } = &*cache.load(&params.recording)?;
     let filter = params.filter.into_filter(&recording.manifest)?;
-    let result = overview::run(&recording, symbols.as_ref(), &filter, params.top)?;
+    let result = overview::run(recording, symbols.as_ref(), &filter, params.top)?;
     render(|out| text::write_overview(out, &result))
 }
 
-fn query(params: QueryParams) -> Result<String, ToolError> {
-    let Loaded { recording, symbols } = load(&params.recording)?;
+fn query(cache: &Cache, params: QueryParams) -> Result<String, ToolError> {
+    let Loaded { recording, symbols } = &*cache.load(&params.recording)?;
     let query = Query {
         group_by: params.group_by.into(),
         metric: params.metric.into(),
         top: params.top,
         filter: params.filter.into_filter(&recording.manifest)?,
     };
-    let mut result = query::run(&recording, symbols.as_ref(), &query)?;
+    let mut result = query::run(recording, symbols.as_ref(), &query)?;
     let biases = take_biases(&mut result.coverage.recording);
     render(|out| {
         text::write_query(out, &result)?;
@@ -342,8 +396,8 @@ fn query(params: QueryParams) -> Result<String, ToolError> {
     })
 }
 
-fn call_paths(params: CallPathsParams) -> Result<String, ToolError> {
-    let Loaded { recording, symbols } = load(&params.recording)?;
+fn call_paths(cache: &Cache, params: CallPathsParams) -> Result<String, ToolError> {
+    let Loaded { recording, symbols } = &*cache.load(&params.recording)?;
     let query = call_paths::Query {
         function: params.function,
         depth: params.depth.get(),
@@ -351,7 +405,7 @@ fn call_paths(params: CallPathsParams) -> Result<String, ToolError> {
         metric: params.metric.into(),
         filter: params.filter.into_filter(&recording.manifest)?,
     };
-    let mut result = call_paths::run(&recording, symbols.as_ref(), &query)?;
+    let mut result = call_paths::run(recording, symbols.as_ref(), &query)?;
     let biases = take_biases(&mut result.coverage.recording);
     render(|out| {
         text::write_call_paths(out, &result)?;
@@ -413,7 +467,10 @@ fn with_causes(error: &dyn std::error::Error) -> String {
     text
 }
 
-struct Server;
+#[derive(Default)]
+struct Server {
+    cache: Arc<Cache>,
+}
 
 #[tool_router]
 impl Server {
@@ -428,7 +485,8 @@ impl Server {
         open_world_hint = false
     ))]
     async fn overview(&self, Parameters(params): Parameters<OverviewParams>) -> CallToolResult {
-        respond(move || overview(params)).await
+        let cache = self.cache.clone();
+        respond(move || overview(&cache, params)).await
     }
 
     /// Rank what a recording's CPU time, time off CPU or page faults went
@@ -444,7 +502,8 @@ impl Server {
         open_world_hint = false
     ))]
     async fn query(&self, Parameters(params): Parameters<QueryParams>) -> CallToolResult {
-        respond(move || query(params)).await
+        let cache = self.cache.clone();
+        respond(move || query(&cache, params)).await
     }
 
     /// Who calls a function and what it calls: two trees from the function
@@ -458,7 +517,8 @@ impl Server {
         open_world_hint = false
     ))]
     async fn call_paths(&self, Parameters(params): Parameters<CallPathsParams>) -> CallToolResult {
-        respond(move || call_paths(params)).await
+        let cache = self.cache.clone();
+        respond(move || call_paths(&cache, params)).await
     }
 }
 
@@ -478,7 +538,7 @@ pub fn serve() -> Result<(), Error> {
         .build()
         .map_err(Error::Runtime)?;
     runtime.block_on(async {
-        let service = Server
+        let service = Server::default()
             .serve(rmcp::transport::stdio())
             .await
             .map_err(|error| Error::Initialize(Box::new(error)))?;

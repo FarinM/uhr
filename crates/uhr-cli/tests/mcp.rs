@@ -3,7 +3,7 @@
 
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 use serde_json::{Value, json};
@@ -100,6 +100,25 @@ const MS: u64 = 1_000_000;
 /// blocked. A runtime compiled the three functions, so the recording has
 /// their names itself.
 fn recording(name: &str) -> PathBuf {
+    let dir = unsymbolized(name);
+    symbolize(&dir);
+    dir
+}
+
+fn symbolize(recording: &Path) {
+    let symbolized = Command::new(UHR)
+        .arg("symbolize")
+        .arg(recording)
+        .output()
+        .unwrap();
+    assert!(
+        symbolized.status.success(),
+        "{}",
+        String::from_utf8_lossy(&symbolized.stderr)
+    );
+}
+
+fn unsymbolized(name: &str) -> PathBuf {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
     let _ = fs::remove_dir_all(&dir);
     let code = 0x7f00_0000_0000;
@@ -239,16 +258,6 @@ fn recording(name: &str) -> PathBuf {
         region_memory: Vec::new(),
     };
     recording.write(&dir).unwrap();
-    let symbolized = Command::new(UHR)
-        .arg("symbolize")
-        .arg(&dir)
-        .output()
-        .unwrap();
-    assert!(
-        symbolized.status.success(),
-        "{}",
-        String::from_utf8_lossy(&symbolized.stderr)
-    );
     dir
 }
 
@@ -397,6 +406,20 @@ fn only_overview_lists_the_known_biases() {
             "{text}"
         );
     }
+}
+
+#[test]
+fn reads_a_recording_again_once_it_is_symbolized() {
+    let recording = unsymbolized("mcp_symbolized_later");
+    let mut client = Client::start();
+    let by_function = json!({"recording": recording, "group_by": "function"});
+    let text = client.call("query", by_function.clone()).unwrap();
+    assert!(text.contains("not symbolized"), "{text}");
+    assert_eq!(functions(&text), ["<unnamed>"]);
+
+    symbolize(&recording);
+    let text = client.call("query", by_function).unwrap();
+    assert_eq!(functions(&text), ["parse", "render", "main"]);
 }
 
 #[test]

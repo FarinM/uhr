@@ -182,6 +182,11 @@ as Claude Code is with `claude mcp add uhr -- uhr mcp`.
   of the coverage, which differs by result, is in each.
 - The tools are marked as only reading, so a client can run them without
   asking.
+- The server keeps the recording it read last in memory, so the next
+  question of it takes milliseconds where reading it again, as each CLI
+  command does, takes most of a second for a few seconds of a busy program.
+  It reads the recording again when its files changed, as `uhr symbolize`
+  changes them.
 - The server gives the client the method to follow, starting with
   `overview`, as the [agent skill](#agent-skill) would.
 
