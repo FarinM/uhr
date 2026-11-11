@@ -8,6 +8,7 @@ use uhr_core::query::{
 };
 use uhr_core::recording::*;
 use uhr_core::symbols::{FrameName, InlineFrame, Source, SourceStatus, Symbols};
+use uhr_core::text;
 
 fn frame(address: u64, mapping: Option<u32>) -> Frame {
     Frame {
@@ -719,6 +720,58 @@ fn a_function_that_is_not_there_is_an_error() {
             functions::Error::NotSymbolized
         )))
     ));
+}
+
+#[test]
+fn picks_a_function_as_the_text_of_a_result_shows_it() {
+    let mut twice = recording();
+    twice.frames = vec![frame(0x10, Some(0)), frame(0x20, Some(0))];
+    twice.stacks = vec![vec![0, 1], vec![1]];
+    twice.samples = vec![sample(0, 6), sample(1, 4)];
+    let workers = Symbols {
+        names: vec![Some(FrameName::Symbol("worker".into())); 2],
+        function_addresses: vec![Some(0x10), Some(0x20)],
+        inline: vec![Vec::new(); 2],
+        sources: Vec::new(),
+    };
+    let under_one = |function: &str| run(&twice, Some(&workers), &under(&[function]));
+    assert!(matches!(
+        under_one("worker"),
+        Err(Error::Filter(filter::Error::Function(
+            functions::Error::Ambiguous { .. }
+        )))
+    ));
+    // Where each starts tells the two apart.
+    assert_eq!(under_one("worker @0x10").unwrap().value, 6);
+    assert_eq!(under_one("worker @0x20").unwrap().value, 10);
+
+    // Each row, as the text shows its function, picks that function.
+    let inlining = symbols_with_inlining();
+    let result = run(&recording(), Some(&inlining), &query(10)).unwrap();
+    let named = function_rows(&result)
+        .iter()
+        .filter(|row| row.function.name.is_some());
+    for row in named {
+        let shown = text::function_name(&row.function);
+        let picked = run(&recording(), Some(&inlining), &under(&[&shown])).unwrap();
+        assert_eq!(picked.value, row.total, "{shown}");
+    }
+    let helper = run(&recording(), Some(&inlining), &under(&["helper (inlined)"]));
+    assert_eq!(helper.unwrap().value, 8);
+
+    // No function is written so: none starts there, and leaf is not inlined.
+    for missing in ["worker @0x30", "leaf (inlined)", "leaf @0xzz"] {
+        let result = run(&recording(), Some(&inlining), &under(&[missing]));
+        assert!(
+            matches!(
+                result,
+                Err(Error::Filter(filter::Error::Function(
+                    functions::Error::NotFound(_)
+                )))
+            ),
+            "{missing}"
+        );
+    }
 }
 
 /// Running `function` at `file:line`, declared at the start of `file`.

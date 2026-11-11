@@ -471,7 +471,9 @@ impl Functions {
         &self.lines[id as usize]
     }
 
-    /// The function with the id `wanted`, or the only one named `wanted`.
+    /// The function with the id `wanted`, or the only one named `wanted`,
+    /// or the only one a result's text shows as `wanted`: a reader of the
+    /// text has no ids, and copies a function as it is written there.
     pub(crate) fn select(&self, wanted: &str) -> Result<u32, Error> {
         if !self.symbolized {
             return Err(Error::NotSymbolized);
@@ -480,9 +482,16 @@ impl Functions {
         if let Some((id, _)) = all().find(|(_, f)| f.id.as_deref() == Some(wanted)) {
             return Ok(id);
         }
-        let named: Vec<_> = all()
+        let mut named: Vec<_> = all()
             .filter(|(_, f)| f.name.as_deref() == Some(wanted))
             .collect();
+        if named.is_empty()
+            && let Some((name, shown)) = Shown::of(wanted)
+        {
+            named = all()
+                .filter(|(_, f)| f.name.as_deref() == Some(name) && shown.is(f))
+                .collect();
+        }
         match named[..] {
             [] => Err(Error::NotFound(wanted.to_owned())),
             [(id, _)] => Ok(id),
@@ -506,6 +515,34 @@ impl Functions {
 
     pub(crate) fn get(&self, id: u32) -> &Function {
         &self.functions[id as usize]
+    }
+}
+
+/// What the text of a result writes after a function's name, which tells
+/// apart functions of one name.
+enum Shown {
+    /// ` @0x` and where the function starts, in hex.
+    Start(u32),
+    /// ` (inlined)`.
+    Inlined,
+}
+
+impl Shown {
+    /// A function's name and what follows it, if `text` is written so.
+    fn of(text: &str) -> Option<(&str, Self)> {
+        if let Some(name) = text.strip_suffix(" (inlined)") {
+            return Some((name, Shown::Inlined));
+        }
+        let (name, start) = text.rsplit_once(" @0x")?;
+        let start = u32::from_str_radix(start, 16).ok()?;
+        Some((name, Shown::Start(start)))
+    }
+
+    fn is(&self, function: &Function) -> bool {
+        match *self {
+            Shown::Start(start) => function.function_address == Some(start),
+            Shown::Inlined => function.inlined,
+        }
     }
 }
 

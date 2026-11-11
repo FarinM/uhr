@@ -111,8 +111,8 @@ enum Command {
         /// What to weigh stacks by
         #[arg(long, value_enum, default_value_t = MetricArg::Cpu)]
         metric: MetricArg,
-        /// Start the graph at a function, by id or by a name only one function
-        /// has. Stacks without it are left out
+        /// Start the graph at a function, by id, by a name only one function
+        /// has, or as a result shows it. Stacks without it are left out
         #[arg(long, value_name = "FUNCTION")]
         root: Option<String>,
         /// Write folded stacks, one per line, as other flame graph tools read
@@ -128,8 +128,9 @@ enum Command {
     /// off-CPU time or page faults
     CallPaths {
         recording: PathBuf,
-        /// A function id from `uhr query --json`, or a name only one function
-        /// has
+        /// A function id from `uhr query --json`, a name only one function
+        /// has, or a function as a result shows it, as in `parse @0x1550` or
+        /// `hash (inlined)`
         #[arg(long)]
         function: String,
         /// What to weigh stacks by
@@ -310,8 +311,8 @@ struct FilterArgs {
     /// Only samples in this CPU mode
     #[arg(long = "mode", value_name = "MODE", value_enum)]
     modes: Vec<ModeArg>,
-    /// Only samples whose stack contains this function, by id or by a name
-    /// only one function has
+    /// Only samples whose stack contains this function, by id, by a name
+    /// only one function has, or as a result shows it
     #[arg(long = "under", value_name = "FUNCTION")]
     under: Vec<String>,
     /// Only samples in this syscall, by name, as in read

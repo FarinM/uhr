@@ -97,8 +97,9 @@ struct FilterParams {
     /// CPU modes. Time off CPU has none, so any mode leaves it out.
     #[serde(default)]
     modes: Vec<ModeParam>,
-    /// Functions, each by its name where only one function has it, or by
-    /// its id, which the error lists where several share the name. Keeps
+    /// Functions, each as a result shows it, as `parse @0x1550` or `hash
+    /// (inlined)`, or by its name alone where only one function has it, or
+    /// by its id, which the error lists where several share the name. Keeps
     /// the stacks that contain one of them.
     #[serde(default)]
     under: Vec<String>,
@@ -297,8 +298,9 @@ fn default_children() -> usize {
 struct CallPathsParams {
     /// Path of the recording directory.
     recording: PathBuf,
-    /// The function, by its name where only one function has it, or by its
-    /// id, which the error lists where several share the name.
+    /// The function as a result shows it, as `parse @0x1550` or `hash
+    /// (inlined)`, or by its name alone where only one function has it, or
+    /// by its id, which the error lists where several share the name.
     function: String,
     #[serde(default)]
     metric: MetricParam,

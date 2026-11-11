@@ -63,10 +63,13 @@ per process, so only filters by process and time apply to it, and a filter
 by thread, mode, stack or syscall leaves it out, as the result says. Only
 page faults have regions, so `overview` refuses a filter by region.
 
-`call_paths` takes a function by its id, or by a name only one function
-has, and returns two trees from it outward: its callers and its callees. Both
-stop at a depth limit and keep the top children of each node, and they report
-the time of what they cut. Where a function recurses, each sample counts from
+`call_paths` takes a function by its id, by a name only one function has, or
+as the text of a result shows it, where `@0x` and its start, or `(inlined)`,
+after the name tell functions of one name apart: a reader of the text has no
+ids, and copies a function as it is written there. It returns two trees from
+the function outward: its callers and its callees. Both stop at a depth limit
+and keep the top children of each node, and they report the time of what they
+cut. Where a function recurses, each sample counts from
 its outermost call, so the callers show where the function is entered.
 
 `flamegraph` takes the metric and filters `query` takes, and a function to
