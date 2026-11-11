@@ -14,5 +14,6 @@ mod regions;
 pub mod runtimes;
 pub mod symbols;
 mod syscalls;
+pub mod text;
 mod threads;
 pub mod wall_clock;
