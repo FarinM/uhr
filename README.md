@@ -27,7 +27,8 @@ one of two samplers:
   counts and times syscalls, sees what woke each thread that waited, and
   reads the frames of CPython 3.11 to 3.14,
   Node 20 to 24, Bun 1.4.3, Ruby 3.2, PHP 8.3, Lua 5.4 and Java's interpreter
-  ([limits](docs/collection.md#runtimes)).
+  ([limits](docs/collection.md#runtimes)), with the async functions of Bun
+  that wait for the one that runs as its callers.
 
 ## How the eBPF sampler works
 

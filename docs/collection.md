@@ -470,7 +470,13 @@ programs read the frames of:
   script. Where the build with symbols is kept by its build id with the
   system's debug info, it also names the interpreter's code, so that its
   frames take the place of the interpreter's native ones; without it they
-  go just above them. Lines are not read yet.
+  go just above them. Lines are not read yet. An async function that is
+  resumed gets its `JSAsyncFunctionGenerator` as an argument, which holds
+  the promise of its result, and a pending promise that of the function
+  that waits for it, or the promise of the `Promise.all`, `allSettled` or
+  `any` it is one of, as JavaScriptCore's own async stack traces follow
+  them. What `.then` or `Promise.race` waits for ends there, and so does a
+  promise more than one function waits for.
 - CRuby 3.2, in a `ruby` program or a `libruby`, from the headers of 3.2.
   CRuby keeps its frames in an array in each thread's execution context,
   which the thread-local `ruby_current_ec` points to, and says the line of
@@ -542,7 +548,8 @@ it or stay. One path leads from that frame to its function's state, one
 tells a state, one leads from a state to its code, and up to four from a
 state to that of the function that waits for it, of which the first that
 does not end is taken. Nothing in a recording says yet which callers were
-on no stack.
+on no stack. In Bun, a sample of about 9.5 microseconds took 2.7 more, and
+0.1 more for each function that waited.
 
 Of each frame they copy the bytes at an offset from it, and up to two words
 read at the time of the sample at an offset from a pointer the copy holds,

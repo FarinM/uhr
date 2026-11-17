@@ -851,6 +851,36 @@ fn reads_bun_frames() {
     assert!(share(work, "total_share") >= hot + warm - 0.01, "{work}");
 }
 
+/// That the functions of await.js that waited for inner() have the time it
+/// worked for, once resumed, with none of them on the stack.
+fn has_the_functions_that_waited(recording: &str, runtime: &str) {
+    let rows = functions(recording);
+    let total = |name: &str| share(runtime_function(&rows, runtime, name), "total_share");
+    let work = total("work");
+    assert!(work > 0.5, "{work}");
+    for name in ["inner", "middle", "outer", "main"] {
+        assert!(
+            total(name) >= work - 0.05,
+            "{name}: {} of {work}",
+            total(name)
+        );
+    }
+}
+
+#[test]
+fn names_the_bun_functions_that_wait_for_one() {
+    let Some(bun) = bun() else {
+        return;
+    };
+    let dir = scratch("interpreters_bun_await");
+    let program = format!("{PROGRAMS}/await.js");
+    let command = [bun.to_str().unwrap(), &program, "60"];
+    let Some(recording) = record(&dir, &[], &command) else {
+        return;
+    };
+    has_the_functions_that_waited(&recording, "bun");
+}
+
 #[test]
 fn reads_lua_frames() {
     let Some(lua) = find("lua5.4") else {

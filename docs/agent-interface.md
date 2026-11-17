@@ -212,6 +212,14 @@ query by function or module. Native code the program calls, such as libc or
 an extension, and the kernel keep their own self time. Whether the
 runtime's own functions are hidden from stacks is not decided.
 
+An async function of Bun that was resumed after an `await` has the
+functions that wait for it as its callers, though the runtime's loop called
+it and they were on no stack: so `call_paths` leads from the work to the
+code that asked for it, and each of them has the time of what it waited
+for. Where the chain ends, as at a `.then`, the callers are the runtime's
+loop, as for any function before this. Python's coroutines are on the stack
+within a task, and those of another task are not followed.
+
 ## Measurement rigor
 
 Profiling overhead is measured and reported. Instrumenting profilers distort

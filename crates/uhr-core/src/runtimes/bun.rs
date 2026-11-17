@@ -12,7 +12,8 @@ use std::ops::Range;
 use super::process::{bytes_at, debug_symbols, mapped_build_id, u32_at, u64_at};
 use super::text;
 use super::{
-    Code, Copy, Error, Frames, Interpreter, Memory, Process, Read, Runtime, Walk, WalkedFrame,
+    Awaits, Code, Copy, Error, Frames, Interpreter, Memory, PathStep, Process, Read, Runtime, Walk,
+    WalkedFrame,
 };
 use crate::recording::Mapping;
 
@@ -52,6 +53,15 @@ struct Layout {
     function_name: u64,
     provider: u64,
     url: u64,
+    /// The types cells say they are: the state of an async function, a
+    /// promise.
+    async_function_type: u32,
+    promise_type: u32,
+    /// In a `FunctionExecutable`, its `CodeBlock` for a call.
+    code_block: i32,
+    /// The tasks a promise queues that `Promise.all`, `allSettled` or `any`
+    /// waits for, the first and the last.
+    group_tasks: (u32, u32),
 }
 
 const LAYOUTS: [([u8; 20], Layout); 1] = [(
@@ -70,13 +80,45 @@ const LAYOUTS: [([u8; 20], Layout); 1] = [(
         function_name: 0x40,
         provider: 0x28,
         url: 0x48,
+        async_function_type: 76,
+        promise_type: 87,
+        code_block: 0x58,
+        group_tasks: (8, 10),
     },
 )];
 
 /// JavaScriptCore's `CallFrame`, from its frame pointer: the `CodeBlock`,
-/// then the callee.
+/// then the callee. Past them come how many arguments it has, `this`, and
+/// the first argument, which an async function that is resumed gets its
+/// state as.
 const FRAME_CODE_BLOCK: i32 = 16;
 const FRAME_COPY: u32 = 16;
+const FRAME_ARGUMENTS: i32 = 32;
+const FRAME_FIRST_ARGUMENT: i32 = 48;
+
+/// Where a cell's first word says its type.
+const CELL_TYPE_SHIFT: u32 = 40;
+
+/// In a `JSAsyncFunctionGenerator`, the function it resumes and the promise
+/// of its result. In a `JSFunction`, its executable, unless the low bit says
+/// it holds more than that.
+const GENERATOR_NEXT: i32 = 24;
+const GENERATOR_PROMISE: i32 = 48;
+const FUNCTION_EXECUTABLE: i32 = 24;
+
+/// In a `JSPromise`, the word of its flags, above a pointer of 48 bits, and
+/// then the state of the function that waits for it. The flags say it is
+/// pending in their low two bits, that it has the one reaction of an
+/// internal task in the two from the fourth, and which task in the eight
+/// from the sixth. A `JSPromiseCombinatorsGlobalContext` holds the promise
+/// of them all after its header.
+const PROMISE_FLAGS: i32 = 16;
+const PROMISE_WAITER: i32 = 24;
+const FLAGS_SHIFT: u32 = 48;
+const FLAGS_PENDING_INTERNAL_MASK: u64 = 0b11_0011;
+const FLAGS_PENDING_INTERNAL: u64 = 0b01_0000;
+const FLAGS_TASK_SHIFT: u32 = 6;
+const GROUP_PROMISE: i32 = 8;
 
 /// The kinds of code a `CodeBlock` runs.
 const GLOBAL_CODE: u64 = 0;
@@ -135,13 +177,87 @@ fn find(bun: &dyn Runtime, process: &dyn Process) -> Result<Option<Box<dyn Inter
             reads: vec![Read { word: 0, offset: 0 }],
         },
         frame_pointers: true,
-        awaits: None,
+        awaits: Some(awaits(&layout)),
     };
     Ok(Some(Box::new(JavaScriptCore {
         layout,
         walk,
         eval_loop,
     })))
+}
+
+/// How the sampler finds the async functions that wait for one a thread
+/// runs, as JavaScriptCore's own async stack traces do: the state of each
+/// holds the promise of its result, and a pending promise the state of the
+/// function that waits for it, or for the promise of the `Promise.all` it
+/// is one of.
+fn awaits(layout: &Layout) -> Awaits {
+    let cell = |kind: u32| {
+        PathStep::check(
+            0,
+            0xff << CELL_TYPE_SHIFT,
+            u64::from(kind) << CELL_TYPE_SHIFT,
+        )
+    };
+    let flags = |mask: u64, value: u64| {
+        PathStep::check(PROMISE_FLAGS, mask << FLAGS_SHIFT, value << FLAGS_SHIFT)
+    };
+    let pending = flags(FLAGS_PENDING_INTERNAL_MASK, FLAGS_PENDING_INTERNAL);
+    let state = cell(layout.async_function_type);
+    let promise = [PathStep::to(GENERATOR_PROMISE), cell(layout.promise_type)];
+    // A group's promise holds no state there, so this ends for one.
+    let mut next = vec![
+        [
+            &promise[..],
+            &[pending, PathStep::to(PROMISE_WAITER), state],
+        ]
+        .concat(),
+    ];
+    for task in layout.group_tasks.0..=layout.group_tasks.1 {
+        let group = PathStep {
+            follow: Some((1 << FLAGS_SHIFT) - 1),
+            ..flags(
+                FLAGS_PENDING_INTERNAL_MASK | 0xff << FLAGS_TASK_SHIFT,
+                FLAGS_PENDING_INTERNAL | u64::from(task) << FLAGS_TASK_SHIFT,
+            )
+        };
+        let of_all = [
+            group,
+            PathStep::to(GROUP_PROMISE),
+            cell(layout.promise_type),
+            pending,
+            PathStep::to(PROMISE_WAITER),
+        ];
+        next.push([&promise[..], &of_all].concat());
+    }
+    Awaits {
+        // Its `CodeBlock` is one, as the frame's read says.
+        frame: vec![(
+            FRAME_COPY,
+            0xff << CELL_TYPE_SHIFT,
+            u64::from(layout.code_block_type) << CELL_TYPE_SHIFT,
+        )],
+        copy_code: 0,
+        // The state follows `this`, in a frame with both. A frame with
+        // fewer arguments holds there what an earlier one left.
+        start: vec![
+            PathStep {
+                at_least: true,
+                ..PathStep::check(FRAME_ARGUMENTS, u64::from(u32::MAX), 2)
+            },
+            PathStep::to(FRAME_FIRST_ARGUMENT),
+        ],
+        state: vec![state],
+        code: vec![
+            PathStep::to(GENERATOR_NEXT),
+            PathStep {
+                check: Some((1, 0)),
+                ..PathStep::to(FUNCTION_EXECUTABLE)
+            },
+            PathStep::to(layout.code_block),
+        ],
+        next,
+    }
 }
 
 impl JavaScriptCore {
