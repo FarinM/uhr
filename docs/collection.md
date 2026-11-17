@@ -529,6 +529,21 @@ and a runtime picks one and gives its offsets:
   its frame pointer. This needs that walk, which they take on x86-64, and
   not `--unwind dwarf` yet.
 
+A function that waits for another's result, as an async function does at an
+`await`, is on no stack when the other is resumed: the runtime's loop calls
+that one. For a runtime that keeps a state for each such function, with
+frames on the native stack, the programs also follow the functions that wait
+for the outermost frame of the program, up to 32, and uhr puts them just
+above it, as its callers, so their time has what they waited for. The
+programs know no runtime here either: a runtime describes paths through its
+memory, each of up to 8 steps that read a word at an offset, end the path
+unless it, or a word it points to, is a value under a mask, and go on from
+it or stay. One path leads from that frame to its function's state, one
+tells a state, one leads from a state to its code, and up to four from a
+state to that of the function that waits for it, of which the first that
+does not end is taken. Nothing in a recording says yet which callers were
+on no stack.
+
 Of each frame they copy the bytes at an offset from it, and up to two words
 read at the time of the sample at an offset from a pointer the copy holds,
 as for objects a garbage collector can move before uhr reads them. The

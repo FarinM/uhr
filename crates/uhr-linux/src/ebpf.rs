@@ -142,7 +142,7 @@ const FAULT_SAMPLER: &str = "sample_fault";
 /// their place in `PROGRAMS`: to find a thread's state in the runtime, to
 /// walk frames on the native stack, and to walk them in the runtime's
 /// memory from the state.
-const WALKERS: [&str; 3] = ["walk_frames", "walk_native", "walk_memory"];
+const WALKERS: [&str; 4] = ["walk_frames", "walk_native", "walk_memory", "walk_awaited"];
 
 /// The program that sees CPUs go offline and online, and the tracepoint it
 /// runs at.
@@ -450,8 +450,13 @@ impl Programs {
             .ebpf
             .take_map("THREADS")
             .ok_or(Error::Missing("THREADS"))?;
+        let awaits = self
+            .ebpf
+            .take_map("AWAITS")
+            .ok_or(Error::Missing("AWAITS"))?;
         let maps = Maps {
             walks: aya::maps::HashMap::try_from(walks).map_err(|e| Error::Map("WALKS", e))?,
+            awaits: aya::maps::HashMap::try_from(awaits).map_err(|e| Error::Map("AWAITS", e))?,
             threads: aya::maps::HashMap::try_from(threads).map_err(|e| Error::Map("THREADS", e))?,
         };
         let finder = Finder::start(maps, sampling.stack_bytes.is_none());
@@ -993,6 +998,7 @@ fn walked_frames(sample: &[u8]) -> Option<Walked> {
         status: header.walk,
         frame_bytes: header.walked_bytes,
         frames: sample.get(start..start + len)?.to_vec(),
+        awaited: header.awaited,
     })
 }
 

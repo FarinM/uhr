@@ -265,5 +265,6 @@ fn header(kernel: usize, user: usize, copied: usize, copy: bool) -> SampleHeader
         frame_ends: 0,
         exec: 0,
         mapped: 0,
+        awaited: 0,
     }
 }

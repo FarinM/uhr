@@ -120,6 +120,7 @@ fn find(php: &dyn Runtime, process: &dyn Process) -> Result<Option<Box<dyn Inter
                 }],
             },
             frame_pointers: false,
+            awaits: None,
         };
         return Ok(Some(Box::new(ZendEngine {
             version,

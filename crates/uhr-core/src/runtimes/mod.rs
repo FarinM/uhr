@@ -52,6 +52,14 @@ pub trait Interpreter: Send {
     fn eval_loop(&self) -> &[Range<u64>];
     /// What the bytes the sampler copied of a frame, then its reads, say.
     fn frame(&self, bytes: &[u8]) -> WalkedFrame;
+    /// The code of a function that waited, from what the sampler writes
+    /// for one: a frame's copy with only its code, then its reads.
+    fn waiting(&self, bytes: &[u8]) -> Option<u64> {
+        match self.frame(bytes) {
+            WalkedFrame::Code { code, .. } => Some(code),
+            _ => None,
+        }
+    }
     /// Whether the runtime keeps the instruction its innermost frame runs
     /// in a register, and saves it to the frame only when that frame calls
     /// out, so that the frame holds where it last called, not where it is.
@@ -73,6 +81,75 @@ pub struct Walk {
     /// stack, for an interpreter that keeps its entry frames there. Frames
     /// on the native stack need it anyway.
     pub frame_pointers: bool,
+    /// For frames on the native stack: how to find the functions that
+    /// wait for the outermost one, if the runtime has such.
+    pub awaits: Option<Awaits>,
+}
+
+/// How to find the functions that wait for the result of the outermost one
+/// a thread runs, as async functions wait for one they called, which are on
+/// no stack, in a runtime that keeps a state for each in its memory. The
+/// sampler follows these paths: from the frame the runtime resumed a
+/// function in to that function's state, and from each state to that of
+/// the function that waits for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Awaits {
+    /// A frame is one of the program's where each of these words of what
+    /// the sampler has of it, its copy and then its reads, is the value
+    /// under the mask: where the word is, the mask and the value.
+    pub frame: Vec<(u32, u64, u64)>,
+    /// Where a frame's copy holds the code it runs.
+    pub copy_code: u32,
+    /// From the address of the outermost of the program's frames to the
+    /// state of the function resumed in it.
+    pub start: Vec<PathStep>,
+    /// Ends unless it starts at a state.
+    pub state: Vec<PathStep>,
+    /// From a state to the code a frame of its function runs.
+    pub code: Vec<PathStep>,
+    /// From a state to that of the function that waits for it: the first
+    /// of these that does not end.
+    pub next: Vec<Vec<PathStep>>,
+}
+
+/// A step of a path through a process's memory, which reads the word at
+/// `offset` from the address the path is at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PathStep {
+    pub offset: i32,
+    /// The path ends unless the word, under the mask, is the value.
+    pub check: Option<(u64, u64)>,
+    /// The check is of the word at this offset from the word read.
+    pub via: Option<i32>,
+    /// The check holds for the value or more.
+    pub at_least: bool,
+    /// The path goes on from the word under this mask, or else from where
+    /// it is.
+    pub follow: Option<u64>,
+}
+
+impl PathStep {
+    /// Goes on from the pointer at `offset`.
+    pub fn to(offset: i32) -> Self {
+        PathStep {
+            offset,
+            check: None,
+            via: None,
+            at_least: false,
+            follow: Some(u64::MAX),
+        }
+    }
+
+    /// Stays, if the word at `offset` under `mask` is `value`.
+    pub fn check(offset: i32, mask: u64, value: u64) -> Self {
+        PathStep {
+            offset,
+            check: Some((mask, value)),
+            via: None,
+            at_least: false,
+            follow: None,
+        }
+    }
 }
 
 /// Where a runtime's frames are.

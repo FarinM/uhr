@@ -168,6 +168,7 @@ fn find(ruby: &dyn Runtime, process: &dyn Process) -> Result<Option<Box<dyn Inte
                 }],
             },
             frame_pointers: false,
+            awaits: None,
         };
         return Ok(Some(Box::new(CRuby {
             version,
@@ -421,6 +422,7 @@ mod tests {
                     reads: Vec::new(),
                 },
                 frame_pointers: false,
+                awaits: None,
             },
             eval_loop: Vec::new(),
         };

@@ -142,7 +142,13 @@ pub struct SampleHeader {
     /// How many times the process had mapped a file's code since the
     /// programs started, its low 32 bits.
     pub mapped: u32,
+    /// How many of the interpreter frames, the last ones, are of functions
+    /// that waited for the outermost one the thread ran, nearest first, and
+    /// were on no stack.
+    pub awaited: u32,
 }
+
+const _: () = assert!(core::mem::size_of::<SampleHeader>() == 96);
 
 /// The most interpreter frames a sample walks. Each frame's address, its
 /// copy and its reads take at most `MAX_WALKED_BYTES`, a power of two, and
@@ -190,6 +196,86 @@ pub mod step {
     pub const POINTER: u32 = 0;
     /// `Walk::next_frame` bytes on, as in an array of frames.
     pub const STRIDE: u32 = 1;
+}
+
+/// The most functions followed that wait for the one a sampled thread runs.
+pub const MAX_AWAITED: usize = 32;
+
+/// The most steps of a path, the most paths tried from one function that
+/// waits to the next, and the most words of a frame's record checked.
+pub const MAX_STEPS: usize = 8;
+pub const MAX_NEXT: usize = 4;
+pub const MAX_FRAME_CHECKS: usize = 3;
+
+/// Of `PathStep::flags`.
+pub mod path_step {
+    /// The word checked is the one at `via` from the word read.
+    pub const VIA: u32 = 1;
+    /// The word checked, under `mask`, is `value` or more, not `value`.
+    pub const AT_LEAST: u32 = 2;
+}
+
+/// A step of a path through a process's memory. It reads the word at
+/// `offset` from the address the path is at, and ends the path unless that
+/// word, or the one it points to as `flags` say, under `mask` is `value`.
+/// Then the path goes on from the word read under `pointer`, or from where
+/// it is if that is 0.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PathStep {
+    pub offset: i32,
+    pub via: i32,
+    /// Of `path_step`.
+    pub flags: u32,
+    pub pad: u32,
+    pub mask: u64,
+    pub value: u64,
+    pub pointer: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Path {
+    pub steps: [PathStep; MAX_STEPS],
+    pub len: u32,
+    pub pad: u32,
+}
+
+/// What a word of a frame's record is under `mask`: the word `word` bytes
+/// into its copy, which its reads follow.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FrameCheck {
+    pub word: u32,
+    pub pad: u32,
+    pub mask: u64,
+    pub value: u64,
+}
+
+/// How to find the functions that wait for the result of the outermost one
+/// a thread runs, which are on no stack, for a runtime that keeps a state
+/// for each such function in its memory. uhr sets it for each process whose
+/// runtime has them, and the programs know no runtime.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Awaits {
+    /// A frame is one of the program's where all of these hold.
+    pub frame: [FrameCheck; MAX_FRAME_CHECKS],
+    pub frame_len: u32,
+    /// Where a frame's copy holds the code it runs.
+    pub copy_code: u32,
+    /// From the address of the outermost of the program's frames to the
+    /// state of the function that was resumed in it.
+    pub start: Path,
+    /// Ends unless it starts at a state.
+    pub state: Path,
+    /// From a state to the code a frame of its function runs.
+    pub code: Path,
+    /// From a state to that of the function that waits for it: the first of
+    /// these that does not end.
+    pub next: [Path; MAX_NEXT],
+    pub next_len: u32,
+    pub pad: u32,
 }
 
 /// A word read at the time of a sample at a signed offset from a pointer a
@@ -263,11 +349,18 @@ pub struct Walk {
     /// The words to read for each frame, which follow its copy.
     pub reads: [Read; MAX_READS],
     pub reads_len: u32,
-    pub pad: u32,
+    /// For `frames::NATIVE`: 1 if the process has an `Awaits`.
+    pub awaits: u32,
 }
 
 // No padding, which `Pod` needs.
 const _: () = assert!(core::mem::size_of::<Walk>() == 168);
+const _: () = assert!(core::mem::size_of::<PathStep>() == 40);
+const _: () = assert!(core::mem::size_of::<FrameCheck>() == 24);
+const _: () = assert!(
+    core::mem::size_of::<Awaits>()
+        == MAX_FRAME_CHECKS * 24 + 16 + (3 + MAX_NEXT) * (MAX_STEPS * 40 + 8)
+);
 
 /// How a sample's walk of interpreter frames went.
 pub mod walk {
@@ -306,4 +399,5 @@ mod user {
     unsafe impl aya::Pod for super::Calls {}
     unsafe impl aya::Pod for super::Walk {}
     unsafe impl aya::Pod for super::Read {}
+    unsafe impl aya::Pod for super::Awaits {}
 }

@@ -135,6 +135,7 @@ fn find(bun: &dyn Runtime, process: &dyn Process) -> Result<Option<Box<dyn Inter
             reads: vec![Read { word: 0, offset: 0 }],
         },
         frame_pointers: true,
+        awaits: None,
     };
     Ok(Some(Box::new(JavaScriptCore {
         layout,

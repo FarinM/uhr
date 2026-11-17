@@ -6,7 +6,7 @@
 use core::ffi::c_void;
 
 use aya_ebpf::Global;
-use aya_ebpf::bindings::bpf_pidns_info;
+use aya_ebpf::bindings::{BPF_F_NO_PREALLOC, bpf_pidns_info};
 use aya_ebpf::helpers::bpf_get_current_task;
 use aya_ebpf::helpers::generated::{
     bpf_get_ns_current_pid_tgid, bpf_probe_read_kernel, bpf_probe_read_user,
@@ -14,13 +14,19 @@ use aya_ebpf::helpers::generated::{
 use aya_ebpf::macros::map;
 use aya_ebpf::maps::{HashMap, LruHashMap};
 use uhr_ebpf::{
-    MAX_FRAMES, MAX_PATH, MAX_READS, MAX_THREADS, MAX_WALKED_BYTES, MAX_WALKED_FRAMES, ONE_LIST,
-    Read, WALKED_BYTES, Walk, frames, step, walk,
+    Awaits, MAX_AWAITED, MAX_FRAMES, MAX_PATH, MAX_READS, MAX_THREADS, MAX_WALKED_BYTES,
+    MAX_WALKED_FRAMES, ONE_LIST, Path, Read, WALKED_BYTES, Walk, frames, path_step, step, walk,
 };
 
 /// By tgid. uhr sets a process's walk once it knows its runtime.
 #[map]
 static WALKS: HashMap<u32, Walk> = HashMap::with_max_entries(16384, 0);
+
+/// By tgid, for a process whose runtime has functions that wait for one
+/// another off the stack. They are few and each takes room, so that for one
+/// is only taken when uhr sets it.
+#[map]
+static AWAITS: HashMap<u32, Awaits> = HashMap::with_max_entries(1024, BPF_F_NO_PREALLOC);
 
 /// The state each thread runs in, by its id, so a sample need not search
 /// for it again. uhr fills it too, with threads a search can't reach.
@@ -62,10 +68,16 @@ pub(crate) fn of(tgid: u32) -> Option<&'static Walk> {
     unsafe { WALKS.get(tgid) }
 }
 
+/// How to find the functions that wait in the process `tgid`, if uhr said.
+pub(crate) fn awaits_of(tgid: u32) -> Option<&'static Awaits> {
+    unsafe { AWAITS.get(tgid) }
+}
+
 /// Forgets the walk of a process that execs or exits, whose memory is then
 /// another program's or none.
 pub(crate) fn forget(tgid: u32) {
     let _ = WALKS.remove(tgid);
+    let _ = AWAITS.remove(tgid);
 }
 
 fn read(address: u64) -> Option<u64> {
@@ -417,4 +429,103 @@ fn native_frames<const READS: bool>(
         }
     }
     (walk::DONE, count as u32, each as u32)
+}
+
+/// What the copy of a function that waits starts as.
+static ZEROS: [u8; MAX_WALKED_BYTES] = [0; MAX_WALKED_BYTES];
+
+/// Where `path` ends from `address`, 0 where a step ends it early or a
+/// word can't be read.
+#[inline(always)]
+fn follow_path(path: &Path, mut address: u64) -> u64 {
+    for (i, step) in path.steps.iter().enumerate() {
+        if i as u32 >= path.len {
+            break;
+        }
+        let word = word_at(address.wrapping_add(step.offset as i64 as u64));
+        let checked = match step.flags & path_step::VIA {
+            0 => word,
+            _ => word_at(word.wrapping_add(step.via as i64 as u64)),
+        } & step.mask;
+        let holds = match step.flags & path_step::AT_LEAST {
+            0 => checked == step.value,
+            _ => checked >= step.value,
+        };
+        if !holds {
+            return 0;
+        }
+        if step.pointer != 0 {
+            address = word & step.pointer;
+        }
+    }
+    address
+}
+
+/// After the `frames` frames `native` copied to `to`, of `each` bytes, adds
+/// one for each function that waits for the outermost of the program's
+/// frames, nearest first, as `awaits` says to find them: each as a frame
+/// that runs the function's code would be copied, at the address of its
+/// state, but of its copy only the code. Returns how many.
+#[inline(always)]
+pub(crate) fn awaited(walk: &Walk, awaits: &Awaits, to: *mut u8, frames: u32, each: u32) -> u32 {
+    let bytes = walk.frame_bytes as usize & (MAX_WALKED_BYTES - 1);
+    let each = each as usize & (2 * MAX_WALKED_BYTES - 1);
+    let count = (frames as usize).min(MAX_WALKED_FRAMES);
+    let mut frame = 0u64;
+    for i in 0..MAX_WALKED_FRAMES {
+        if i >= count {
+            break;
+        }
+        let at = core::hint::black_box(i * each) & (WALKED_BYTES - 1);
+        let record = unsafe { to.add(at) };
+        let mut holds = true;
+        for (c, check) in awaits.frame.iter().enumerate() {
+            if c as u32 >= awaits.frame_len {
+                break;
+            }
+            let at = 8 + (check.word as usize & (MAX_WALKED_BYTES - 1));
+            let word = unsafe { record.add(at).cast::<u64>().read_unaligned() };
+            holds &= word & check.mask == check.value;
+        }
+        if holds {
+            frame = unsafe { record.cast::<u64>().read_unaligned() };
+        }
+    }
+    if frame == 0 {
+        return 0;
+    }
+    let mut state = follow_path(&awaits.start, frame);
+    let mut added = 0;
+    for hop in 0..MAX_AWAITED {
+        state = follow_path(&awaits.state, state);
+        if state == 0 {
+            break;
+        }
+        // The first is the function of the outermost frame itself.
+        if hop > 0 {
+            let index = count + added;
+            if index >= MAX_WALKED_FRAMES {
+                break;
+            }
+            let at = core::hint::black_box(index * each) & (WALKED_BYTES - 1);
+            let record = unsafe { to.add(at) };
+            unsafe { record.cast::<u64>().write_unaligned(state) };
+            let into = unsafe { record.add(8) };
+            unsafe { bpf_probe_read_kernel(into.cast(), bytes as u32, ZEROS.as_ptr().cast()) };
+            let code = follow_path(&awaits.code, state);
+            let held = awaits.copy_code as usize & (MAX_WALKED_BYTES - 1);
+            unsafe { into.add(held).cast::<u64>().write_unaligned(code) };
+            read_words(walk, into, bytes);
+            added += 1;
+        }
+        let mut next = 0;
+        for (i, path) in awaits.next.iter().enumerate() {
+            if i as u32 >= awaits.next_len || next != 0 {
+                break;
+            }
+            next = follow_path(path, state);
+        }
+        state = next;
+    }
+    added as u32
 }

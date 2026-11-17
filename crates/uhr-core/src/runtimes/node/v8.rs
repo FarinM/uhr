@@ -301,6 +301,7 @@ impl V8 {
                 }],
             },
             frame_pointers: true,
+            awaits: None,
         };
         Ok(Self {
             version,

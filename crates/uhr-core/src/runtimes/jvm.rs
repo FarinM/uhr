@@ -172,6 +172,7 @@ fn find(jvm: &dyn Runtime, process: &dyn Process) -> Result<Option<Box<dyn Inter
             }],
         },
         frame_pointers: true,
+        awaits: None,
     };
     Ok(Some(Box::new(HotSpot {
         version,

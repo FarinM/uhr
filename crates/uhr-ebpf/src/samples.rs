@@ -72,10 +72,10 @@ static COPIES: Array<Copy> = Array::with_max_entries(1, 0);
 #[unsafe(no_mangle)]
 pub(crate) static STACK_BYTES: Global<u32> = Global::new(0);
 
-/// `walk_frames`, which uhr puts at 0, `walk_native` at 1 and
-/// `walk_memory` at 2.
+/// `walk_frames`, which uhr puts at 0, `walk_native` at 1, `walk_memory`
+/// at 2 and `walk_awaited` at 3.
 #[map]
-static PROGRAMS: ProgramArray = ProgramArray::with_max_entries(3, 0);
+static PROGRAMS: ProgramArray = ProgramArray::with_max_entries(4, 0);
 
 /// The state of the thread `walk_frames` found, for `walk_memory`.
 #[map]
@@ -233,6 +233,7 @@ fn take(ctx: &PerfEventContext, event: u32) -> u32 {
         frame_ends: u32::from(ends),
         exec: exec(),
         mapped: mappings::count(tgid),
+        awaited: 0,
     };
     if mode != mode::GUEST
         && let Some(process) = process
@@ -299,7 +300,7 @@ pub fn walk_frames(ctx: PerfEventContext) -> u32 {
         },
         Err(status) => status,
     };
-    finish((status, 0, 0), walked);
+    finish((status, 0, 0), 0, walked);
     0
 }
 
@@ -316,14 +317,14 @@ pub fn walk_memory(_ctx: PerfEventContext) -> u32 {
         Some(state) => walker::frames(walker::of(tgid), unsafe { *state }, walked),
         None => (walk::FAILED, 0, 0),
     };
-    finish(found, walked);
+    finish(found, 0, walked);
     0
 }
 
 /// As `walk_frames`, for a runtime that keeps its frames on the native
 /// stack, which needs the frame pointers the sampler walked.
 #[perf_event]
-pub fn walk_native(_ctx: PerfEventContext) -> u32 {
+pub fn walk_native(ctx: PerfEventContext) -> u32 {
     let (tgid, _) = current();
     let Some(walked) = WALKED.get_ptr_mut(0) else {
         return 0;
@@ -331,30 +332,59 @@ pub fn walk_native(_ctx: PerfEventContext) -> u32 {
     let walked = unsafe { (*walked).frames.as_mut_ptr() };
     let mut found = (walk::FAILED, 0, 0);
     if STACK_BYTES.load() == 0
-        && let (Some(process), Some(sample)) = (walker::of(tgid), SCRATCH.get_ptr(0))
+        && let (Some(process), Some(sample)) = (walker::of(tgid), SCRATCH.get_ptr_mut(0))
     {
-        let sample = unsafe { &*sample };
-        let header = &sample.header;
-        if header.frame_ends != 0 {
+        let sample = unsafe { &mut *sample };
+        if sample.header.frame_ends != 0 {
             found = walker::native(
                 process,
                 &sample.frames,
-                header.kernel_frames,
-                header.user_frames,
+                sample.header.kernel_frames,
+                sample.header.user_frames,
                 walked,
             );
+            if process.awaits != 0 {
+                // For `walk_awaited`, which the verifier checks apart.
+                sample.header.walk = found.0;
+                sample.header.walked_frames = found.1;
+                sample.header.walked_bytes = found.2;
+                unsafe { PROGRAMS.tail_call(&ctx, 3) };
+            }
         }
     }
-    finish(found, walked);
+    finish(found, 0, walked);
+    0
+}
+
+/// After `walk_native`, adds the functions that wait for the outermost
+/// frame of the program it copied, and writes the sample.
+#[perf_event]
+pub fn walk_awaited(_ctx: PerfEventContext) -> u32 {
+    let (tgid, _) = current();
+    let Some(walked) = WALKED.get_ptr_mut(0) else {
+        return 0;
+    };
+    let walked = unsafe { (*walked).frames.as_mut_ptr() };
+    let Some(sample) = SCRATCH.get_ptr(0) else {
+        return 0;
+    };
+    let header = unsafe { &(*sample).header };
+    let (status, frames, each) = (header.walk, header.walked_frames, header.walked_bytes);
+    let awaited = match (walker::of(tgid), walker::awaits_of(tgid)) {
+        (Some(process), Some(awaits)) => walker::awaited(process, awaits, walked, frames, each),
+        _ => 0,
+    };
+    finish((status, frames + awaited, each), awaited, walked);
     0
 }
 
 /// Copies the frames a walk found, `frames` of `each` bytes at `walked`,
 /// into the sample `sample` put together, and writes it.
 #[inline(always)]
-fn finish((status, frames, each): (u32, u32, u32), walked: *mut u8) {
+fn finish((status, frames, each): (u32, u32, u32), awaited: u32, walked: *mut u8) {
     let into = |header: &mut SampleHeader, to: *mut u8| {
         header.walk = status;
+        header.awaited = awaited;
         header.walked_frames = frames;
         header.walked_bytes = each;
         // Never more than there is room for, which the verifier needs to
@@ -455,6 +485,7 @@ fn fill_copy(ctx: &PerfEventContext, event: u32, sample: &mut Copy, stack_bytes:
         frame_ends: 0,
         exec: exec(),
         mapped: mappings::count(tgid),
+        awaited: 0,
     };
     len
 }

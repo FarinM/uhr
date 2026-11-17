@@ -141,6 +141,7 @@ fn find(lua: &dyn Runtime, process: &dyn Process) -> Result<Option<Box<dyn Inter
             ],
         },
         frame_pointers: false,
+        awaits: None,
     };
     Ok(Some(Box::new(PucLua {
         version,

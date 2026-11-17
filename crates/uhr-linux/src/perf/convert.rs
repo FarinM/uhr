@@ -709,16 +709,26 @@ fn place(
 /// place of that native frame where it runs the program's frames, and
 /// else goes just above it: a function that sets up no frame keeps its
 /// caller's frame pointer, so that the walk of frame pointers lost the
-/// caller, whose frame this is.
-fn place_native(native: &[Native], walked: &HashMap<u64, u32>) -> Vec<u32> {
-    let mut merged = Vec::with_capacity(native.len() + 1);
+/// caller, whose frame this is. `awaiting` are the functions that waited
+/// for the outermost of those frames, nearest first, and go just above it,
+/// as its callers.
+fn place_native(native: &[Native], walked: &HashMap<u64, u32>, awaiting: &[u32]) -> Vec<u32> {
+    let mut merged = Vec::with_capacity(native.len() + 1 + awaiting.len());
+    let mut above_outermost = None;
     for frame in native {
         let found = frame.end.and_then(|end| walked.get(&end.wrapping_sub(16)));
         match found {
             Some(&walked) if frame.eval => merged.push(walked),
             Some(&walked) => merged.extend([frame.id, walked]),
-            None => merged.push(frame.id),
+            None => {
+                merged.push(frame.id);
+                continue;
+            }
         }
+        above_outermost = Some(merged.len());
+    }
+    if let Some(at) = above_outermost {
+        merged.splice(at..at, awaiting.iter().copied());
     }
     merged
 }
@@ -1856,10 +1866,21 @@ impl State {
         if let (Some(interpreter), true) = (at, header.walked_frames > 0) {
             // Each frame after its address.
             let bytes = header.walked_bytes.max(9) as usize;
-            let records = walked.chunks_exact(bytes).map(|record| {
+            // The last are of functions that waited, on no stack.
+            let on_stack = header.walked_frames.saturating_sub(header.awaited) as usize;
+            let records = walked.chunks_exact(bytes).enumerate().map(|(at, record)| {
                 let (address, frame) = record.split_at(8);
                 let address = u64::from_ne_bytes(address.try_into().unwrap());
-                (address, interpreter.frame(frame))
+                let frame = match interpreter.waiting(frame) {
+                    _ if at < on_stack => interpreter.frame(frame),
+                    Some(code) => WalkedFrame::Code {
+                        code,
+                        instruction: 0,
+                        entered: false,
+                    },
+                    None => WalkedFrame::Native,
+                };
+                (address, frame)
             });
             let runs = |frame: &Frame| {
                 let address = frame
@@ -1879,7 +1900,8 @@ impl State {
             let mut innermost = interpreter.saves_instruction_on_calls();
             if interpreter.walk().frames == Frames::Native {
                 let mut placed = HashMap::new();
-                for (address, frame) in records {
+                let mut awaiting = Vec::new();
+                for (at, (address, frame)) in records.enumerate() {
                     let WalkedFrame::Code {
                         code, instruction, ..
                     } = frame
@@ -1899,8 +1921,10 @@ impl State {
                     counts.unread_frames += u64::from(!read);
                     // A frame whose code can't be read may be no frame of
                     // the runtime's at all.
-                    if read {
+                    if read && at < on_stack {
                         placed.insert(address, id);
+                    } else if read {
+                        awaiting.push(id);
                     }
                 }
                 // Code the runtime compiled is in no file.
@@ -1916,7 +1940,7 @@ impl State {
                         }
                     })
                     .collect();
-                *stack = place_native(&native, &placed);
+                *stack = place_native(&native, &placed, &awaiting);
             } else {
                 let mut groups = vec![Group::default()];
                 for (address, frame) in records {
@@ -3019,11 +3043,21 @@ mod tests {
         // its caller's, which the walk lost.
         let walked = HashMap::from([(at(jit), 100), (at(builtin), 101), (at(outer_jit), 102)]);
         assert_eq!(
-            place_native(&stack, &walked),
+            place_native(&stack, &walked, &[]),
             vec![100, builtin, 101, native, 102, main]
         );
         assert_eq!(
-            place_native(&stack, &HashMap::new()),
+            place_native(&stack, &HashMap::new(), &[]),
+            vec![jit, builtin, native, outer_jit, main]
+        );
+        // The functions that waited for the outermost frame of the program
+        // are its callers, inside the native code that resumed it.
+        assert_eq!(
+            place_native(&stack, &walked, &[200, 201]),
+            vec![100, builtin, 101, native, 102, 200, 201, main]
+        );
+        assert_eq!(
+            place_native(&stack, &HashMap::new(), &[200]),
             vec![jit, builtin, native, outer_jit, main]
         );
     }
@@ -3142,6 +3176,7 @@ mod tests {
             frame_ends: 0,
             exec: 0,
             mapped: 0,
+            awaited: 0,
         };
         for pid in [1, 2, 3] {
             state.ebpf_sample(
@@ -3184,6 +3219,7 @@ mod tests {
             frame_ends: 0,
             exec: 0,
             mapped: 0,
+            awaited: 0,
         };
         state.ebpf_sample(&header, [(0x1010, None)].into_iter(), None, None, 1000);
         assert_eq!((state.samples.len(), state.ebpf_untracked), (1, 0));
@@ -3220,6 +3256,7 @@ mod tests {
             frame_ends: 0,
             exec: 0,
             mapped: 0,
+            awaited: 0,
         };
         for header in [
             header(event::CPU_CLOCK, 1000, 0),
@@ -3459,6 +3496,7 @@ mod tests {
             frame_ends: 0,
             exec: 0,
             mapped: 0,
+            awaited: 0,
         }
     }
 

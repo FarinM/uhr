@@ -446,6 +446,7 @@ fn walk(layout: &Layout, runtime: u64) -> Walk {
             reads: Vec::new(),
         },
         frame_pointers: matches!(frame.entry, Entry::Owner(_)),
+        awaits: None,
     }
 }
 

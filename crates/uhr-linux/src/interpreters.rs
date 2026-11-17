@@ -15,7 +15,7 @@ use uhr_core::recording::Mapping;
 use uhr_core::runtimes::{
     self, Code, Frames, Interpreter, Memory, Process, States, Step, Thread, WalkedFrame,
 };
-use uhr_ebpf::{MAX_PATH, MAX_READS, MAX_WALKED_BYTES, ONE_LIST, walk};
+use uhr_ebpf::{MAX_FRAME_CHECKS, MAX_NEXT, MAX_PATH, MAX_READS, MAX_WALKED_BYTES, ONE_LIST, walk};
 
 use crate::launch::monotonic_ns;
 use crate::procfs;
@@ -32,6 +32,8 @@ pub(crate) struct Walked {
     pub(crate) status: u32,
     pub(crate) frame_bytes: u32,
     pub(crate) frames: Vec<u8>,
+    /// How many of the frames, the last, are of functions that waited.
+    pub(crate) awaited: u32,
 }
 
 /// A program a process ran: its pid, and how many times it had exec'd.
@@ -88,6 +90,7 @@ pub(crate) struct Finder {
 /// state each thread runs in.
 pub(crate) struct Maps {
     pub(crate) walks: BpfHashMap<MapData, u32, uhr_ebpf::Walk>,
+    pub(crate) awaits: BpfHashMap<MapData, u32, uhr_ebpf::Awaits>,
     pub(crate) threads: BpfHashMap<MapData, u32, u64>,
 }
 
@@ -179,7 +182,7 @@ fn find(receiver: Receiver<Walked>, mut maps: Maps, frame_pointers: bool) -> Int
                 next_ns,
                 wait_ns,
             } if mapped.is_none_or(|had| walked.mapped > had) || monotonic_ns() >= *next_ns => {
-                match look(program, &mut maps.walks, &mut found, frame_pointers) {
+                match look(program, &mut maps, &mut found, frame_pointers) {
                     Ok(Some(next)) => *state = next,
                     Ok(None) => {
                         *mapped = (*mapped).max(Some(walked.mapped));
@@ -215,8 +218,15 @@ fn find(receiver: Receiver<Walked>, mut maps: Maps, frame_pointers: bool) -> Int
                 }
                 // Each after its address.
                 let bytes = walked.frame_bytes.max(9) as usize;
-                for frame in walked.frames.chunks_exact(bytes) {
-                    let WalkedFrame::Code { code, .. } = interpreter.frame(&frame[8..]) else {
+                let on_stack =
+                    (walked.frames.len() / bytes).saturating_sub(walked.awaited as usize);
+                for (at, frame) in walked.frames.chunks_exact(bytes).enumerate() {
+                    let code = match interpreter.frame(&frame[8..]) {
+                        _ if at >= on_stack => interpreter.waiting(&frame[8..]),
+                        WalkedFrame::Code { code, .. } => Some(code),
+                        _ => None,
+                    };
+                    let Some(code) = code else {
                         continue;
                     };
                     if found.code.contains_key(&(program, code)) {
@@ -308,7 +318,7 @@ fn pid_namespace_of(process: &str) -> Option<(u64, u64)> {
 /// it cannot read.
 fn look(
     program: Program,
-    walks: &mut BpfHashMap<MapData, u32, uhr_ebpf::Walk>,
+    maps: &mut Maps,
     found: &mut Interpreters,
     frame_pointers: bool,
 ) -> Result<Option<State>, String> {
@@ -348,8 +358,20 @@ fn look(
             interpreter.version()
         )
     })?;
+    let mut walk = walk;
+    // Before the walk, which says to look for it.
+    let awaits = interpreter.walk().awaits.as_ref();
+    let awaits = awaits.and_then(|awaits| programs_awaits(interpreter.walk(), awaits));
+    if let Some(awaits) = awaits
+        && let Err(error) = maps.awaits.insert(pid, awaits, 0)
+    {
+        debug!(pid, %error, "telling uhr's eBPF programs how to find the functions that wait");
+        walk.awaits = 0;
+    } else if awaits.is_none() {
+        walk.awaits = 0;
+    }
     let since_ns = monotonic_ns();
-    if let Err(error) = walks.insert(pid, walk, 0) {
+    if let Err(error) = maps.walks.insert(pid, walk, 0) {
         warn!(pid, %error, "telling uhr's eBPF programs how to walk its frames");
         return Err(format!(
             "uhr's eBPF programs could not take its walk: {error}"
@@ -462,9 +484,79 @@ fn programs_walk(walk: &runtimes::Walk, pid_namespace: [u64; 2]) -> Option<uhr_e
         Frames::Native => {
             programs.frames = uhr_ebpf::frames::NATIVE;
             programs.frame_pointers = 1;
+            programs.awaits = u32::from(walk.awaits.is_some());
         }
     }
     Some(programs)
+}
+
+/// `awaits` as uhr's programs take it, `None` if it has more steps, paths
+/// or checks than they follow, or says of a frame what they don't copy.
+fn programs_awaits(walk: &runtimes::Walk, awaits: &runtimes::Awaits) -> Option<uhr_ebpf::Awaits> {
+    let path = |steps: &[runtimes::PathStep]| {
+        let mut path = uhr_ebpf::Path {
+            len: steps.len() as u32,
+            ..uhr_ebpf::Path::default()
+        };
+        for (step, wanted) in path.steps.get_mut(..steps.len())?.iter_mut().zip(steps) {
+            let (mask, value) = wanted.check.unwrap_or((0, 0));
+            let via = u32::from(wanted.via.is_some()) * uhr_ebpf::path_step::VIA;
+            let at_least = u32::from(wanted.at_least) * uhr_ebpf::path_step::AT_LEAST;
+            *step = uhr_ebpf::PathStep {
+                offset: wanted.offset,
+                via: wanted.via.unwrap_or(0),
+                flags: via | at_least,
+                pad: 0,
+                mask,
+                value,
+                pointer: wanted.follow.unwrap_or(0),
+            };
+        }
+        Some(path)
+    };
+    let copied = walk.copy.bytes + 8 * walk.copy.reads.len() as u32;
+    if awaits.copy_code + 8 > walk.copy.bytes || walk.copy.reads.is_empty() {
+        return None;
+    }
+    let mut frame = [uhr_ebpf::FrameCheck::default(); MAX_FRAME_CHECKS];
+    for (check, &(word, mask, value)) in frame
+        .get_mut(..awaits.frame.len())?
+        .iter_mut()
+        .zip(&awaits.frame)
+    {
+        if word + 8 > copied {
+            return None;
+        }
+        *check = uhr_ebpf::FrameCheck {
+            word,
+            pad: 0,
+            mask,
+            value,
+        };
+    }
+    let mut next = [uhr_ebpf::Path::default(); MAX_NEXT];
+    for (to, steps) in next
+        .get_mut(..awaits.next.len())?
+        .iter_mut()
+        .zip(&awaits.next)
+    {
+        // One that takes no step would wait for itself.
+        if !steps.iter().any(|step| step.follow.is_some()) {
+            return None;
+        }
+        *to = path(steps)?;
+    }
+    Some(uhr_ebpf::Awaits {
+        frame,
+        frame_len: awaits.frame.len() as u32,
+        copy_code: awaits.copy_code,
+        start: path(&awaits.start)?,
+        state: path(&awaits.state)?,
+        code: path(&awaits.code)?,
+        next,
+        next_len: awaits.next.len() as u32,
+        pad: 0,
+    })
 }
 
 /// A running process, read through `/proc`.
