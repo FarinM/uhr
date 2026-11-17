@@ -212,7 +212,7 @@ query by function or module. Native code the program calls, such as libc or
 an extension, and the kernel keep their own self time. Whether the
 runtime's own functions are hidden from stacks is not decided.
 
-An async function of Bun that was resumed after an `await` has the
+An async function of Node or Bun that was resumed after an `await` has the
 functions that wait for it as its callers, though the runtime's loop called
 it and they were on no stack: so `call_paths` leads from the work to the
 code that asked for it, and each of them has the time of what it waited

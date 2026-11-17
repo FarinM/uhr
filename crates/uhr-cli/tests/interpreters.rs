@@ -882,6 +882,20 @@ fn names_the_bun_functions_that_wait_for_one() {
 }
 
 #[test]
+fn names_the_v8_functions_that_wait_for_one() {
+    let Some(node) = node() else {
+        return;
+    };
+    let dir = scratch("interpreters_v8_await");
+    let program = format!("{PROGRAMS}/await.js");
+    let command = [node.to_str().unwrap(), &program, "60"];
+    let Some(recording) = record(&dir, &[], &command) else {
+        return;
+    };
+    has_the_functions_that_waited(&recording, "node");
+}
+
+#[test]
 fn reads_lua_frames() {
     let Some(lua) = find("lua5.4") else {
         eprintln!("skipped: needs Lua 5.4");

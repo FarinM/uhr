@@ -14,7 +14,8 @@ use std::ops::Range;
 use super::super::process::{bytes_at, symbols, u32_at, u64_at};
 use super::super::text;
 use super::super::{
-    Code, Copy, Error, Frames, Interpreter, Memory, Process, Read, Runtime, Walk, WalkedFrame,
+    Awaits, Code, Copy, Error, Frames, Interpreter, Memory, PathStep, Process, Read, Runtime, Walk,
+    WalkedFrame,
 };
 use crate::recording::Mapping;
 
@@ -42,6 +43,22 @@ const SCOPE_CONTEXT_LOCALS: u64 = 24;
 const SCOPE_PARTS: u64 = 32;
 /// Context locals past this many keep their names in a table of their own.
 const SCOPE_MAX_INLINED_NAMES: u64 = 75;
+
+/// What V8 does not publish of how an async function waits, from the
+/// headers of V8 11 to 13, in 8-byte tagged values past the map. The
+/// builtin that resumes an async function runs in the context of its
+/// `await`, whose third slot holds the function's `JSAsyncFunctionObject`.
+/// That holds its function and the promise of its result, a `JSPromise` its
+/// reactions and its flags, which say it is pending in their low two bits,
+/// and a `PromiseReaction` a handler, of the `await` of the function that
+/// waits, whichever of the two where V8 keeps more in a reaction.
+const AWAIT_CONTEXT_SLOT: u64 = 2;
+const GENERATOR_FUNCTION: u64 = 24;
+const ASYNC_FUNCTION_PROMISE: u64 = 80;
+const PROMISE_REACTIONS: u64 = 24;
+const PROMISE_FLAGS: u64 = 32;
+const PROMISE_STATUS_MASK: u64 = 0b11;
+const REACTION_HANDLER: u64 = 24;
 
 /// How one major version of V8 lays out a `ScopeInfo`'s parts.
 #[derive(Debug, Clone, Copy)]
@@ -98,6 +115,7 @@ struct Layout {
     map: u64,
     instance_type: u64,
     function_shared: u64,
+    function_context: u64,
     shared_name: u64,
     shared_script: u64,
     script_name: u64,
@@ -115,6 +133,8 @@ struct Layout {
     array_length: u64,
     array_data: u64,
     shared_type: u16,
+    async_function_type: u16,
+    reaction_type: u16,
     scope_type: u16,
     script_type: u16,
     array_type: u16,
@@ -173,6 +193,7 @@ impl Layout {
             map: offset("class_HeapObject__map")?,
             instance_type: offset("class_Map__instance_type")?,
             function_shared: offset("class_JSFunction__shared")?,
+            function_context: offset("class_JSFunction__context")?,
             shared_name: offset("class_SharedFunctionInfo__name_or_scope_info")?,
             // A `DebugInfo` there before V8 12 is for a function being
             // debugged.
@@ -193,6 +214,10 @@ impl Layout {
             array_length: offset("class_FixedArrayBase__length")?,
             array_data: offset("class_FixedArray__data")?,
             shared_type: small("type_SharedFunctionInfo__SHARED_FUNCTION_INFO_TYPE")?,
+            async_function_type: small(
+                "type_JSAsyncFunctionObject__JS_ASYNC_FUNCTION_OBJECT_TYPE",
+            )?,
+            reaction_type: small("type_PromiseReaction__PROMISE_REACTION_TYPE")?,
             scope_type: small("type_ScopeInfo__SCOPE_INFO_TYPE")?,
             script_type: small("type_Script__SCRIPT_TYPE")?,
             array_type: small("type_FixedArray__FIXED_ARRAY_TYPE")?,
@@ -213,6 +238,54 @@ impl Layout {
                 _ => UNCACHED_EXTERNAL_STRING,
             },
         })
+    }
+}
+
+/// How the sampler finds the async functions that wait for one a thread
+/// runs, as V8's own async stack traces do, from the frame of the builtin
+/// that resumed it: `copied_from` is where a frame's copy starts.
+fn awaits(layout: &Layout, copied_from: i32) -> Awaits {
+    // Of a tagged pointer.
+    let field = |offset: u64| (offset as i64 - layout.heap_object_tag as i64) as i32;
+    let object = |word: i32| {
+        (
+            word as u32,
+            layout.heap_object_tag_mask,
+            layout.heap_object_tag,
+        )
+    };
+    let is = |kind: u16| PathStep {
+        via: Some(field(layout.instance_type)),
+        ..PathStep::check(field(layout.map), 0xffff, u64::from(kind))
+    };
+    let state = is(layout.async_function_type);
+    let slot = field(layout.array_data + 8 * AWAIT_CONTEXT_SLOT);
+    let pending = PathStep::check(
+        field(PROMISE_FLAGS),
+        PROMISE_STATUS_MASK << layout.smi_shift,
+        0,
+    );
+    Awaits {
+        // As `frame` tells one: its context, its function and that
+        // function's `SharedFunctionInfo` are objects.
+        frame: vec![
+            object(layout.fp_context - copied_from),
+            object(layout.fp_function - copied_from),
+            object(-copied_from),
+        ],
+        copy_code: (layout.fp_function - copied_from) as u32,
+        start: vec![PathStep::to(layout.fp_context), PathStep::to(slot)],
+        state: vec![state],
+        code: vec![PathStep::to(field(GENERATOR_FUNCTION))],
+        next: vec![vec![
+            PathStep::to(field(ASYNC_FUNCTION_PROMISE)),
+            pending,
+            PathStep::to(field(PROMISE_REACTIONS)),
+            is(layout.reaction_type),
+            PathStep::to(field(REACTION_HANDLER)),
+            PathStep::to(field(layout.function_context)),
+            PathStep::to(slot),
+        ]],
     }
 }
 
@@ -301,7 +374,7 @@ impl V8 {
                 }],
             },
             frame_pointers: true,
-            awaits: None,
+            awaits: Some(awaits(&layout, from)),
         };
         Ok(Self {
             version,
@@ -632,6 +705,19 @@ impl Interpreter for V8 {
             instruction: 0,
             entered: false,
         }
+    }
+
+    fn waiting(&self, bytes: &[u8]) -> Option<u64> {
+        let copy = &self.walk.copy;
+        let word = |at: usize| {
+            bytes
+                .get(at..at + 8)
+                .map_or(0, |b| u64::from_ne_bytes(b.try_into().unwrap()))
+        };
+        // The sampler writes only the function, so no context.
+        let function = word((self.layout.fp_function - copy.from) as usize);
+        let shared = word(copy.bytes as usize);
+        (self.is_object(function) && self.is_object(shared)).then_some(shared)
     }
 
     fn code(&self, memory: &dyn Memory, shared: u64) -> Result<Code, Error> {

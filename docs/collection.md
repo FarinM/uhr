@@ -461,7 +461,12 @@ programs read the frames of:
   whose `SharedFunctionInfo` the programs read at the sample, as V8's
   garbage collector moves functions. That names its functions and their
   files, and the line and column each starts at, from the script's source.
-  Lines within a function are not read yet.
+  Lines within a function are not read yet. The builtin that resumes an
+  async function runs in the context of its `await`, which holds the
+  function's `JSAsyncFunctionObject`, and each of those the promise of its
+  result, whose reaction leads to that of the function that waits for it,
+  as V8's own async stack traces follow them. What `.then` or a
+  `Promise.all` waits for ends there. Checked on Node 24 only.
 - JavaScriptCore as Bun 1.4.3 runs it, by its build id. Bun's releases keep
   no symbols, and JavaScriptCore publishes no offsets, so they are those
   found in the build with symbols Bun publishes with each release, from the
@@ -548,8 +553,8 @@ it or stay. One path leads from that frame to its function's state, one
 tells a state, one leads from a state to its code, and up to four from a
 state to that of the function that waits for it, of which the first that
 does not end is taken. Nothing in a recording says yet which callers were
-on no stack. In Bun, a sample of about 9.5 microseconds took 2.7 more, and
-0.1 more for each function that waited.
+on no stack. In Bun and in Node, a sample of about 9.5 microseconds took 2
+to 3 more, and 0.1 more for each function that waited.
 
 Of each frame they copy the bytes at an offset from it, and up to two words
 read at the time of the sample at an offset from a pointer the copy holds,
