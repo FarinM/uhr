@@ -17,6 +17,12 @@ publish it. `--json` prints a summary and coverage to stdout; the profile is
 always written to `-o`. The output must be a new file. Export works on every
 platform that can read a uhr recording and needs no profiling privileges.
 
+A name that ends in `.gz` is written compressed with gzip, which Firefox
+Profiler opens as it is. Each time a thread went off CPU adds up to three
+markers, so a profile grows with the context switches of what it selects: 6
+seconds with 926,000 off-CPU intervals are 300 MB, or 13 MB compressed.
+Filters by process, thread and time keep it small.
+
 
 The exporter writes processed profile JSON, version 55, which Firefox
 Profiler upgrades on import. The wire schema is isolated in

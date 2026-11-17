@@ -23,6 +23,7 @@ arrow-schema = "60"
 arrow-select = "60"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 clap = { version = "4.6", features = ["derive"] }
+flate2 = "1"
 libc = "0.2"
 linux-perf-data = "0.13"
 memmap2 = "0.9"

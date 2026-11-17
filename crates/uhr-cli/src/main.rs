@@ -10,6 +10,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use flate2::Compression;
+use flate2::write::GzEncoder;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::LevelFilter;
 use uhr_core::call_paths;
@@ -61,7 +63,9 @@ enum Command {
         /// Viewer format
         #[arg(long, value_enum, default_value_t = ExportFormat::Firefox)]
         format: ExportFormat,
-        /// New file to write; an existing file is not overwritten
+        /// New file to write; an existing file is not overwritten. A name
+        /// that ends in .gz is compressed with gzip, which the viewer opens
+        /// as it is
         #[arg(short, long)]
         output: PathBuf,
         /// Print the export summary and coverage as JSON
@@ -670,11 +674,22 @@ fn run_export(
             output.display()
         )
     })?;
-    let mut file = io::BufWriter::new(file);
-    profile
-        .write(&mut file)
-        .and_then(|()| file.flush())
-        .with_context(|| format!("writing {}", output.display()))?;
+    if output
+        .extension()
+        .is_some_and(|extension| extension == "gz")
+    {
+        // Buffered, as the encoder is slow at the many small writes of JSON.
+        let mut gzip = io::BufWriter::new(GzEncoder::new(file, Compression::default()));
+        profile
+            .write(&mut gzip)
+            .and_then(|()| gzip.into_inner().map_err(io::IntoInnerError::into_error))
+            .and_then(GzEncoder::finish)
+            .map(drop)
+    } else {
+        let mut file = io::BufWriter::new(file);
+        profile.write(&mut file).and_then(|()| file.flush())
+    }
+    .with_context(|| format!("writing {}", output.display()))?;
     let report = &profile.report;
     if json {
         let text = serde_json::to_string_pretty(report)?;

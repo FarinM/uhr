@@ -14,6 +14,7 @@ uhr-core.workspace = true
 uhr-mcp.workspace = true
 anyhow.workspace = true
 clap.workspace = true
+flate2.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

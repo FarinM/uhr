@@ -1,8 +1,10 @@
 //! Export is available on every platform and needs no recording privileges.
 use std::fs;
+use std::io::Read;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
+use flate2::read::GzDecoder;
 use serde_json::Value;
 use uhr_core::recording::*;
 
@@ -140,6 +142,31 @@ fn exports_a_selected_thread_and_time_range() {
     assert_eq!(profile["threads"].as_array().unwrap().len(), 1);
     assert_eq!(profile["threads"][0]["name"], "worker");
     assert_eq!(profile["threads"][0]["samples"]["time"][0], 2.0);
+}
+
+#[test]
+fn compresses_an_export_named_gz() {
+    let (rec, out) = recording("export_gzip");
+    let compressed = out.with_extension("json.gz");
+    for output in [&out, &compressed] {
+        let ran = Command::new(UHR)
+            .arg("export")
+            .arg(&rec)
+            .arg("-o")
+            .arg(output)
+            .output()
+            .unwrap();
+        assert!(
+            ran.status.success(),
+            "{}",
+            String::from_utf8_lossy(&ran.stderr)
+        );
+    }
+    let mut profile = Vec::new();
+    GzDecoder::new(&fs::read(compressed).unwrap()[..])
+        .read_to_end(&mut profile)
+        .unwrap();
+    assert_eq!(profile, fs::read(out).unwrap());
 }
 
 #[test]
