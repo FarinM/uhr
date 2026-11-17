@@ -1,10 +1,107 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
+use serde::ser::SerializeMap;
+use serde::{Serialize, Serializer};
 use serde_json::{Value, json};
 
 use super::{Builder, Error, ObservationCounts, firefox, relative_ms};
 use crate::filter::Filter;
-use crate::recording::{ThreadState, Waker};
+use crate::recording::{MemoryReading, Mode, ThreadState, Waker};
+
+/// What a marker says of its observation, under the keys of its schema.
+/// Each time a thread goes off CPU makes up to three markers, so a busy
+/// recording has millions, and they hold only their fields until written.
+pub(super) struct MarkerData {
+    /// The stack the marker shows, in its thread's stack table.
+    cause: Option<usize>,
+    payload: Payload,
+}
+
+enum Payload {
+    OffCpu {
+        state: ThreadState,
+        /// `None` without a wakeup.
+        waker: Option<Arc<str>>,
+        stack_recorded: bool,
+    },
+    Wakeup {
+        waker: Arc<str>,
+        stack_recorded: bool,
+    },
+    PageFault {
+        faults: u64,
+        address: u64,
+        mode: Mode,
+    },
+    /// Boxed, as few markers are of memory and it is the largest.
+    Memory(Box<MemoryReading>),
+}
+
+#[derive(Serialize)]
+struct Cause {
+    stack: usize,
+}
+
+impl Serialize for MarkerData {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let mut m = s.serialize_map(None)?;
+        let cause = |m: &mut S::SerializeMap| match self.cause {
+            Some(stack) => m.serialize_entry("cause", &Cause { stack }),
+            None => Ok(()),
+        };
+        let stack_status = |recorded: bool, stack: &'static str| match recorded {
+            true => stack,
+            false => "not recorded",
+        };
+        match &self.payload {
+            Payload::OffCpu {
+                state,
+                waker,
+                stack_recorded,
+            } => {
+                cause(&mut m)?;
+                let status = stack_status(*stack_recorded, "switch-out stack");
+                m.serialize_entry("stackStatus", status)?;
+                m.serialize_entry("state", state.as_str())?;
+                m.serialize_entry("type", "UhrOffCpu")?;
+                m.serialize_entry("waker", waker.as_deref().unwrap_or("unknown"))?;
+            }
+            Payload::Wakeup {
+                waker,
+                stack_recorded,
+            } => {
+                cause(&mut m)?;
+                let status = stack_status(*stack_recorded, "waker stack");
+                m.serialize_entry("stackStatus", status)?;
+                m.serialize_entry("type", "UhrWakeup")?;
+                m.serialize_entry("waker", &**waker)?;
+            }
+            Payload::PageFault {
+                faults,
+                address,
+                mode,
+            } => {
+                // Addresses can exceed JavaScript's exact integer range.
+                m.serialize_entry("address", &format_args!("0x{address:x}"))?;
+                cause(&mut m)?;
+                m.serialize_entry("faults", faults)?;
+                m.serialize_entry("mode", mode.as_str())?;
+                m.serialize_entry("type", "UhrPageFault")?;
+            }
+            Payload::Memory(reading) => {
+                m.serialize_entry("anonymous", &reading.rss_anon_bytes)?;
+                m.serialize_entry("file", &reading.rss_file_bytes)?;
+                m.serialize_entry("peakRss", &reading.peak_rss_bytes)?;
+                m.serialize_entry("rss", &reading.rss_bytes())?;
+                m.serialize_entry("shared", &reading.rss_shmem_bytes)?;
+                m.serialize_entry("swap", &reading.swap_bytes)?;
+                m.serialize_entry("type", "UhrMemory")?;
+            }
+        }
+        m.end()
+    }
+}
 
 impl Builder<'_> {
     pub(super) fn observations(
@@ -12,19 +109,23 @@ impl Builder<'_> {
         filter: &Filter,
     ) -> Result<(ObservationCounts, Vec<firefox::Counter>), Error> {
         let mut counts = ObservationCounts::default();
+        // One label for all the waits a thread ended.
+        let mut wakers: HashMap<(u32, u32, &str), Arc<str>> = HashMap::new();
+        let interrupt: Arc<str> = "interrupt".into();
         for (interval, start, end) in filter.off_cpu(self.recording, self.functions)? {
             let thread = self.thread(interval.pid, interval.tid, interval.start_ns);
             let waker = interval.wakeup.as_ref().map(|w| match &w.waker {
-                Waker::Thread { pid, tid, name } => format!("{name} (pid {pid}, tid {tid})"),
-                Waker::Interrupt => "interrupt".into(),
+                Waker::Thread { pid, tid, name } => wakers
+                    .entry((*pid, *tid, name))
+                    .or_insert_with(|| format!("{name} (pid {pid}, tid {tid})").into())
+                    .clone(),
+                Waker::Interrupt => interrupt.clone(),
             });
             let wakeup = interval.wakeup.as_ref().map(|w| w.time_ns);
-            let data = |state: ThreadState| {
-                json!({
-                    "type": "UhrOffCpu", "state": state.as_str(),
-                    "waker": waker.as_deref().unwrap_or("unknown"),
-                    "stackStatus": if interval.stack.is_some() { "switch-out stack" } else { "not recorded" },
-                })
+            let data = |state: ThreadState| Payload::OffCpu {
+                state,
+                waker: waker.clone(),
+                stack_recorded: interval.stack.is_some(),
             };
             if let Some(wakeup) = wakeup {
                 if start < wakeup {
@@ -57,16 +158,17 @@ impl Builder<'_> {
                     data(interval.state),
                 );
             }
-            if let Some(wakeup) = &interval.wakeup
+            if let Some((wakeup, waker)) = interval.wakeup.as_ref().zip(waker)
                 && (start..=end).contains(&wakeup.time_ns)
                 && filter
                     .to_ns
                     .is_none_or(|to| wakeup.time_ns < self.start.saturating_add(to))
             {
-                self.marker(thread, "Wakeup", wakeup.time_ns, None, wakeup.stack, json!({
-                    "type": "UhrWakeup", "waker": waker,
-                    "stackStatus": if wakeup.stack.is_some() { "waker stack" } else { "not recorded" },
-                }));
+                let data = Payload::Wakeup {
+                    waker,
+                    stack_recorded: wakeup.stack.is_some(),
+                };
+                self.marker(thread, "Wakeup", wakeup.time_ns, None, wakeup.stack, data);
             }
             counts.off_cpu_intervals += 1;
             counts.off_cpu_ns += end - start;
@@ -79,11 +181,11 @@ impl Builder<'_> {
                 fault.time_ns,
                 None,
                 Some(fault.stack),
-                json!({
-                    "type": "UhrPageFault", "faults": fault.faults,
-                    // Addresses can exceed JavaScript's exact integer range.
-                    "address": format!("0x{:x}", fault.address), "mode": fault.mode.as_str(),
-                }),
+                Payload::PageFault {
+                    faults: fault.faults,
+                    address: fault.address,
+                    mode: fault.mode,
+                },
             );
             counts.page_fault_samples += 1;
         }
@@ -117,11 +219,7 @@ impl Builder<'_> {
                     reading.time_ns,
                     None,
                     None,
-                    json!({
-                        "type": "UhrMemory", "rss": rss, "anonymous": reading.rss_anon_bytes,
-                        "file": reading.rss_file_bytes, "shared": reading.rss_shmem_bytes,
-                        "swap": reading.swap_bytes, "peakRss": reading.peak_rss_bytes,
-                    }),
+                    Payload::Memory(Box::new(reading.clone())),
                 );
                 counts.memory_readings += 1;
             }
@@ -136,18 +234,16 @@ impl Builder<'_> {
         start: u64,
         end: Option<u64>,
         stack: Option<u32>,
-        mut data: Value,
+        payload: Payload,
     ) {
-        if let Some(stack) = stack.and_then(|s| self.stack(thread, s)) {
-            data["cause"] = json!({"stack": stack});
-        }
+        let cause = stack.and_then(|s| self.stack(thread, s));
         let t = &mut self.threads[thread];
         let name = t.string(name);
         t.data.markers.0.push(firefox::Marker {
             name,
             start: relative_ms(start, self.start),
             end: end.map(|t| relative_ms(t, self.start)),
-            data,
+            data: MarkerData { cause, payload },
         });
     }
 }

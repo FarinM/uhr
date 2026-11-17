@@ -6,6 +6,8 @@ use serde::ser::{SerializeMap, SerializeSeq};
 use serde::{Serialize, Serializer};
 use serde_json::Value;
 
+use super::observations::MarkerData;
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct Profile {
@@ -59,7 +61,7 @@ pub(super) struct Marker {
     pub name: usize,
     pub start: f64,
     pub end: Option<f64>,
-    pub data: Value,
+    pub data: MarkerData,
 }
 impl Serialize for Markers {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
@@ -70,8 +72,7 @@ impl Serialize for Markers {
         m.serialize_entry("endTime", &column(&self.0, |r| r.end))?;
         m.serialize_entry("phase", &column(&self.0, |r| u8::from(r.end.is_some())))?;
         m.serialize_entry("category", &repeat(0, self.0.len()))?;
-        let data: Vec<_> = self.0.iter().map(|r| &r.data).collect();
-        m.serialize_entry("data", &data)?;
+        m.serialize_entry("data", &column(&self.0, |r| &r.data))?;
         m.end()
     }
 }
@@ -196,9 +197,9 @@ impl Serialize for Resources {
     }
 }
 
-fn column<T, U: Serialize>(rows: &[T], get: impl Fn(&T) -> U) -> impl Serialize {
+fn column<'a, T, U: Serialize>(rows: &'a [T], get: impl Fn(&'a T) -> U) -> impl Serialize {
     struct Column<'a, T, F>(&'a [T], F);
-    impl<T, U: Serialize, F: Fn(&T) -> U> Serialize for Column<'_, T, F> {
+    impl<'a, T, U: Serialize, F: Fn(&'a T) -> U> Serialize for Column<'a, T, F> {
         fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
             let mut seq = s.serialize_seq(Some(self.0.len()))?;
             for row in self.0 {
