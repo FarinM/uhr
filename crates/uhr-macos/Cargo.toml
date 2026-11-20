@@ -1,0 +1,20 @@
+[package]
+name = "uhr-macos"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+uhr-core.workspace = true
+wholesym.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+framehop = { workspace = true, features = ["macho"] }
+libc.workspace = true
+mach2.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[build-dependencies]
+cc.workspace = true
