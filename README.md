@@ -10,9 +10,9 @@ and exposes questions over that model through MCP and a CLI.
 
 ## Status
 
-Early, and Linux only. Recording needs Linux and perf; a recording can be read
-anywhere. The [docs](#docs) describe the whole design, which the code only
-partly covers.
+Early, on Linux and macOS. Recording needs Linux and perf, or macOS; a
+recording can be read anywhere. The [docs](#docs) describe the whole design,
+which the code only partly covers.
 
 uhr records CPU samples with user and kernel stacks, and time off CPU, per
 process and thread, how much memory each process has resident over time,
@@ -29,6 +29,25 @@ one of two samplers:
   Node 20 to 24, Bun 1.4.3, Ruby 3.2, PHP 8.3, Lua 5.4 and Java's interpreter
   ([limits](docs/collection.md#runtimes)), with the async functions of Node
   and Bun that wait for the one that runs as its callers.
+
+On macOS uhr samples with a sampler of its own, without root for a program
+it starts, and records CPU time in user and kernel mode with user stacks,
+time off CPU with the stacks threads waited at, and each process's memory.
+macOS shows no process the kernel's stacks, so time in the kernel is under
+the user code that entered it, and there are no wakeups, syscall counts or
+page faults. dyld leaves uhr's library out of programs the system protects,
+as those in `/usr/bin`, and hardened ones ([limits](docs/collection.md#uhrs-sampler-on-macos)).
+
+## How the macOS sampler works
+
+About a thousand times a second, uhr reads each thread's CPU time and state.
+A thread that ran since the last time, or can run now, it holds still for
+about 16 microseconds and walks its stack with the unwind tables of the
+images in its process. The CPU time since the last poll goes to that stack.
+A thread that waits costs one call, and its time off CPU goes to the stack
+it waits at. uhr gets each process's task port from a small library it has
+dyld load into the program and every process that program starts, which
+sends the port to uhr before the program's own code runs.
 
 ## How the eBPF sampler works
 
@@ -86,7 +105,9 @@ existing file. See [viewer exports](docs/export.md) for coverage and limits.
 
 Full stacks need frame pointers. `uhr doctor` lists the build flags, or record
 with `--unwind dwarf`, which needs no rebuild but copies the stack in every
-sample.
+sample. On macOS, stacks are walked with each image's unwind tables, and
+`--sampler`, `--unwind dwarf`, `--stack-size` and `--skip-syscall` are for
+Linux only. Attaching with `--pid` needs `sudo` there.
 
 ## Docs
 

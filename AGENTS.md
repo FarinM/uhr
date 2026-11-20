@@ -16,7 +16,7 @@ and lets an agent ask questions over that model through MCP and a CLI.
 
 ## Where things stand
 
-Early implementation, on Linux only. The code covers only part of the design;
+Early implementation, on Linux and macOS. The code covers only part of the design;
 `README.md` says what works.
 
 - Start with `docs/vision.md` (the goals), then `docs/model.md` (the core
@@ -37,9 +37,12 @@ Early implementation, on Linux only. The code covers only part of the design;
 - `cargo build`, `cargo fmt --check`, `cargo clippy --all-targets` and
   `cargo test`. `cargo check --workspace --all-targets --target
   x86_64-pc-windows-gnu` checks that what is not for Linux builds elsewhere;
-  its C dependencies need a MinGW compiler.
+  its C dependencies need a MinGW compiler. On a Mac, `cargo clippy
+  --workspace --all-targets --target x86_64-apple-darwin` checks the code for
+  Intel Macs, whose registers uhr reads too.
 - The end-to-end tests in `crates/uhr-cli/tests` run perf and a C compiler on
-  the host. `uhr doctor` shows what is missing.
+  the host, and on macOS, in `macos.rs`, uhr's own sampler and a C compiler.
+  `uhr doctor` shows what is missing.
 - uhr's eBPF programs, in `uhr-ebpf`, build when nightly Rust with `rust-src`
   and `bpf-linker` are installed. Without them uhr builds without the
   programs. The checks above leave their code out; lint it with
@@ -51,7 +54,11 @@ Early implementation, on Linux only. The code covers only part of the design;
   and the text form of their results, and builds on every platform: nothing in
   it depends on Linux, so a recording can be read anywhere. `uhr-linux`
   records on Linux: perf, launching and attaching, kernel symbols and the
-  Linux `doctor` checks. Elsewhere it is empty. `uhr-mcp` is the MCP server,
+  Linux `doctor` checks. Elsewhere it is empty. `uhr-macos` records on macOS
+  with uhr's own sampler: its Mach calls, launching with the library it has
+  dyld load, attaching, and the macOS `doctor` checks. Elsewhere it holds
+  only what calls no Mach API, so those tests run on any host. `uhr-mcp` is
+  the MCP server,
   which gives an agent the tools that read a recording. `uhr-cli` is the `uhr`
   binary, and its `uhr mcp` runs the server. Put new tools in the core, so the
   CLI and the MCP server share them, and code for one platform in that

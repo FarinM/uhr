@@ -5,6 +5,8 @@ use std::ptr;
 use uhr_core::interrupts::Interrupts;
 #[cfg(target_os = "linux")]
 use uhr_linux::launch::monotonic_ns;
+#[cfg(target_os = "macos")]
+use uhr_macos::monotonic_ns;
 
 /// A signal handler can only reach statics.
 pub static INTERRUPTS: Interrupts = Interrupts::new(monotonic_ns);

@@ -11,7 +11,7 @@ use crate::filter::Filter;
 use crate::flamegraph::FlameGraph;
 use crate::functions::Function;
 use crate::metric::{Metric, Unit};
-use crate::overview::{CPUTime, Memory, Overview};
+use crate::overview::{CPUTime, Memory, MemoryUsage, Overview};
 use crate::query::{
     FunctionRow, GroupBy, Latency, ModuleRow, QueryResult, RegionRow, Rows, SyscallRow, WakerRow,
     WokenBy,
@@ -208,10 +208,33 @@ fn write_memory(out: &mut impl Write, memory: &Memory) -> io::Result<()> {
          the most of any reading, and the kernel's peak",
         memory.interval_ns / 1_000_000
     )?;
+    // Only macOS counts a footprint.
+    let footprints = memory
+        .processes
+        .iter()
+        .any(|p| p.last.footprint_bytes.is_some());
+    let footprint = |usage: &MemoryUsage| match (footprints, usage.footprint_bytes) {
+        (false, _) => String::new(),
+        (true, Some(footprint)) => format!(" {:>10}", bytes(footprint)),
+        (true, None) => format!(" {:>10}", "-"),
+    };
     writeln!(
         out,
-        "{:>10} {:>11} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>9}  name",
-        "rss", "change", "max", "peak", "anon", "file", "shmem", "swap", "pid"
+        "{:>10} {:>11} {:>10} {:>10}{} {:>10} {:>10} {:>10} {:>10} {:>9}  name",
+        "rss",
+        "change",
+        "max",
+        "peak",
+        if footprints {
+            format!(" {:>10}", "footprint")
+        } else {
+            String::new()
+        },
+        "anon",
+        "file",
+        "shmem",
+        "swap",
+        "pid"
     )?;
     for process in &memory.processes {
         let (first, last) = (&process.first, &process.last);
@@ -221,11 +244,12 @@ fn write_memory(out: &mut impl Write, memory: &Memory) -> io::Result<()> {
         };
         writeln!(
             out,
-            "{:>10} {:>11} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>9}  {}",
+            "{:>10} {:>11} {:>10} {:>10}{} {:>10} {:>10} {:>10} {:>10} {:>9}  {}",
             bytes(last.rss_bytes),
             change,
             bytes(process.max.rss_bytes),
             bytes(last.peak_rss_bytes),
+            footprint(last),
             bytes(last.rss_anon_bytes),
             bytes(last.rss_file_bytes),
             bytes(last.rss_shmem_bytes),

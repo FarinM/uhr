@@ -327,6 +327,7 @@ fn example() -> Recording {
                 rss_shmem_bytes: 0,
                 swap_bytes: 0,
                 peak_rss_bytes: 12_288,
+                footprint_bytes: None,
             },
             MemoryReading {
                 time_ns: 2_000,
@@ -336,6 +337,7 @@ fn example() -> Recording {
                 rss_shmem_bytes: 4_096,
                 swap_bytes: 1 << 20,
                 peak_rss_bytes: (1 << 30) + 12_288,
+                footprint_bytes: Some((1 << 30) + (1 << 20)),
             },
         ],
         regions: vec![

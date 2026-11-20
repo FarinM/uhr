@@ -756,6 +756,7 @@ fn with_memory(mut recording: Recording) -> Recording {
         rss_shmem_bytes: 1,
         swap_bytes: 0,
         peak_rss_bytes,
+        footprint_bytes: None,
     };
     recording.memory = vec![
         reading(1_000, 1, 100, 111),
@@ -795,6 +796,7 @@ fn reads_each_process_memory_at_its_first_last_and_largest_reading() {
             rss_shmem_bytes: 1,
             swap_bytes: 0,
             peak_rss_bytes: 450,
+            footprint_bytes: None,
         }
     );
     assert!(

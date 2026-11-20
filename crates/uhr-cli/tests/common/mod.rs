@@ -4,6 +4,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+#[cfg(target_os = "linux")]
 use std::ptr;
 
 pub const UHR: &str = env!("CARGO_BIN_EXE_uhr");
@@ -62,6 +63,7 @@ pub fn as_root(command: &[&str], recording: &Path) -> Option<()> {
 
 /// Whether processes can name their memory, as on Linux 5.17 and later
 /// built with CONFIG_ANON_VMA_NAME.
+#[cfg(target_os = "linux")]
 pub fn kernel_names_memory() -> bool {
     let length: libc::size_t = 4096;
     let protection = libc::PROT_READ | libc::PROT_WRITE;
@@ -139,10 +141,13 @@ pub fn compile_rust(program: &str, output: &Path) {
     assert!(status.success(), "rustc failed");
 }
 
-/// `flags` come last, so they win over the defaults.
+/// `flags` come last, so they win over the defaults. Mach-O binaries always
+/// have their UUID, which Apple's linker takes no flag for.
 fn build(program: &str, output: &Path, flags: &[&str]) {
+    let build_id = (!cfg!(target_os = "macos")).then_some("-Wl,--build-id");
     let status = Command::new("cc")
-        .args(["-pthread", "-fno-omit-frame-pointer", "-Wl,--build-id"])
+        .args(["-pthread", "-fno-omit-frame-pointer"])
+        .args(build_id)
         .args(flags)
         .arg("-o")
         .arg(output)

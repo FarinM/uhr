@@ -396,6 +396,7 @@ fn with_observations() -> (Recording, Symbols) {
             rss_shmem_bytes: 5,
             swap_bytes: 2,
             peak_rss_bytes: 1_000_055,
+            footprint_bytes: None,
         })
         .collect();
     (recording, symbols)

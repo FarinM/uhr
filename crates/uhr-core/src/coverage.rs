@@ -115,6 +115,11 @@ impl Coverage {
                     stacks.stack_copy_bytes.unwrap_or_default()
                 )),
                 (Unwinding::Dwarf, _) => {}
+                (Unwinding::UnwindTables, _) => coverage.unknown.push(format!(
+                    "stacks of stream {} cut short in code that has neither unwind tables \
+                     nor frame pointers",
+                    stream.id
+                )),
             }
             for walks in &stacks.interpreters {
                 let of = format!(

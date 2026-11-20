@@ -49,39 +49,39 @@ replaces them.
 | `platform.os`, `platform.arch` | The system the target ran on, as Rust names them, such as `linux`, `macos`, `x86_64` and `aarch64`. It says how to read what was recorded: uhr finds syscalls in stacks recorded on Linux from its kernel's function names, and on macOS from the function of `libsystem_kernel` a stack ends in, and frames' `file_offset` counts from the start of a Mach-O image's `__TEXT` on macOS |
 | `target.command` | Command and arguments. Empty for an attached process without a command line, such as a kernel thread |
 | `target.launched` | True if the recording started the target, false if it attached |
-| `target.runtime_support` | The runtimes whose perf maps were on in the target's environment, so that they named the code they compiled: `python`, `node`. Null for a process uhr attached to, whose environment it did not see |
+| `target.runtime_support` | The runtimes whose perf maps were on in the target's environment, so that they named the code they compiled: `python`, `node`. Empty on macOS, where uhr turns on none. Null for a process uhr attached to, whose environment it did not see |
 | `target.exit` | `{"code": n}`, `{"signal": n}`, `{"unknown": reason}` when uhr could not see the status, as for a process it attached to, or null if it was still running |
 | `clock` | `CLOCK_MONOTONIC` |
 | `start_ns`, `end_ns` | When the capture started and stopped: the first and last event or memory reading, or when perf began sampling a process uhr attached to if that came earlier, and when uhr stopped the recording if that came later, at an interrupt or the end of `--duration`. Null if nothing was recorded |
 | `wall_clock` | CLOCK_REALTIME read against `clock` as the capture started and as it stopped, as `start` and `end`, each a `time_ns` on `clock` and a `realtime_ns` in nanoseconds since 1970 began in UTC. They tell times on `clock` as times of day. Where they put the two clocks more than 1 ms further apart at the end than at the start, the system clock was set during the capture, and times of day are not known. Null in a recording from before uhr read it |
 | `streams` | One per collector that ran |
 | `missing_signals` | The signals of collectors that could not run, each with a `reason`, as `syscall_calls` without the privileges to load eBPF |
-| `kernel_symbols` | `{"status": "saved"}` if the kernel's symbols were read while recording, or `{"status": "unavailable", "reason": ...}` if not, and then kernel frames have no names |
+| `kernel_symbols` | `{"status": "saved"}` if the kernel's symbols were read while recording, or `{"status": "unavailable", "reason": ...}` if not, and then kernel frames have no names. Unavailable on macOS, whose recordings have no kernel frames |
 
 Each stream has:
 
 | Field | Meaning |
 |---|---|
 | `id` | Unique within the recording |
-| `collector` | `name` plus the collector's version and settings. For perf: `version`, `sampling`, `page_faults`, `context_switches` (whether perf recorded every context switch). uhr's eBPF programs are `ebpf`, with `programs`, their tags in hex, as in the kernel's names for their code: `bpf_prog_<tag>_<name>`, `sampling`, `page_faults`, `call_interval_ns`, how long the intervals are they counted syscalls in, null if they counted none, and `skipped_syscalls`, the names of the syscalls `uhr record --skip-syscall` had them leave uncounted. uhr reading `/proc` is `procfs`, with `interval_ns`, how often it read |
+| `collector` | `name` plus the collector's version and settings. For perf: `version`, `sampling`, `page_faults`, `context_switches` (whether perf recorded every context switch). uhr's eBPF programs are `ebpf`, with `programs`, their tags in hex, as in the kernel's names for their code: `bpf_prog_<tag>_<name>`, `sampling`, `page_faults`, `call_interval_ns`, how long the intervals are they counted syscalls in, null if they counted none, and `skipped_syscalls`, the names of the syscalls `uhr record --skip-syscall` had them leave uncounted. uhr reading `/proc` is `procfs`, with `interval_ns`, how often it read. uhr's sampler on macOS is `mach`, with `sampling`, whose event is `thread-poll`, and uhr reading memory there with `task_info` is `task_info`, with `interval_ns` |
 | `collector.page_faults` | How the collector sampled page faults: `event` and `period`, one fault in every that many, which each sample stands for. Null for one that did not |
 | `collector.sampling` | How the collector sampled CPU time: `event`, `frequency_hz` (what it sampled at), `requested_frequency_hz`. Null for one that did not |
 | `signals` | What was captured: `user_cpu_samples`, `kernel_cpu_samples`, `user_stacks`, `kernel_stacks`, `off_cpu_time` (when threads went off CPU and came back, and whether they were preempted), `off_cpu_stacks` (where they went off CPU), `wakeups` (when each thread that blocked was woken, and what woke it), `syscall_calls` (how often threads called each syscall and how long the calls took), `resident_memory` (how much memory each process had resident and in swap, over time), `memory_regions` (the regions of each process's memory, as it mapped them), `region_memory` (how much each process had resident and in swap in each kind of region, over time), `page_faults` (samples of the page faults threads took, with their stacks) |
 | `missing_signals` | Signals requested but not captured, each with a `reason`. Without `kernel_cpu_samples`, CPU time spent in the kernel is not in the samples at all, not merely unnamed. Threads go off CPU in the kernel, so without kernel sampling `off_cpu_stacks` is missing too |
 | `coverage.lost_events` | Events the kernel dropped |
 | `coverage.stacks` | For a collector that takes stacks, the counts below. Null for one that takes none |
-| `coverage.stacks.unwinding` | How user stacks were walked: `frame_pointers` or `dwarf` |
+| `coverage.stacks.unwinding` | How user stacks were walked: `frame_pointers`, `dwarf`, or `unwind_tables`, as `mach` walks them: from the stack in the process's memory while its thread is held still, with the unwind tables of its images as loaded there, Apple's compact unwind info, then DWARF CFI, then frame pointers for code with neither |
 | `coverage.stacks.stack_copy_bytes` | User stack copied with each stack, as the collector used it. Null without `dwarf` |
 | `coverage.stacks.samples` | CPU samples written |
 | `coverage.stacks.page_fault_samples` | Page-fault samples written. Null without page faults |
 | `coverage.stacks.off_cpu_intervals` | Off-CPU intervals written. Null without `context_switches` |
-| `coverage.stacks.throttle_events` | Times the kernel throttled sampling. Null where the collector does not see it, as for `ebpf`, whose events have no buffer for the kernel to say so in |
+| `coverage.stacks.throttle_events` | Times the kernel throttled sampling. Null where the collector does not see it, as for `ebpf`, whose events have no buffer for the kernel to say so in, and for `mach`, which no kernel throttles: its known biases say how many of its polls came late |
 | `coverage.stacks.max_stack_depth` | Stacks deeper than this were cut |
-| `coverage.stacks.stacks_at_stack_limit` | Stacks that reached that depth. This and the next two count every stack: one per CPU or page-fault sample, one per switch out and one per wakeup |
+| `coverage.stacks.stacks_at_stack_limit` | Stacks that reached that depth. This and the next two count every stack: one per CPU or page-fault sample, one per switch out and one per wakeup, and for `mach`, one per walk, which a poll's samples and time off CPU share |
 | `coverage.stacks.stacks_cut_at_stack_copy` | Stacks that went on past the end of their stack copy, so their outer callers are missing. A copy the kernel ended early, where it could read no further, does not count. Null without `dwarf` |
 | `coverage.stacks.interpreters` | For each runtime and version whose interpreter frames the collector read, over the samples, of CPU time and page faults, of the processes that ran it: `runtime`, `version`, `processes`, `samples`, `before_found` (samples taken before uhr found the runtime, without its frames), `no_thread` (of threads it keeps no state for), `unsearched` (of threads whose state was past the 256 the collector searches), `failed` (whose frames could not be read), `cut` (whose frames went on past the 127 uhr reads), `frames`, `unread_frames` (whose code could not be read) and `unmatched`. For a runtime that keeps its frames in its memory, each call native code made into the interpreter ran a group of its frames, which goes just above that call's frames of the eval loop. An interpreter that keeps where each call starts on the native stack has each group go by where that is. For one that does not, groups are matched to the eval loop's frames in the stack, and `unmatched` counts the samples whose native stack lost some of those, so where a group went is a guess. For one that keeps them on the native stack, each takes the place of the native frame that ran it, and `unmatched` is 0. Empty for a collector that reads none |
 | `coverage.stacks.stacks_not_unwound` | Stacks of 32-bit code, which `dwarf` unwinding cannot walk. They keep only the instruction they were taken at. Null without `dwarf` |
-| `coverage.overhead_ns` | Profiler overhead. Null until it is measured. For `ebpf`, the target's CPU time in uhr's programs, from its samples, which leaves out the sampling program itself, as no sample lands in it. Null without kernel stacks, or their names, to find them by. For `procfs`, uhr's own CPU time reading `/proc` |
+| `coverage.overhead_ns` | Profiler overhead. Null until it is measured. For `ebpf`, the target's CPU time in uhr's programs, from its samples, which leaves out the sampling program itself, as no sample lands in it. Null without kernel stacks, or their names, to find them by. For `procfs`, uhr's own CPU time reading `/proc`. For `mach`, the CPU time of uhr's thread that polls, but for what it spent reading memory, which is `task_info`'s |
 | `coverage.known_biases` | Biases of this collector, in words |
 
 ## Tables
@@ -97,6 +97,14 @@ Each stream has:
 | `end_ns` | uint64, nullable | Null if the thread outlived the recording, or its exit was not seen |
 | `main` | bool | Whether it is the thread its process started with: on Linux, the one with the pid as its tid. A recording from before the column has it so |
 
+On macOS, `tid` is the kernel's id for the thread, unique since boot, which
+the main thread's is too, and `parent_tid` is null: uhr sees which process
+started a thread, not which of its threads. An exec gives a process new
+threads, whose rows start at its first poll after. A thread uhr first sees
+after its process's first poll, which polls find within one period of its
+start, starts at that poll. Its main thread is the first the kernel lists
+then, as it lists them oldest first.
+
 `thread_names`:
 
 | Column | Type | Meaning |
@@ -104,6 +112,10 @@ Each stream has:
 | `pid`, `tid` | uint32 | |
 | `time_ns` | uint64, nullable | When the name was set. Null if before the recording |
 | `name` | string | |
+
+On macOS a thread that gave itself no name has its process's, as on Linux:
+the name of the program it runs, up to 32 bytes. A rename shows at the next
+poll.
 
 `mappings`:
 
@@ -116,6 +128,18 @@ Each stream has:
 | `path` | string | File path, or a name such as `[vdso]` or `//anon`. `[kernel]` for the kernel, and the module name in brackets for a kernel module, as in `[ext4]` |
 | `build_id` | string, nullable | Hex. Null if the kernel could not read it |
 | `time_ns` | uint64, nullable | When it was mapped. Null if before the recording |
+
+On macOS a mapping is an executable segment of a Mach-O image, as dyld
+lists the images it loaded, which also holds the images of its shared cache
+that have no file of their own. `path` is the image's path as dyld has it,
+and for the program the kernel's path of it, which is absolute. `build_id` is
+the image's UUID, in lowercase hex. `file_offset` is the segment's offset
+from the image's `__TEXT` segment, which starts it, so a frame's
+`file_offset` is its address relative to the image's base. That is where the
+code is in the image's file too, as `__TEXT` starts it, and the same for an
+image of the shared cache, whose segments the cache moved apart. `time_ns`
+is null for the images already loaded at the process's first poll, and else
+the poll at which uhr found the image in dyld's list.
 
 `frames`:
 
@@ -147,6 +171,14 @@ Each stream has:
 | `mode` | string | `user`, `kernel` or `unknown` (hypervisor, guest) |
 | `stack_id` | uint32 | |
 | `cpu_ns` | uint64 | CPU time this sample stands for |
+
+On macOS a sample stands for the CPU time a thread used in one mode between
+two polls of it, which the kernel counts to the microsecond, and has the
+stack the thread had at the later poll, where it is timed. A poll's samples
+of user and kernel time share that stack, which has no kernel frames: time
+in the kernel is under the user code that entered it. `cpu` is null. A
+thread first seen after its process's first poll has its CPU time until then
+in the samples of that poll.
 
 `page_faults`, one row per sample of the page faults a thread took. The
 collector samples one fault in every period, its `page_faults.period`, and
@@ -181,6 +213,16 @@ signal, each time a blocked thread was woken comes with when and by what.
 | `waker_pid`, `waker_tid` | uint32, nullable | The thread that woke it, the target's or another process's. Null unless `woken_by` is `thread` |
 | `waker_name` | string, nullable | That thread's name then |
 | `waker_stack_id` | uint32, nullable | Where it was woken: the kernel's frames, leaf first from `try_to_wake_up`, then the waking thread's user frames if it is one of the target's. An interrupt's end at the kernel's entry for it, and a softirq's at the function that runs softirqs, as the code they ran on top of had no certain part in it. Null if not recorded |
+
+On macOS the times off CPU come from polls, not switches. A thread that did
+not run between two polls was off CPU all that time: `blocked`, with the
+stack it had, if it waited for something other than a CPU at the later
+poll, `runnable` if it could run, and `unknown` if it was stopped. One that
+ran was off CPU for the rest of the time, which goes to the wait it was in
+at the earlier poll, if it was in one, and else is a row in an `unknown`
+state without a stack. A wait that goes on across polls is one row. So a row
+starts and ends at polls, or where its thread's CPU time ends, and can hold
+several waits shorter than a period between polls.
 
 `kernel_symbols`, sorted by `start`, with ranges that don't overlap. The
 kernel moves to a random address on every boot, and modules come and go, so
@@ -267,6 +309,16 @@ through a thread that still runs.
 | `rss_shmem_bytes` | uint64 | Resident shared memory. The three add up to its resident memory, which counts pages shared with other processes in each of them |
 | `swap_bytes` | uint64 | Its own memory the kernel moved out to swap |
 | `peak_rss_bytes` | uint64 | The most it had resident since it started, or last exec'd, as the kernel tracks it: between readings too |
+| `footprint_bytes` | uint64, nullable | What macOS counts against the process, as Activity Monitor shows it and the system reclaims memory by: its own memory that is not a clean page of a file, resident or compressed. Null on Linux, which does not count it, and in a recording from before the column |
+
+On macOS uhr reads each process's counts with `task_info` every 100 ms,
+from its first poll until the capture ends or the process does.
+`rss_anon_bytes` is what the kernel calls the process's internal memory,
+`rss_file_bytes` its external memory, pages of files, and the two add up to
+the resident memory `ps` shows. `rss_shmem_bytes` is 0: macOS counts shared
+memory in the other two. `swap_bytes` is its memory the kernel compressed,
+which macOS keeps in RAM, in less room, until it moves it out to disk, and
+`peak_rss_bytes` the most it had resident.
 
 `regions`, one row per region of memory a process mapped, from perf's
 records of mapping memory, which it writes when page faults are sampled.

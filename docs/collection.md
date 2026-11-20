@@ -66,8 +66,8 @@ asks otherwise. Deeper signals are added when the question needs them.
 |---|---|---|---|---|
 | Per-thread CPU time, user and kernel | time level 0, cheap | `/proc/<pid>/task/<tid>/stat` | thread info APIs | `GetThreadTimes` |
 | Resident memory by category | memory level 0 | `status`, `smaps_rollup`, `smaps` | `task_info`, `vmmap` | working set APIs |
-| On-CPU stack sampling, user and kernel | time levels 2-5 | perf, eBPF | samply, xctrace Time Profiler | ETW, samply |
-| Off-CPU and thread state | time level 0, locks, I/O | perf context switches, eBPF on scheduler tracepoints and wakeups | xctrace System Trace | ETW context switches |
+| On-CPU stack sampling, user and kernel | time levels 2-5 | perf, eBPF | uhr's own sampler, user stacks only; samply, xctrace Time Profiler | ETW, samply |
+| Off-CPU and thread state | time level 0, locks, I/O | perf context switches, eBPF on scheduler tracepoints and wakeups | uhr's own sampler, by thread state at each poll; xctrace System Trace | ETW context switches |
 | Syscalls | time level 1 | eBPF on `raw_syscalls` tracepoints, `perf trace` | xctrace System Trace | ETW syscall events |
 | Mixed native and runtime stacks | time levels 2-4 for runtimes | uhr's eBPF collector, perf with runtime perf maps, py-spy `--native` | runtime profilers (limited) | runtime profilers |
 | Runtime CPU profiles | time levels 2-4 | async-profiler, V8 `--cpu-prof`, Go pprof, rbspy, dotnet-trace | same | same |
@@ -82,8 +82,9 @@ asks otherwise. Deeper signals are added when the question needs them.
 Platform depth will differ:
 - Linux gets full depth through perf_event and eBPF.
 - Windows ETW covers context switches, syscalls and kernel stacks.
-- macOS is the most restricted (SIP limits DTrace), so it relies on xctrace
-  and the task and thread APIs.
+- macOS is the most restricted (SIP limits DTrace), so uhr samples it with a
+  sampler of its own through the task and thread APIs, which see no kernel
+  stacks, and xctrace is the candidate for what they don't see.
 
 The coverage matrix must state this per signal instead of promising parity.
 
@@ -402,6 +403,122 @@ which takes the process's memory lock and costs by its size.
 - The stream's overhead is uhr's own CPU time reading `/proc`, which the
   kernel spends on the target's counts but not in the target.
 
+### uhr's sampler on macOS
+
+On macOS uhr samples with a sampler of its own, in uhr's process, through
+the task port of each of the target's processes. It polls every thread of
+them 999 times a second by default (`-F`), at fixed deadlines.
+
+- At each poll it reads each thread's CPU time, in user and in kernel mode,
+  and its run state, with one `thread_info` through the port uhr holds for
+  it. It lists the task's threads again only when the kernel counts other
+  threads than uhr follows, which `proc_pidinfo` says, or one could not be
+  polled, as one that exited, so it finds a new thread at the first poll
+  after the thread starts.
+- The CPU time a thread used between two polls becomes a sample in each
+  mode at the later poll, with the stack it has then, as a CPU-clock
+  sampler takes one at the end of its period. Totals are what the kernel
+  counts, to the microsecond, and time is put on the stack at the poll. A
+  thread first seen after its process's first poll has its CPU time so far
+  sampled there.
+- The rest of the time between two polls the thread was off CPU: all of it
+  for a thread that did not run, with its stack, `blocked` if it waited and
+  `runnable` if it could run, and for one that ran, the part it did not,
+  which goes to the wait it was in at the earlier poll, or else is time off
+  CPU in an unknown state, without a stack.
+- A waiting thread whose CPU time did not move since the last poll ran none
+  of its code, so its stack is the one it had: the kernel brings a thread's
+  count up to date as it blocks, and an idle thread costs one call. A thread
+  that can run is held still and walked at every poll, whether or not its
+  count moved: the kernel counts the time of a thread on a CPU only as it
+  enters the kernel. On an M5, a quarter of 1 ms polls of a thread that
+  spun found its count unchanged, and it jumped by up to 10.4 ms, a
+  scheduler quantum. Held still, its count is up to date.
+- To walk a stack, uhr holds the thread still with `thread_suspend`, reads
+  its registers, and walks with `framehop`, from each image's unwind tables
+  as loaded in the process: Apple's compact unwind info, then DWARF CFI,
+  then frame pointers for code with neither, as JIT code. Each image's
+  `__TEXT` is mapped from the target with one copy-on-write `mach_vm_read`,
+  which covers the images of the dyld shared cache, which have no file of
+  their own. On arm64 the pointer authentication bits of return addresses
+  are stripped. A walk reads the stack in 4 KiB chunks, at most 64 of them,
+  and up to 512 frames. A thread of a busy C program was held 16 µs on
+  average, and with 8 of them busy, 38 µs. Should uhr be killed while it
+  holds a thread, which no handler can catch, the thread stays held.
+- uhr reads the images dyld loaded from the list it keeps for debuggers,
+  `dyld_all_image_infos`, at each process's first poll, and again when its
+  stamp moves, which costs one 8-byte read a poll. Each executable segment
+  of an image is a mapping, by the image's path and UUID, and the program's
+  path is the kernel's, which is absolute.
+- There are no kernel stacks: time in the kernel is under the user code
+  that entered it, whose stack, on a thread in a syscall, ends in the
+  function of `libsystem_kernel` that made the call, named for it, as
+  `read` or `__psynch_cvwait`. Grouping by syscall takes the name from
+  there. Kernel time at a stack that ends elsewhere, as in a page fault, is
+  in no known syscall. Wakeups, syscall counts, page faults and the regions
+  of memory are not recorded.
+- Its overhead is the CPU time of uhr's thread that polls. With one thread
+  of the target busy, it took 31 ms of CPU in 2 s, 1.5% of a CPU, and with
+  500 idle threads beside it, 477 ms. samply took about 30 and 560 ms on
+  the same programs. With 8 busy threads it took 219 ms, and 159 of 2,000
+  polls came late. A poll that comes late puts the time since the last on
+  fewer, later stacks, and the recording counts them.
+- Threads that start and exit between two polls are not seen, and the CPU
+  time a thread used after its last poll, before it exited, is not counted.
+- To launch a target without root, uhr registers a Mach service under a
+  random name, and starts the program with `DYLD_INSERT_LIBRARIES` naming a
+  small library of its own, written once to `$TMPDIR` and never removed, as
+  processes the target leaves running keep the variable, and dyld ends a
+  process whose inserted library is missing. The library's constructor
+  sends the service `mach_task_self()`, which a process can always give
+  away, and waits for an answer, so uhr polls the process first before its
+  own code runs. Every process the target starts inherits the variables, so
+  each says hello as it starts: a forked child at once, from a handler the
+  library registers with `pthread_atfork`, and a program it execs from its
+  constructor. An exec gives the process a new task and new threads, whose
+  hello ends the old ones. Each waits up to a period for uhr. Once the
+  capture ends, a process that says hello goes on unrecorded.
+- dyld ignores the variables in programs System Integrity Protection
+  protects, as those in `/bin`, `/usr/bin` and `/System`, and in all they
+  run, as a script that starts with `#!/usr/bin/env`, and in programs that
+  are restricted, set-user-ID, or signed for the hardened runtime without
+  both the `allow-dyld-environment-variables` and
+  `disable-library-validation` entitlements. uhr reads all this from the
+  program's file, and the interpreter of a script, before it launches, and
+  fails with how to fix it, as to run a script with an interpreter
+  Homebrew installed, or to sign a build again without the hardened
+  runtime, with `codesign -s - -f <program>`. A program that exits without
+  saying hello fails the recording too, and one that runs 5 s without, a
+  warning.
+- With `--pid`, uhr attaches with `task_for_pid`, which macOS allows only to
+  root, or to a program signed with the debugger entitlement, and for no
+  process that System Integrity Protection or the hardened runtime
+  protects. It follows no process the attached one starts, which load no
+  library of uhr's, and never signals it: the capture ends at an interrupt,
+  at the end of `--duration`, or when the process exits, whose status is
+  then unknown.
+- Interrupts end a launched target's capture as on Linux: the first stops
+  it and waits for the target, a signal sent to uhr alone is passed on, and
+  a second kills the target.
+- The system's own code changes only with an update of the system, which
+  replaces the shared cache and the files System Integrity Protection
+  protects, as `dyld`, so uhr reads the names of their functions that
+  frames fall in right after recording, and the recording keeps them.
+
+### Memory on macOS
+
+uhr reads each of the target's processes' counts with
+`task_info(TASK_VM_INFO)` every 100 ms, unless `uhr record --no-memory`:
+its own memory resident, which the kernel calls internal, its pages of
+files, which it calls external, and which add up to the resident memory
+`ps` shows, the memory the kernel compressed, which macOS keeps in RAM in
+less room until it moves it to disk, the most it had resident, and its
+footprint, what Activity Monitor shows and the system reclaims memory by:
+its memory that is not a clean page of a file, resident or compressed. A
+program whose heap grew by 200 MiB, and which then read a 71 MiB file, had
+273 MiB resident, as `ps` said too, and a footprint of 201 MiB. The
+stream's overhead is uhr's own CPU time reading the counts.
+
 ## Cost control
 
 - Aggregate in the kernel by default: counts, total time and latency
@@ -650,6 +767,13 @@ uhr can stop everything it started, which cancellation needs.
 - Common blockers: `perf_event_paranoid`, `kptr_restrict`, CAP_PERFMON and
   CAP_BPF, container capabilities, macOS code signing for attaching, missing
   debug info and frame pointers.
+- On macOS, launching needs no privileges, and `doctor` checks it by
+  launching uhr's own executable with its library and waiting for its task
+  port. Attaching needs root, or uhr signed with the
+  `com.apple.security.cs.debugger` entitlement, and `doctor` says which uhr
+  has. It also says what macOS lets no recording have: kernel stacks,
+  wakeups, syscall counts, page faults and the regions of memory, and which
+  programs dyld leaves uhr's library out of.
 - `doctor` must report exactly what is missing for the requested signals on
   this target and host, and how to fix it.
 - The current `doctor` tests the selected perf executable by recording `true`

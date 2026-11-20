@@ -564,6 +564,7 @@ impl Counts {
             rss_shmem_bytes: self.rss_shmem,
             swap_bytes: self.swap,
             peak_rss_bytes: self.peak_rss,
+            footprint_bytes: None,
         }
     }
 }

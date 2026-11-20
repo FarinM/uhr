@@ -117,6 +117,10 @@ pub struct MemoryUsage {
     /// The most it had resident since it started, or last exec'd, as the
     /// kernel tracked it: between readings too, and before the capture.
     pub peak_rss_bytes: u64,
+    /// What macOS counts against the process: its own memory that is not a
+    /// clean page of a file, resident or compressed. `None` where it is not
+    /// counted, as on Linux.
+    pub footprint_bytes: Option<u64>,
 }
 
 /// The end is exclusive when the time filter sets it, like the filter.
@@ -485,7 +489,9 @@ fn memory(
         .iter()
         .filter(|s| s.signals.contains(&Signal::ResidentMemory))
         .find_map(|s| match s.collector {
-            Collector::Procfs { interval_ns } => Some(interval_ns),
+            Collector::Procfs { interval_ns } | Collector::TaskInfo { interval_ns } => {
+                Some(interval_ns)
+            }
             _ => None,
         })?;
     let mut lives: HashMap<(u32, Option<usize>), Vec<&MemoryReading>> = HashMap::new();
@@ -531,6 +537,7 @@ fn memory(
         rss_shmem_bytes: reading.rss_shmem_bytes,
         swap_bytes: reading.swap_bytes,
         peak_rss_bytes: reading.peak_rss_bytes,
+        footprint_bytes: reading.footprint_bytes,
     };
     let mut processes: Vec<MemoryRow> = lives
         .into_iter()

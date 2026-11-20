@@ -852,7 +852,10 @@ fn log_summary(recording: &Recording, out: &Path) {
         {
             let sampler = match stream.collector {
                 Collector::Perf { .. } => "perf",
-                Collector::Ebpf { .. } | Collector::Procfs { .. } => "uhr",
+                Collector::Ebpf { .. }
+                | Collector::Procfs { .. }
+                | Collector::Mach { .. }
+                | Collector::TaskInfo { .. } => "uhr",
             };
             warn!(
                 requested_hz = sampling.requested_frequency_hz,

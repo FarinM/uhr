@@ -1,11 +1,11 @@
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 mod signals;
 
 use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -16,7 +16,7 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::LevelFilter;
 use uhr_core::call_paths;
 use uhr_core::doctor::Report;
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 use uhr_core::doctor::{Check, Status};
 use uhr_core::export;
 use uhr_core::filter::Filter;
@@ -29,7 +29,7 @@ use uhr_core::symbols;
 use uhr_core::text;
 use uhr_core::wall_clock::{self, Time};
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use signals::{Handlers, INTERRUPTS};
 #[cfg(target_os = "linux")]
 use uhr_linux::perf::{self, RecordOptions, Sampler, Target, Unwind};
@@ -52,8 +52,7 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Record a command, or a running process, with perf and write a
-    /// recording
+    /// Record a command, or a running process, and write a recording
     Record(RecordArgs),
     /// Resolve function names in a recording against the files on this machine
     Symbolize { recording: PathBuf },
@@ -161,7 +160,7 @@ enum Command {
 }
 
 #[derive(Args)]
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
 struct RecordArgs {
     /// Directory for the recording. Must not exist
     #[arg(short, long)]
@@ -540,13 +539,18 @@ fn host_report() -> Report {
     uhr_linux::doctor::check()
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
+fn host_report() -> Report {
+    uhr_macos::doctor::check()
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn host_report() -> Report {
     Report {
         checks: vec![Check {
             status: Status::Blocked,
             detail: format!(
-                "uhr records on Linux only, so far, not on {}",
+                "uhr records on Linux and macOS only, so far, not on {}",
                 std::env::consts::OS
             ),
             fix: None,
@@ -605,9 +609,52 @@ fn run_record(args: RecordArgs) -> Result<ExitCode> {
     run_symbolize(&args.output)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
+fn run_record(args: RecordArgs) -> Result<ExitCode> {
+    use uhr_macos::{RecordOptions, Target};
+
+    // What only Linux's samplers do, rather than silently left out.
+    let linux_only = [
+        (args.sampler.is_some(), "--sampler"),
+        (args.unwind == UnwindArg::Dwarf, "--unwind dwarf"),
+        (args.stack_size.is_some(), "--stack-size"),
+        (!args.skip_syscall.is_empty(), "--skip-syscall"),
+    ];
+    if let Some((_, flag)) = linux_only.iter().find(|(given, _)| *given) {
+        bail!(
+            "{flag} is for Linux only: on macOS uhr samples with its own sampler, which walks \
+             stacks with the images' unwind tables and counts no syscalls"
+        );
+    }
+    let target = match args.pid {
+        Some(pid) => Target::Attach {
+            pid,
+            duration: args.duration.map(Duration::from_nanos),
+        },
+        None => Target::Launch(args.command),
+    };
+    let options = RecordOptions {
+        target,
+        frequency_hz: args.frequency,
+        off_cpu: !args.no_off_cpu,
+        memory: !args.no_memory,
+        wakeups: !args.no_wakeups,
+        syscalls: !args.no_syscalls,
+        page_faults: !args.no_page_faults,
+    };
+    let handlers = Handlers::install().context("installing the signal handlers")?;
+    let recorded = uhr_macos::record(&options, &INTERRUPTS, &args.output);
+    drop(handlers);
+    recorded?;
+    if args.no_symbolize {
+        return Ok(ExitCode::SUCCESS);
+    }
+    run_symbolize(&args.output)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn run_record(_: RecordArgs) -> Result<ExitCode> {
-    bail!("uhr records on Linux only, so far")
+    bail!("uhr records on Linux and macOS only, so far")
 }
 
 fn run_mcp() -> Result<ExitCode> {

@@ -274,7 +274,10 @@ pub(crate) fn counted(recording: &Recording, filter: &Filter) -> Option<CountedC
                 Collector::Ebpf {
                     call_interval_ns, ..
                 } => call_interval_ns,
-                Collector::Perf { .. } | Collector::Procfs { .. } => None,
+                Collector::Perf { .. }
+                | Collector::Procfs { .. }
+                | Collector::Mach { .. }
+                | Collector::TaskInfo { .. } => None,
             })?;
             if rows.iter().any(|c| c.interval_start_ns.is_none()) {
                 return None;

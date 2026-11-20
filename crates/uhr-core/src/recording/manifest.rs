@@ -157,15 +157,24 @@ pub enum Collector {
         /// How often it read them.
         interval_ns: u64,
     },
+    /// uhr's own sampler on macOS, which polls each thread's CPU time and
+    /// state through its process's task port, and walks the stack of each
+    /// thread that ran since the last poll.
+    Mach { sampling: Option<Sampling> },
+    /// uhr reading each process's memory counts with `task_info` on macOS.
+    TaskInfo {
+        /// How often it read them.
+        interval_ns: u64,
+    },
 }
 
 impl Collector {
     pub fn sampling(&self) -> Option<&Sampling> {
         match self {
-            Collector::Perf { sampling, .. } | Collector::Ebpf { sampling, .. } => {
-                sampling.as_ref()
-            }
-            Collector::Procfs { .. } => None,
+            Collector::Perf { sampling, .. }
+            | Collector::Ebpf { sampling, .. }
+            | Collector::Mach { sampling } => sampling.as_ref(),
+            Collector::Procfs { .. } | Collector::TaskInfo { .. } => None,
         }
     }
 }
@@ -194,6 +203,11 @@ pub enum Unwinding {
     /// From each sample's copy of the user stack, with the unwind tables of
     /// the mapped files.
     Dwarf,
+    /// From the stack in the process's memory while its thread is held
+    /// still, with the unwind tables of its images as loaded there: compact
+    /// unwind info, then DWARF CFI, then frame pointers for code with
+    /// neither.
+    UnwindTables,
 }
 
 /// CPU samples are split by mode because a sampler can leave one mode out,

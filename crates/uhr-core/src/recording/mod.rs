@@ -325,6 +325,10 @@ pub struct MemoryReading {
     /// The most it had resident since it started, or last exec'd, as the
     /// kernel tracks it, between readings too.
     pub peak_rss_bytes: u64,
+    /// What macOS counts against the process: its own memory that is not a
+    /// clean page of a file, resident or compressed. `None` on Linux, which
+    /// does not count it.
+    pub footprint_bytes: Option<u64>,
 }
 
 impl MemoryReading {
@@ -655,7 +659,10 @@ impl Recording {
         let streams = &self.manifest.streams;
         let tags = streams.iter().find_map(|s| match &s.collector {
             Collector::Ebpf { programs, .. } => Some(programs),
-            Collector::Perf { .. } | Collector::Procfs { .. } => None,
+            Collector::Perf { .. }
+            | Collector::Procfs { .. }
+            | Collector::Mach { .. }
+            | Collector::TaskInfo { .. } => None,
         })?;
         let sampled = streams
             .iter()
@@ -672,7 +679,10 @@ impl Recording {
                 Collector::Ebpf {
                     skipped_syscalls, ..
                 } => &skipped_syscalls[..],
-                Collector::Perf { .. } | Collector::Procfs { .. } => &[],
+                Collector::Perf { .. }
+                | Collector::Procfs { .. }
+                | Collector::Mach { .. }
+                | Collector::TaskInfo { .. } => &[],
             })
             .map(String::as_str)
             .collect()
@@ -973,6 +983,10 @@ impl Recording {
                 Column::u64(
                     "peak_rss_bytes",
                     memory.iter().map(|m| m.peak_rss_bytes).collect(),
+                ),
+                Column::optional_u64(
+                    "footprint_bytes",
+                    memory.iter().map(|m| m.footprint_bytes).collect(),
                 ),
             ],
         )?;
@@ -1533,6 +1547,7 @@ fn read_memory(dir: &Path) -> Result<Vec<MemoryReading>> {
     let rss_shmem_bytes = table.u64("rss_shmem_bytes")?;
     let swap_bytes = table.u64("swap_bytes")?;
     let peak_rss_bytes = table.u64("peak_rss_bytes")?;
+    let footprint_bytes = table.added_u64("footprint_bytes")?;
     Ok((0..table.len())
         .map(|i| MemoryReading {
             time_ns: time_ns[i],
@@ -1542,6 +1557,7 @@ fn read_memory(dir: &Path) -> Result<Vec<MemoryReading>> {
             rss_shmem_bytes: rss_shmem_bytes[i],
             swap_bytes: swap_bytes[i],
             peak_rss_bytes: peak_rss_bytes[i],
+            footprint_bytes: footprint_bytes[i],
         })
         .collect())
 }
