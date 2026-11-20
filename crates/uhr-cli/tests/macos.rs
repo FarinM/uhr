@@ -1,7 +1,7 @@
 //! End to end on macOS, with uhr's own sampler: needs a C compiler, and
-//! for the frames of runtimes, Python 3.11 or later and Node 20 to 24
-//! outside the directories System Integrity Protection protects, as
-//! Homebrew installs them. The test of a runtime that is missing checks
+//! for the frames of runtimes, Python 3.11 or later, Node 20 to 24 and
+//! Bun 1.4.3 outside the directories System Integrity Protection protects,
+//! as Homebrew installs them. The test of a runtime that is missing checks
 //! nothing. `uhr doctor` shows what is missing.
 #![cfg(target_os = "macos")]
 
@@ -301,6 +301,20 @@ fn node() -> Option<PathBuf> {
     node
 }
 
+/// A `bun` whose frames uhr reads: the release whose offsets it knows, of
+/// which uhr knows the build for arm64.
+fn bun() -> Option<PathBuf> {
+    let bun = find("bun").filter(|bun| {
+        let output = Command::new(bun).arg("--revision").output();
+        cfg!(target_arch = "aarch64")
+            && output.is_ok_and(|output| output.stdout.starts_with(b"1.4.3+c6da4a4d3"))
+    });
+    if bun.is_none() {
+        eprintln!("skipped: needs Bun 1.4.3 for arm64");
+    }
+    bun
+}
+
 /// What the stream says of the interpreters whose frames it read.
 fn interpreters(recording: &Path) -> Vec<Value> {
     let manifest = manifest(recording);
@@ -481,4 +495,48 @@ fn reads_the_frames_of_node() {
     record(&recording, &[node.to_str().unwrap(), &program, "50"]);
     has_the_split_of(recording.to_str().unwrap(), "node", "jit.js");
     read_the_frames(&recording, "node", 0.01);
+}
+
+#[test]
+fn reads_the_frames_of_bun() {
+    let Some(bun) = bun() else {
+        return;
+    };
+    let dir = scratch("macos_bun");
+    let recording = dir.join("rec");
+    let program = format!("{PROGRAMS}/jit.js");
+    record(&recording, &[bun.to_str().unwrap(), &program, "100"]);
+    has_the_split_of(recording.to_str().unwrap(), "bun", "jit.js");
+    read_the_frames(&recording, "bun", 0.01);
+}
+
+/// That the functions of await.js that waited for inner() have the time it
+/// worked for, once resumed, with none of them on the stack.
+fn has_the_functions_that_waited(runtime: &Path, name: &str) {
+    let dir = scratch(&format!("macos_{name}_await"));
+    let recording = dir.join("rec");
+    let program = format!("{PROGRAMS}/await.js");
+    record(&recording, &[runtime.to_str().unwrap(), &program, "60"]);
+    let result = functions(recording.to_str().unwrap());
+    let total = |function: &str| {
+        runtime_function(&result, name, function)["total_share"]
+            .as_f64()
+            .unwrap()
+    };
+    let work = total("work");
+    assert!(work > 0.5, "{work}");
+    for function in ["inner", "middle", "outer", "main"] {
+        let waited = total(function);
+        assert!(waited >= work - 0.05, "{function}: {waited} of {work}");
+    }
+}
+
+#[test]
+fn names_the_functions_that_wait_for_one() {
+    if let Some(node) = node() {
+        has_the_functions_that_waited(&node, "node");
+    }
+    if let Some(bun) = bun() {
+        has_the_functions_that_waited(&bun, "bun");
+    }
 }

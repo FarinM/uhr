@@ -593,18 +593,19 @@ programs read the frames of:
 - JavaScriptCore as Bun 1.4.3 runs it, by its build id. Bun's releases keep
   no symbols, and JavaScriptCore publishes no offsets, so they are those
   found in the build with symbols Bun publishes with each release, from the
-  code that reads them, and other releases are not read. Each JavaScript
+  code that reads them, and other releases are not read. Of 1.4.3's builds,
+  uhr knows those for x86-64 Linux and arm64 macOS. Each JavaScript
   function's frame holds its `CodeBlock`, whose executable names it and its
   script. Where the build with symbols is kept by its build id with the
   system's debug info, it also names the interpreter's code, so that its
-  frames take the place of the interpreter's native ones; without it they
-  go just above them. Lines are not read yet. An async function that is
-  resumed gets its `JSAsyncFunctionGenerator` as an argument, which holds
-  the promise of its result, and a pending promise that of the function
-  that waits for it, or the promise of the `Promise.all`, `allSettled` or
-  `any` it is one of, as JavaScriptCore's own async stack traces follow
-  them. What `.then` or `Promise.race` waits for ends there, and so does a
-  promise more than one function waits for.
+  frames take the place of the interpreter's native ones; without it they go
+  just above them. Lines are not read yet. An async function that is resumed
+  gets its `JSAsyncFunctionGenerator` as an argument, which holds the
+  promise of its result, and a pending promise that of the function that
+  waits for it, or the promise of the `Promise.all`, `allSettled` or `any`
+  it is one of, as JavaScriptCore's own async stack traces follow them. What
+  `.then` or `Promise.race` waits for ends there, and so does a promise more
+  than one function waits for.
 - CRuby 3.2, in a `ruby` program or a `libruby`, from the headers of 3.2.
   CRuby keeps its frames in an array in each thread's execution context,
   which the thread-local `ruby_current_ec` points to, and says the line of
@@ -744,10 +745,14 @@ walked alike, so time off CPU has the runtime's frames too. Between a
 process's exec and the next program's hello, the program's memory is gone,
 and walks that fail then count as none. Checked with Homebrew's CPython
 3.13, a framework build whose library is named `Python`, and Node 24 from
-nodejs.org, on arm64. The other runtimes' frames are not read on macOS yet:
-CRuby's state is in a thread-local, which uhr finds only in ELF files, Bun's
-frames are read by the build ids of its releases for Linux, HotSpot's
-library is looked for as `libjvm.so`, and PHP and Lua are not checked.
+nodejs.org, on arm64. Bun 1.4.3's build for arm64 is read by its UUID, with
+the offsets of its build for Linux, which name its functions, their scripts
+and the async functions that wait there as on Linux. No debug info names its
+interpreter's code on macOS, so the frames it runs go just above the
+interpreter's native ones. Bun's builds for x86-64 Macs are not read. The
+other runtimes' frames are not read on macOS yet: CRuby's state is in a
+thread-local, which uhr finds only in ELF files, HotSpot's library is looked
+for as `libjvm.so`, and PHP and Lua are not checked.
 
 ## Unwinding and symbols
 

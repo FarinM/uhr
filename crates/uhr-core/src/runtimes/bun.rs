@@ -64,28 +64,43 @@ struct Layout {
     group_tasks: (u32, u32),
 }
 
-const LAYOUTS: [([u8; 20], Layout); 1] = [(
-    [
-        0xa9, 0xea, 0x37, 0x07, 0xc3, 0x2f, 0x24, 0x2d, 0xc5, 0xec, 0x7f, 0xee, 0x3c, 0x5f, 0xdd,
-        0x9b, 0xc9, 0x98, 0x93, 0xb3,
-    ],
-    Layout {
-        version: "1.4.3",
-        code_block_type: 18,
-        unlinked: 0x38,
-        unlinked_flags: 0x18,
-        code_type_shift: 44,
-        executable: 0x40,
-        unlinked_function: 0x50,
-        function_name: 0x40,
-        provider: 0x28,
-        url: 0x48,
-        async_function_type: 76,
-        promise_type: 87,
-        code_block: 0x58,
-        group_tasks: (8, 10),
-    },
-)];
+const BUN_1_4_3: Layout = Layout {
+    version: "1.4.3",
+    code_block_type: 18,
+    unlinked: 0x38,
+    unlinked_flags: 0x18,
+    code_type_shift: 44,
+    executable: 0x40,
+    unlinked_function: 0x50,
+    function_name: 0x40,
+    provider: 0x28,
+    url: 0x48,
+    async_function_type: 76,
+    promise_type: 87,
+    code_block: 0x58,
+    group_tasks: (8, 10),
+};
+
+/// The builds whose offsets uhr knows, by build id, on macOS the Mach-O
+/// UUID.
+const LAYOUTS: [(&[u8], Layout); 2] = [
+    // Linux, x86-64.
+    (
+        &[
+            0xa9, 0xea, 0x37, 0x07, 0xc3, 0x2f, 0x24, 0x2d, 0xc5, 0xec, 0x7f, 0xee, 0x3c, 0x5f,
+            0xdd, 0x9b, 0xc9, 0x98, 0x93, 0xb3,
+        ],
+        BUN_1_4_3,
+    ),
+    // macOS, arm64.
+    (
+        &[
+            0x4c, 0x4c, 0x44, 0xb0, 0x55, 0x55, 0x31, 0x44, 0xa1, 0x92, 0x22, 0xcb, 0x6d, 0xd5,
+            0x8b, 0x41,
+        ],
+        BUN_1_4_3,
+    ),
+];
 
 /// JavaScriptCore's `CallFrame`, from its frame pointer: the `CodeBlock`,
 /// then the callee. Past them come how many arguments it has, `this`, and
