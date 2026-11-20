@@ -442,9 +442,15 @@ them 999 times a second by default (`-F`), at fixed deadlines.
   which covers the images of the dyld shared cache, which have no file of
   their own. On arm64 the pointer authentication bits of return addresses
   are stripped. A walk reads the stack in 4 KiB chunks, at most 64 of them,
-  and up to 512 frames. A thread of a busy C program was held 16 µs on
-  average, and with 8 of them busy, 38 µs. Should uhr be killed while it
-  holds a thread, which no handler can catch, the thread stays held.
+  and up to 512 frames, and keeps where each frame ends on the stack, its
+  caller's stack pointer. The frames of a runtime the thread runs are then
+  read while it is still held, through the same chunks, up to 128 in all,
+  as the frames a runtime keeps lie near each other and each read is a
+  call that keeps the thread held longer ([runtimes](#runtimes)). A thread
+  of a busy C program was held 16 µs on average, and with 8 of them busy,
+  38 µs; one running CPython 20 µs, and Node 26 µs. Should uhr be killed
+  while it holds a thread, which no handler can catch, the thread stays
+  held.
 - uhr reads the images dyld loaded from the list it keeps for debuggers,
   `dyld_all_image_infos`, at each process's first poll, and again when its
   stamp moves, which costs one 8-byte read a poll. Each executable segment
@@ -719,6 +725,29 @@ goes just above it: a function that sets up no frame keeps its caller's
 frame pointer, so that the walk lost the caller, whose frame it is. One
 whose code could not be read stays the native frame. Frames of a version
 uhr does not know stay the interpreter's own, and the recording says why.
+
+On macOS uhr's sampler walks the same descriptions in user space, while it
+holds the thread still after walking its native stack, with the same
+searches and limits as the eBPF programs, and writes what it found as they
+do, so each runtime reads both alike. The ends of native frames come from
+the unwind tables, so a group goes just above the native frame its call
+started in, and a frame on the native stack takes the place of the one that
+ran it, whether or not the code has frame pointers. uhr looks for a
+process's runtime at its first poll, and again each time dyld lists more
+images, in the Mach-O files the process maps, by the slice with the recorded
+UUID. Mach-O symbols say nothing of where they end, so each ends where the
+next function, as `LC_FUNCTION_STARTS` lists them, or symbol starts. A
+runtime keeps the kernel's id of each thread, as CPython keeps its native
+id, which on macOS is the id the sampler polls the thread by. The code each
+frame ran is read once the thread runs again. The stack a thread waits at is
+walked alike, so time off CPU has the runtime's frames too. Between a
+process's exec and the next program's hello, the program's memory is gone,
+and walks that fail then count as none. Checked with Homebrew's CPython
+3.13, a framework build whose library is named `Python`, and Node 24 from
+nodejs.org, on arm64. The other runtimes' frames are not read on macOS yet:
+CRuby's state is in a thread-local, which uhr finds only in ELF files, Bun's
+frames are read by the build ids of its releases for Linux, HotSpot's
+library is looked for as `libjvm.so`, and PHP and Lua are not checked.
 
 ## Unwinding and symbols
 

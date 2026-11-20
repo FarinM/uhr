@@ -12,9 +12,8 @@ use std::thread::{self, JoinHandle};
 use aya::maps::{HashMap as BpfHashMap, MapData};
 use tracing::{debug, warn};
 use uhr_core::recording::Mapping;
-use uhr_core::runtimes::{
-    self, Code, Frames, Interpreter, Memory, Process, States, Step, Thread, WalkedFrame,
-};
+use uhr_core::runtimes::stacks::code_addresses;
+use uhr_core::runtimes::{self, Code, Frames, Interpreter, Memory, Process, States, Step, Thread};
 use uhr_ebpf::{MAX_FRAME_CHECKS, MAX_NEXT, MAX_PATH, MAX_READS, MAX_WALKED_BYTES, ONE_LIST, walk};
 
 use crate::launch::monotonic_ns;
@@ -218,17 +217,9 @@ fn find(receiver: Receiver<Walked>, mut maps: Maps, frame_pointers: bool) -> Int
                 }
                 // Each after its address.
                 let bytes = walked.frame_bytes.max(9) as usize;
-                let on_stack =
-                    (walked.frames.len() / bytes).saturating_sub(walked.awaited as usize);
-                for (at, frame) in walked.frames.chunks_exact(bytes).enumerate() {
-                    let code = match interpreter.frame(&frame[8..]) {
-                        _ if at >= on_stack => interpreter.waiting(&frame[8..]),
-                        WalkedFrame::Code { code, .. } => Some(code),
-                        _ => None,
-                    };
-                    let Some(code) = code else {
-                        continue;
-                    };
+                let codes =
+                    code_addresses(interpreter, &walked.frames, bytes, walked.awaited as usize);
+                for code in codes {
                     if found.code.contains_key(&(program, code)) {
                         continue;
                     }

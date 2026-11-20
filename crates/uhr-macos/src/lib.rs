@@ -6,6 +6,8 @@
 
 #[cfg(target_os = "macos")]
 pub mod doctor;
+#[cfg(target_os = "macos")]
+mod held;
 mod images;
 #[cfg(target_os = "macos")]
 mod launch;
@@ -17,6 +19,8 @@ mod polling;
 mod process;
 #[cfg(target_os = "macos")]
 mod record;
+#[cfg(target_os = "macos")]
+mod runtime;
 #[cfg(target_os = "macos")]
 mod unwind;
 

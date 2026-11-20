@@ -275,6 +275,21 @@ impl Interpreters {
         })
     }
 
+    /// Counts `samples` of `program` taken before uhr found its interpreter,
+    /// `of`, which have none of its frames.
+    pub fn add_before_found(&mut self, program: Program, of: &dyn Interpreter, samples: u64) {
+        if samples == 0 {
+            return;
+        }
+        let walks = self
+            .walks
+            .entry((of.runtime(), of.version().to_owned()))
+            .or_default();
+        walks.processes.insert(program.0);
+        walks.samples += samples;
+        walks.before_found += samples;
+    }
+
     /// How the walks of each runtime and version went, for a stream's
     /// coverage.
     pub fn coverage(&self) -> Vec<InterpreterCoverage> {
@@ -296,6 +311,29 @@ impl Interpreters {
             })
             .collect()
     }
+}
+
+/// The code each frame a walk found runs, of `interpreter`, from its
+/// records of `record_bytes`, the last `awaited` of functions that waited:
+/// what to read while the process still has it.
+pub fn code_addresses(
+    interpreter: &dyn Interpreter,
+    records: &[u8],
+    record_bytes: usize,
+    awaited: usize,
+) -> impl Iterator<Item = u64> {
+    let on_stack = (records.len() / record_bytes.max(1)).saturating_sub(awaited);
+    records
+        .chunks_exact(record_bytes.max(1))
+        .enumerate()
+        .filter_map(move |(at, record)| {
+            let frame = record.get(8..)?;
+            match interpreter.frame(frame) {
+                _ if at >= on_stack => interpreter.waiting(frame),
+                WalkedFrame::Code { code, .. } => Some(code),
+                _ => None,
+            }
+        })
 }
 
 fn intern<T: Clone + Eq + Hash>(items: &mut Vec<T>, ids: &mut HashMap<T, u32>, item: T) -> u32 {

@@ -33,6 +33,8 @@ one of two samplers:
 On macOS uhr samples with a sampler of its own, without root for a program
 it starts, and records CPU time in user and kernel mode with user stacks,
 time off CPU with the stacks threads waited at, and each process's memory.
+It reads the frames of CPython and Node as the eBPF sampler does, checked
+with CPython 3.13 and Node 24, but not yet those of the other runtimes.
 macOS shows no process the kernel's stacks, so time in the kernel is under
 the user code that entered it, and there are no wakeups, syscall counts or
 page faults. dyld leaves uhr's library out of programs the system protects,
@@ -43,7 +45,8 @@ as those in `/usr/bin`, and hardened ones ([limits](docs/collection.md#uhrs-samp
 About a thousand times a second, uhr reads each thread's CPU time and state.
 A thread that ran since the last time, or can run now, it holds still for
 about 16 microseconds and walks its stack with the unwind tables of the
-images in its process. The CPU time since the last poll goes to that stack.
+images in its process, and if it runs Python or Node, their frames from the
+process's memory. The CPU time since the last poll goes to that stack.
 A thread that waits costs one call, and its time off CPU goes to the stack
 it waits at. uhr gets each process's task port from a small library it has
 dyld load into the program and every process that program starts, which

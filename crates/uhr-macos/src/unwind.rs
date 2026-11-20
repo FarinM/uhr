@@ -11,6 +11,7 @@ use framehop::aarch64::{CacheAarch64 as Cache, PtrAuthMask, UnwindRegsAarch64, U
 use framehop::x86_64::{CacheX86_64 as Cache, UnwindRegsX86_64, UnwinderX86_64};
 use framehop::{ExplicitModuleSectionInfo, FrameAddress, Module, Unwinder};
 
+use crate::held::Chunks;
 use crate::images::Image;
 use crate::mach::{Failed, Mapped, Registers, Task};
 
@@ -33,25 +34,23 @@ impl Deref for Text {
     }
 }
 
-/// Stack is read in chunks of this size, which end at its boundaries, so
-/// none crosses into memory that is not mapped, whatever the page size.
-const CHUNK: u64 = 4096;
-
-/// The most of a stack one walk reads, which bounds how long a thread is
-/// held still.
+/// The most chunks of a stack one walk reads, 256 KiB, which bounds how
+/// long a thread is held still.
 const MAX_CHUNKS: usize = 64;
 
 /// The unwind tables of one process's images.
 pub(crate) struct Unwinding {
     unwinder: ArchUnwinder,
     cache: Cache,
-    chunks: Vec<(u64, Box<[u8; CHUNK as usize]>)>,
 }
 
 /// One walk: return addresses after the first frame's address, outermost
 /// last.
 pub(crate) struct Walk {
     pub frames: Vec<FrameAddress>,
+    /// Where each frame ends on the stack, its caller's stack pointer, where
+    /// its caller was found.
+    pub ends: Vec<Option<u64>>,
     pub end: End,
 }
 
@@ -73,7 +72,6 @@ impl Unwinding {
         Self {
             unwinder: ArchUnwinder::new(),
             cache: Cache::new(),
-            chunks: Vec::new(),
         }
     }
 
@@ -138,44 +136,46 @@ impl Unwinding {
     }
 
     /// Walks the stack of a thread held still with `registers`, up to
-    /// `max` frames.
-    pub(crate) fn walk(&mut self, task: &Task, registers: Registers, max: usize) -> Walk {
-        self.chunks.clear();
-        let chunks = &mut self.chunks;
+    /// `max` frames, reading it into `chunks`, which it clears first.
+    pub(crate) fn walk(
+        &mut self,
+        task: &Task,
+        chunks: &mut Chunks,
+        registers: Registers,
+        max: usize,
+    ) -> Walk {
+        chunks.clear();
         let mut read_stack = |address: u64| -> Result<u64, ()> {
             if !address.is_multiple_of(8) {
                 return Err(());
             }
-            let start = address - address % CHUNK;
-            let chunk = match chunks.iter().position(|&(at, _)| at == start) {
-                Some(i) => &chunks[i].1,
-                None if chunks.len() < MAX_CHUNKS => {
-                    let mut chunk = Box::new([0; CHUNK as usize]);
-                    task.read(start, &mut chunk[..]).map_err(drop)?;
-                    chunks.push((start, chunk));
-                    &chunks.last().expect("just pushed").1
-                }
-                None => return Err(()),
-            };
-            let at = (address - start) as usize;
-            Ok(u64::from_ne_bytes(
-                chunk[at..at + 8].try_into().expect("eight bytes"),
-            ))
+            chunks.word(task, address, MAX_CHUNKS).ok_or(())
         };
-        let (pc, regs) = regs(registers);
-        let mut iter = self
-            .unwinder
-            .iter_frames(pc, regs, &mut self.cache, &mut read_stack);
-        let mut frames = Vec::new();
+        let (pc, mut regs) = regs(registers);
+        let mut frames = vec![FrameAddress::InstructionPointer(pc)];
+        let mut ends = Vec::new();
         let end = loop {
-            match iter.next() {
-                Ok(Some(_)) if frames.len() == max => break End::Depth,
-                Ok(Some(frame)) => frames.push(frame),
+            let frame = *frames.last().expect("never empty");
+            let caller =
+                self.unwinder
+                    .unwind_frame(frame, &mut regs, &mut self.cache, &mut read_stack);
+            match caller {
+                Ok(Some(address)) => {
+                    ends.push(Some(regs.sp()));
+                    let Some(caller) = FrameAddress::from_return_address(address) else {
+                        break End::Failed;
+                    };
+                    if frames.len() == max {
+                        break End::Depth;
+                    }
+                    frames.push(caller);
+                }
                 Ok(None) => break End::Outermost,
                 Err(_) => break End::Failed,
             }
         };
-        Walk { frames, end }
+        ends.resize(frames.len(), None);
+        Walk { frames, ends, end }
     }
 }
 

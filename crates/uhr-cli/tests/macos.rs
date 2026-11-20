@@ -1,16 +1,24 @@
-//! End to end on macOS, with uhr's own sampler: needs a C compiler. `uhr
-//! doctor` shows what is missing.
+//! End to end on macOS, with uhr's own sampler: needs a C compiler, and
+//! for the frames of runtimes, Python 3.11 or later and Node 20 to 24
+//! outside the directories System Integrity Protection protects, as
+//! Homebrew installs them. The test of a runtime that is missing checks
+//! nothing. `uhr doctor` shows what is missing.
 #![cfg(target_os = "macos")]
 
 mod common;
 
+use std::env;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::thread;
+use std::time::Duration;
 
 use serde_json::Value;
 
 use common::{UHR, compile, compile_with_debug_info, scratch, uhr, uhr_as_root};
+
+const PROGRAMS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../test-programs");
 
 fn json(args: &[&str]) -> Value {
     let mut args = args.to_vec();
@@ -244,4 +252,233 @@ fn attaches_to_a_running_program() {
     assert!(manifest["target"]["runtime_support"].is_null());
     // Still running when the duration ended.
     assert!(manifest["target"]["exit"].is_null());
+}
+
+/// `program` found in `PATH`, outside the directories whose programs
+/// System Integrity Protection keeps uhr's library out of.
+fn find(program: &str) -> Option<PathBuf> {
+    let protected = [
+        "/bin",
+        "/sbin",
+        "/usr/bin",
+        "/usr/sbin",
+        "/usr/libexec",
+        "/System",
+    ];
+    let path = env::var_os("PATH")?;
+    env::split_paths(&path)
+        .filter(|dir| !protected.iter().any(|p| dir.starts_with(p)))
+        .map(|dir| dir.join(program))
+        .find(|candidate| candidate.is_file())
+}
+
+/// A `python3` whose frames uhr reads.
+fn python() -> Option<PathBuf> {
+    let python = ["python3.14", "python3.13", "python3.12", "python3.11"]
+        .into_iter()
+        .find_map(find);
+    if python.is_none() {
+        eprintln!("skipped: needs Python 3.11 or later");
+    }
+    python
+}
+
+/// A `node` whose V8 uhr reads the frames of.
+fn node() -> Option<PathBuf> {
+    let node = find("node").filter(|node| {
+        let output = Command::new(node)
+            .args(["-p", "process.versions.v8"])
+            .output();
+        let major = output.ok().and_then(|output| {
+            let version = String::from_utf8(output.stdout).ok()?;
+            version.split('.').next()?.trim().parse::<u32>().ok()
+        });
+        major.is_some_and(|v8| (11..=13).contains(&v8))
+    });
+    if node.is_none() {
+        eprintln!("skipped: needs Node 20 to 24");
+    }
+    node
+}
+
+/// What the stream says of the interpreters whose frames it read.
+fn interpreters(recording: &Path) -> Vec<Value> {
+    let manifest = manifest(recording);
+    manifest["streams"][0]["coverage"]["stacks"]["interpreters"]
+        .as_array()
+        .unwrap()
+        .clone()
+}
+
+fn functions(recording: &str) -> Value {
+    json(&[
+        "query",
+        recording,
+        "--group-by",
+        "function",
+        "--top",
+        "1000",
+    ])
+}
+
+fn runtime_function<'a>(result: &'a Value, runtime: &str, name: &str) -> &'a Value {
+    rows(result)
+        .iter()
+        .find(|r| r["module"] == format!("[{runtime}]") && r["function"] == name)
+        .unwrap_or_else(|| panic!("no {runtime} function {name} in {result:#}"))
+}
+
+/// That `program` of `runtime` spent its time as jit.py does: hot() does
+/// four times the work of warm(), all under work().
+fn has_the_split_of(recording: &str, runtime: &str, program: &str) {
+    let result = functions(recording);
+    let function = |name| runtime_function(&result, runtime, name);
+    let hot = function("hot");
+    let file = hot["file"].as_str().unwrap();
+    assert!(file.ends_with(&format!("test-programs/{program}")), "{hot}");
+    let share = |row: &Value, which: &str| row[which].as_f64().unwrap();
+    let (hot, warm, work) = (function("hot"), function("warm"), function("work"));
+    let (hot_self, warm_self) = (share(hot, "self_share"), share(warm, "self_share"));
+    let split = hot_self / (hot_self + warm_self);
+    assert!(
+        hot_self + warm_self > 0.7,
+        "hot {hot_self}, warm {warm_self}"
+    );
+    assert!((0.7..0.9).contains(&split), "hot gets {split} of the two");
+    let under = share(hot, "total_share") + share(warm, "total_share");
+    assert!(share(work, "total_share") >= under - 0.01, "{work}");
+}
+
+/// That every walk of `runtime`'s frames read them, and all but a share
+/// `unread` of their code. A process that starts frees code, and V8's
+/// garbage collector moves it, before uhr reads it.
+fn read_the_frames(recording: &Path, runtime: &str, unread: f64) {
+    let walked = interpreters(recording);
+    let walks = walked
+        .iter()
+        .find(|w| w["runtime"] == runtime)
+        .unwrap_or_else(|| panic!("no walks of {runtime} in {walked:?}"));
+    let frames = walks["frames"].as_u64().unwrap();
+    assert!(frames > 0, "{walks}");
+    assert_eq!(walks["failed"], 0, "{walks}");
+    let missed = walks["unread_frames"].as_u64().unwrap();
+    assert!(missed as f64 <= unread * frames as f64, "{walks}");
+}
+
+#[test]
+fn reads_the_frames_of_python() {
+    let Some(python) = python() else {
+        return;
+    };
+    let dir = scratch("macos_python");
+    let recording = dir.join("rec");
+    let program = format!("{PROGRAMS}/jit.py");
+    record(&recording, &[python.to_str().unwrap(), &program, "50"]);
+    has_the_split_of(recording.to_str().unwrap(), "python", "jit.py");
+    read_the_frames(&recording, "python", 0.01);
+}
+
+/// Whether a node of a call-paths tree, or one under it, is the Python
+/// function `name`.
+fn has_python(nodes: &Value, name: &str) -> bool {
+    nodes.as_array().unwrap().iter().any(|node| {
+        (node["origin"] == "interpreted" && node["function"] == name)
+            || has_python(&node["children"], name)
+    })
+}
+
+#[test]
+fn puts_python_frames_around_the_native_code_they_call() {
+    let Some(python) = python() else {
+        return;
+    };
+    let dir = scratch("macos_python_callback");
+    let recording = dir.join("rec");
+    let program = format!("{PROGRAMS}/callback.py");
+    record(&recording, &[python.to_str().unwrap(), &program, "60"]);
+    let path = recording.to_str().unwrap();
+    // sort() calls qsort(), which calls compare(). Of libc's functions
+    // named so, the one that does.
+    let result = functions(path);
+    let qsort = rows(&result)
+        .iter()
+        .filter(|r| r["function"].as_str().is_some_and(|f| f.contains("qsort")))
+        .max_by(|a, b| {
+            let total = |row: &Value| row["total_share"].as_f64().unwrap();
+            total(a).total_cmp(&total(b))
+        })
+        .unwrap_or_else(|| panic!("no qsort in {result:#}"));
+    let paths = json(&[
+        "call-paths",
+        path,
+        "--function",
+        qsort["id"].as_str().unwrap(),
+        "--mode",
+        "user",
+        "--depth",
+        "20",
+        "--top",
+        "20",
+    ]);
+    assert!(has_python(&paths["callers"], "sort"), "{paths}");
+    assert!(!has_python(&paths["callers"], "compare"), "{paths}");
+    assert!(has_python(&paths["callees"], "compare"), "{paths}");
+}
+
+#[test]
+fn reads_python_frames_when_attached() {
+    let Some(python) = python() else {
+        return;
+    };
+    let dir = scratch("macos_python_attached");
+    let program = format!("{PROGRAMS}/jit.py");
+    let mut target = Command::new(&python)
+        .args([&program, "300"])
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    thread::sleep(Duration::from_millis(300));
+    let pid = target.id().to_string();
+    let recording = dir.join("rec");
+    let args = [
+        "record",
+        "-o",
+        recording.to_str().unwrap(),
+        "--pid",
+        &pid,
+        "--duration",
+        "1s",
+    ];
+    // SAFETY: geteuid has no preconditions.
+    let attached = if unsafe { libc::geteuid() } == 0 {
+        uhr(&args);
+        Some(())
+    } else {
+        uhr_as_root(&args, &recording)
+    };
+    let _ = target.kill();
+    let _ = target.wait();
+    if attached.is_none() {
+        eprintln!("skipped: needs root through sudo without a password");
+        return;
+    }
+    let path = recording.to_str().unwrap();
+    let result = functions(path);
+    for name in ["hot", "warm", "work"] {
+        runtime_function(&result, "python", name);
+    }
+    read_the_frames(&recording, "python", 0.0);
+}
+
+#[test]
+fn reads_the_frames_of_node() {
+    let Some(node) = node() else {
+        return;
+    };
+    let dir = scratch("macos_node");
+    let recording = dir.join("rec");
+    let program = format!("{PROGRAMS}/jit.js");
+    record(&recording, &[node.to_str().unwrap(), &program, "50"]);
+    has_the_split_of(recording.to_str().unwrap(), "node", "jit.js");
+    read_the_frames(&recording, "node", 0.01);
 }

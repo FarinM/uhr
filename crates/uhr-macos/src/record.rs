@@ -3,6 +3,7 @@
 //! the stack of each that ran since the last poll; `polling` turns the
 //! polls into CPU samples and time off CPU.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::fs;
@@ -22,8 +23,10 @@ use uhr_core::recording::{
     Mapping, MemoryReading, MissingSignal, Origin, Platform, Recording, Sampling, Signal,
     StackCoverage, Stream, StreamCoverage, Thread, ThreadName, Unwinding, WallClock,
 };
+use uhr_core::runtimes::stacks::Interpreters;
 use uhr_core::symbols;
 
+use crate::held::{Chunks, Held};
 use crate::images::{Image, ImageInfos, read_image};
 use crate::launch::{self, Hello, Service, Waiting};
 use mach2::port::mach_port_t;
@@ -34,6 +37,7 @@ use crate::mach::{
 };
 use crate::polling::{Poll, Polled, RunState, Timeline};
 use crate::process;
+use crate::runtime::{Runtime, Sample};
 use crate::unwind::{End, Unwinding as Unwinder, Walk};
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -143,6 +147,10 @@ pub enum Target {
 
 /// Stacks deeper than this are cut.
 const MAX_STACK_DEPTH: u32 = 512;
+
+/// The most memory a walk of a thread's stack and its interpreter's frames
+/// reads in chunks, 512 KiB; past that each read is as asked.
+const MAX_HELD_CHUNKS: usize = 128;
 
 /// How often each process's memory is read.
 pub const MEMORY_INTERVAL: Duration = Duration::from_millis(100);
@@ -560,12 +568,16 @@ struct Tables {
     /// Images an update of the system replaces, by path and build id, whose
     /// functions the recording keeps the names of.
     system: HashSet<(String, Option<String>)>,
+    /// The code interpreted frames ran, and how the walks went.
+    interpreted: Interpreters,
+    /// Why uhr read the frames of no runtime a process ran, one for each.
+    unsupported: Vec<String>,
 }
 
 impl Tables {
-    /// Interns a walk's stack, leaf first, with each frame in the code of
-    /// the image segment it falls in, if one does.
-    fn stack(&mut self, code: &BTreeMap<u64, (u64, u32)>, walk: &Walk) -> u32 {
+    /// The frames of a walk's stack, leaf first, each in the code of the
+    /// image segment it falls in, if one does.
+    fn native_stack(&mut self, code: &BTreeMap<u64, (u64, u32)>, walk: &Walk) -> Vec<u32> {
         let mut stack = Vec::with_capacity(walk.frames.len());
         for &frame in &walk.frames {
             let (address, return_address) = match frame {
@@ -603,7 +615,7 @@ impl Tables {
             };
             stack.push(intern(&mut self.frames, &mut self.frame_ids, frame));
         }
-        intern(&mut self.stacks, &mut self.stack_ids, stack)
+        stack
     }
 }
 
@@ -643,6 +655,9 @@ struct Process {
     /// mapping.
     code: BTreeMap<u64, (u64, u32)>,
     unwinder: Unwinder,
+    /// What a walk read of the process's memory while it held a thread.
+    chunks: Chunks,
+    runtime: Runtime,
     /// By the name of uhr's right to each thread's port, which stays the
     /// same while uhr holds it.
     threads: HashMap<mach_port_t, Followed>,
@@ -661,7 +676,9 @@ struct Followed {
 }
 
 impl Process {
-    fn new(task: Task, pid: u32, start: Start) -> Self {
+    /// `exec` counts the programs the process ran before, which an exec
+    /// replaces.
+    fn new(task: Task, pid: u32, exec: u32, start: Start) -> Self {
         let infos = task
             .dyld_info()
             .map_err(io::Error::other)
@@ -680,6 +697,8 @@ impl Process {
             images: BTreeMap::new(),
             code: BTreeMap::new(),
             unwinder: Unwinder::new(),
+            chunks: Chunks::default(),
+            runtime: Runtime::new((pid, exec)),
             threads: HashMap::new(),
             unnumbered: HashMap::new(),
             memory_due: Instant::now(),
@@ -687,7 +706,7 @@ impl Process {
     }
 
     /// Reads dyld's list again if it changed: one 8-byte read when it did
-    /// not.
+    /// not. Looks for the process's runtime again if it lists more.
     fn update_images(&mut self, tables: &mut Tables, counts: &mut Counts, time_ns: Option<u64>) {
         let Some(infos) = self.infos else {
             return;
@@ -724,10 +743,12 @@ impl Process {
                 }
             }
         }
+        let mut added = false;
         for (address, path) in listed.images {
             if self.images.contains_key(&address) {
                 continue;
             }
+            added = true;
             let image = match read_image(&self.task, address, path) {
                 // dyld lists the program by the path it was exec'd with,
                 // which can be relative to where that was.
@@ -768,6 +789,19 @@ impl Process {
             self.images.insert(address, image);
         }
         self.timestamp = Some(listed.timestamp);
+        if added {
+            let mappings: Vec<Mapping> = self
+                .code
+                .values()
+                .map(|&(_, id)| tables.mappings[id as usize].clone())
+                .collect();
+            self.runtime.look(
+                &self.task,
+                &mappings,
+                &mut tables.interpreted,
+                &mut tables.unsupported,
+            );
+        }
     }
 
     /// `None` once it is gone. An exited process can have no threads left
@@ -944,9 +978,21 @@ impl Process {
         let (user_ns, system_ns) = thread_cpu_ns(port).ok()?;
         let time_ns = monotonic_ns();
         let registers = held.registers().ok()?;
-        let walk = self
-            .unwinder
-            .walk(&self.task, registers, MAX_STACK_DEPTH as usize);
+        let walk = self.unwinder.walk(
+            &self.task,
+            &mut self.chunks,
+            registers,
+            MAX_STACK_DEPTH as usize,
+        );
+        let memory = Held {
+            task: &self.task,
+            chunks: RefCell::new(&mut self.chunks),
+            limit: MAX_HELD_CHUNKS,
+        };
+        // The kernel's id of the thread, which runtimes keep as its id.
+        let walked = self
+            .runtime
+            .walk(&memory, u64::from(followed.tid), &walk.ends);
         drop(held);
         counts.held_ns += held_at.elapsed().as_nanos() as u64;
         counts.walks += 1;
@@ -958,12 +1004,27 @@ impl Process {
         if walk.frames.is_empty() {
             return None;
         }
+        if let Some(walked) = &walked {
+            self.runtime.read_code(&self.task, walked);
+        }
+        let mut stack = tables.native_stack(&self.code, &walk);
+        self.runtime.place(
+            &mut tables.interpreted,
+            &mut tables.frames,
+            &mut tables.frame_ids,
+            &mut stack,
+            Sample {
+                walked: walked.as_ref(),
+                ends: &walk.ends,
+                cut_short: walk.end != End::Outermost,
+            },
+        );
         Some(Poll {
             time_ns,
             user_ns,
             system_ns,
             state,
-            stack: Some(tables.stack(&self.code, &walk)),
+            stack: Some(intern(&mut tables.stacks, &mut tables.stack_ids, stack)),
         })
     }
 
@@ -1034,6 +1095,8 @@ struct Sampler<'a> {
     options: &'a RecordOptions,
     tables: Tables,
     processes: Vec<Process>,
+    /// How many programs each pid ran, which its execs start.
+    programs: HashMap<u32, u32>,
     counts: Counts,
     start_ns: Option<u64>,
     last_ns: Option<u64>,
@@ -1052,6 +1115,7 @@ impl<'a> Sampler<'a> {
             options,
             tables: Tables::default(),
             processes: Vec::new(),
+            programs: HashMap::new(),
             counts: Counts::default(),
             start_ns: None,
             last_ns: None,
@@ -1070,7 +1134,9 @@ impl<'a> Sampler<'a> {
             self.processes.remove(index).end(&mut self.tables);
         }
         self.start_ns = self.start_ns.or_else(|| Some(monotonic_ns()));
-        let mut process = Process::new(task, pid, start);
+        let programs = self.programs.entry(pid).or_default();
+        let mut process = Process::new(task, pid, *programs, start);
+        *programs += 1;
         let alive = process.poll(
             &mut self.tables,
             &mut self.counts,
@@ -1204,6 +1270,8 @@ impl Captured {
             polled,
             memory,
             system,
+            interpreted,
+            unsupported,
             ..
         } = tables;
         let Polled {
@@ -1314,6 +1382,16 @@ impl Captured {
                 counts.no_unwind_tables
             ));
         }
+        let mut reasons: BTreeMap<&str, usize> = BTreeMap::new();
+        for reason in &unsupported {
+            *reasons.entry(reason).or_default() += 1;
+        }
+        known_biases.extend(reasons.into_iter().map(|(reason, processes)| {
+            format!(
+                "{processes} processes ran an interpreter whose frames uhr did not read, so \
+                 their stacks show only its own code: {reason}."
+            )
+        }));
         if !counts.unnumbered.is_empty() {
             known_biases.push(format!(
                 "{} threads whose ids do not fit 32 bits are left out.",
@@ -1351,7 +1429,7 @@ impl Captured {
                     stacks_at_stack_limit: counts.at_depth,
                     stacks_cut_at_stack_copy: None,
                     stacks_not_unwound: None,
-                    interpreters: Vec::new(),
+                    interpreters: interpreted.coverage(),
                 }),
                 overhead_ns: Some(self.overhead_ns),
                 known_biases,
@@ -1423,7 +1501,7 @@ impl Captured {
             off_cpu,
             kernel_symbols: Vec::new(),
             jit_symbols: Vec::new(),
-            interpreted_code: Vec::new(),
+            interpreted_code: interpreted.code,
             syscall_calls: Vec::new(),
             memory,
             regions: Vec::new(),
