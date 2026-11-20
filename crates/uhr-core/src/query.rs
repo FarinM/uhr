@@ -507,6 +507,7 @@ fn syscall_rows(
     share: &impl Fn(u64) -> f64,
 ) -> Vec<SyscallRow> {
     let in_syscall = syscalls::of_stacks(recording, functions);
+    let by_user_frames = syscalls::by_user_frames(recording);
     let skipped = recording.skipped_syscalls();
     let mut by_syscall: HashMap<InSyscall, u64> = HashMap::new();
     let mut add = |syscall, weight| {
@@ -515,11 +516,16 @@ fn syscall_rows(
         }
     };
     for (stack, &weight) in amounts.by_stack.iter().enumerate() {
+        let user = amounts.user[stack];
         match in_syscall[stack] {
+            Some(syscall) if by_user_frames => {
+                add(InSyscall::Outside, user);
+                add(syscall, weight - user);
+            }
             Some(syscall) => add(syscall, weight),
             None => {
-                add(InSyscall::Outside, amounts.user[stack]);
-                add(InSyscall::Unknown, weight - amounts.user[stack]);
+                add(InSyscall::Outside, user);
+                add(InSyscall::Unknown, weight - user);
             }
         }
     }

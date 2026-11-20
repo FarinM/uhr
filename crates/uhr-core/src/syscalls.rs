@@ -44,6 +44,9 @@ pub(crate) fn of_stacks<'a>(
     recording: &Recording,
     functions: &'a Functions,
 ) -> Vec<Option<InSyscall<'a>>> {
+    if by_user_frames(recording) {
+        return of_macos_stacks(recording, functions);
+    }
     let linux = recording.manifest.platform.os == "linux";
     let marks: Vec<Option<Mark>> = (0..functions.len() as u32)
         .map(|id| {
@@ -97,6 +100,41 @@ pub(crate) fn of_stacks<'a>(
                 (None, None) => return None,
                 (None, Some(Mark::Entry)) if whole => InSyscall::Outside,
                 _ => InSyscall::Unknown,
+            })
+        })
+        .collect()
+}
+
+/// Whether a sample in user mode is in no syscall, whatever its stack: on
+/// macOS, where a stack's syscall comes from its user frames, which the
+/// samples of a poll's user and kernel time share.
+pub(crate) fn by_user_frames(recording: &Recording) -> bool {
+    recording.manifest.platform.os == "macos"
+}
+
+/// On macOS, where uhr sees no kernel frames, a thread in a syscall is at
+/// the function of `libsystem_kernel` that made it, named for the call, as
+/// `read`, `__psynch_cvwait` or `mach_msg2_trap`: the leaf of its user
+/// stack. Its leading underscores are left out, as the kernel's tables of
+/// calls have them. A stack whose leaf is elsewhere is not known to be in a
+/// syscall: a thread in the kernel there took a fault or an interrupt, or
+/// made a syscall itself, as Go programs do.
+fn of_macos_stacks<'a>(
+    recording: &Recording,
+    functions: &'a Functions,
+) -> Vec<Option<InSyscall<'a>>> {
+    recording
+        .stacks
+        .iter()
+        .map(|stack| {
+            let leaf = functions.get(functions.leaf(stack));
+            let in_stubs = leaf
+                .module
+                .as_deref()
+                .is_some_and(|path| path.ends_with("/libsystem_kernel.dylib"));
+            in_stubs.then(|| match leaf.name.as_deref() {
+                Some(name) => InSyscall::Named(name.trim_start_matches('_')),
+                None => InSyscall::Unnamed,
             })
         })
         .collect()

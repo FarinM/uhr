@@ -46,7 +46,7 @@ replaces them.
 | Field | Meaning |
 |---|---|
 | `format_version` | `0` |
-| `platform.os`, `platform.arch` | The system the target ran on, as Rust names them, such as `linux`, `macos`, `x86_64` and `aarch64`. It says how to read what was recorded: uhr finds syscalls only in stacks recorded on Linux, from its kernel's function names, and frames' `file_offset` counts from the start of a Mach-O image's `__TEXT` on macOS |
+| `platform.os`, `platform.arch` | The system the target ran on, as Rust names them, such as `linux`, `macos`, `x86_64` and `aarch64`. It says how to read what was recorded: uhr finds syscalls in stacks recorded on Linux from its kernel's function names, and on macOS from the function of `libsystem_kernel` a stack ends in, and frames' `file_offset` counts from the start of a Mach-O image's `__TEXT` on macOS |
 | `target.command` | Command and arguments. Empty for an attached process without a command line, such as a kernel thread |
 | `target.launched` | True if the recording started the target, false if it attached |
 | `target.runtime_support` | The runtimes whose perf maps were on in the target's environment, so that they named the code they compiled: `python`, `node`. Null for a process uhr attached to, whose environment it did not see |

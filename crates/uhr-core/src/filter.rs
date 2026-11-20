@@ -127,11 +127,13 @@ impl Filter {
         let stacks = self.stacks(recording, functions)?;
         let mut names = (!self.thread_names.is_empty()).then(|| NameMatcher::new(recording));
         let start_ns = recording.manifest.start_ns;
+        let user_outside = !self.syscalls.is_empty() && syscalls::by_user_frames(recording);
         Ok(taken.iter().enumerate().filter(move |(_, sample)| {
             let sample = of(sample);
             (self.pids.is_empty() || self.pids.contains(&sample.pid))
                 && (self.tids.is_empty() || self.tids.contains(&sample.tid))
                 && (self.modes.is_empty() || self.modes.contains(&sample.mode))
+                && !(user_outside && sample.mode == Mode::User)
                 && self.in_time_range(sample.time_ns, start_ns)
                 && stacks
                     .as_ref()
@@ -238,7 +240,9 @@ impl Filter {
         if !functions.symbolized() {
             return Err(functions::Error::NotSymbolized.into());
         }
-        if let KernelSymbols::Unavailable { reason } = &recording.manifest.kernel_symbols {
+        if let KernelSymbols::Unavailable { reason } = &recording.manifest.kernel_symbols
+            && !syscalls::by_user_frames(recording)
+        {
             return Err(Error::NoKernelNames(reason.clone()));
         }
         let in_syscall = syscalls::of_stacks(recording, functions);
