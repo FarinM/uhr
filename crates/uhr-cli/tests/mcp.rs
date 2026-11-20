@@ -257,6 +257,7 @@ fn unsymbolized(name: &str) -> PathBuf {
         memory: Vec::new(),
         regions: Vec::new(),
         region_memory: Vec::new(),
+        system_symbols: Vec::new(),
     };
     recording.write(&dir).unwrap();
     dir

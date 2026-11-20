@@ -538,6 +538,7 @@ pub(super) fn convert(input: Input) -> Result<(Recording, Option<EbpfStacks>)> {
         memory: Vec::new(),
         regions: state.regions,
         region_memory: Vec::new(),
+        system_symbols: Vec::new(),
     };
     Ok((recording, ebpf_stacks))
 }

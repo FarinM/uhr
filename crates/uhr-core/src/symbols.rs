@@ -1,15 +1,18 @@
 mod debug_info;
 mod files;
+mod shared_cache;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::ops::Range;
 use std::path::Path;
+use std::sync::OnceLock;
 
 use debug_info::DebugInfo;
 use files::{Files, Location};
 use serde::Serialize;
+use shared_cache::{Caches, Lookup};
 use tracing::{debug, info, warn};
 use wholesym::samply_symbols::debugid::DebugId;
 use wholesym::samply_symbols::object::read::ReadRef;
@@ -18,7 +21,7 @@ use wholesym::samply_symbols::relative_address_base;
 use wholesym::samply_symbols::{BinaryImage, LookupAddress, MultiArchDisambiguator, SymbolManager};
 
 use crate::recording::table::{self, Column, Table};
-use crate::recording::{self, JIT, KERNEL, KernelSymbols, Origin, Recording};
+use crate::recording::{self, JIT, KERNEL, KernelSymbols, Origin, Recording, SystemSymbol};
 
 /// Why symbolizing failed. Files that can't be read only leave their frames
 /// unnamed, with the reason in their source.
@@ -246,8 +249,13 @@ async fn resolve(recording: &Recording) -> Symbols {
     }
 
     let macos = recording.manifest.platform.os == "macos";
+    let caches = OnceLock::new();
+    let saved = saved_images(recording);
     for ((path, build_id), frames) in by_file {
-        let resolved = resolve_file(path, build_id, &frames, macos).await;
+        let resolved = match saved.get(&(path, build_id)) {
+            Some(symbols) => resolve_saved(path, build_id, symbols, &frames),
+            None => resolve_file(path, build_id, &frames, macos, &caches).await,
+        };
         for named in resolved.names {
             names[named.frame as usize] = Some(named.name);
             function_addresses[named.frame as usize] = Some(named.function_address);
@@ -264,10 +272,151 @@ async fn resolve(recording: &Recording) -> Symbols {
     }
 }
 
+/// The system's functions the recording saved, by image.
+fn saved_images(recording: &Recording) -> HashMap<FileKey<'_>, &[SystemSymbol]> {
+    let symbols = &recording.system_symbols;
+    let mut images = HashMap::new();
+    let mut start = 0;
+    for end in 1..=symbols.len() {
+        let key = |i: usize| (symbols[i].path.as_str(), symbols[i].build_id.as_deref());
+        if end == symbols.len() || key(end) != key(start) {
+            images.insert(key(start), &symbols[start..end]);
+            start = end;
+        }
+    }
+    images
+}
+
+/// Names the frames of an image from the functions the recording saved of
+/// it, sorted by start.
+fn resolve_saved(
+    path: &str,
+    build_id: Option<&str>,
+    symbols: &[SystemSymbol],
+    frames: &[(u32, u64)],
+) -> Resolved {
+    let mut names = Vec::new();
+    let mut placeholders = 0;
+    for &(frame, offset) in frames {
+        let index = symbols.partition_point(|s| s.start <= offset);
+        let Some(symbol) = index
+            .checked_sub(1)
+            .map(|i| &symbols[i])
+            .filter(|s| offset < s.end)
+        else {
+            continue;
+        };
+        let Ok(start) = u32::try_from(symbol.start) else {
+            continue;
+        };
+        let name = match &symbol.name {
+            Some(name) => FrameName::Symbol(name.clone()),
+            None => {
+                placeholders += 1;
+                FrameName::Placeholder(format!("fun_{start:x}"))
+            }
+        };
+        names.push(Named {
+            frame,
+            function_address: start,
+            function_end: u32::try_from(symbol.end).ok(),
+            name,
+            inline: Vec::new(),
+        });
+    }
+    let mut detail = format!(
+        "named {} of {} frames from the names saved while recording",
+        names.len() - placeholders,
+        frames.len()
+    );
+    if placeholders > 0 {
+        detail += &format!(", {placeholders} more with placeholder names");
+    }
+    Resolved {
+        source: Source {
+            path: path.to_owned(),
+            build_id: build_id.map(str::to_owned),
+            status: SourceStatus::Resolved,
+            detail: Some(detail),
+        },
+        names,
+    }
+}
+
+/// The functions that frames of `images` fall in, which an update of the
+/// system replaces, read from their files or the dyld shared cache: while
+/// recording, so that they can be named later on any machine. The images
+/// are the paths and build ids of mappings.
+pub fn system_symbols(
+    recording: &Recording,
+    images: &HashSet<(String, Option<String>)>,
+) -> Result<Vec<SystemSymbol>, Error> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(Error::Runtime)?;
+    let mut by_file: BTreeMap<FileKey, Vec<(u32, u64)>> = BTreeMap::new();
+    for (id, frame) in recording.frames.iter().enumerate() {
+        let (Origin::Binary, Some(mapping), Some(offset)) =
+            (frame.origin, frame.mapping, frame.file_offset)
+        else {
+            continue;
+        };
+        let mapping = &recording.mappings[mapping as usize];
+        let key = (mapping.path.clone(), mapping.build_id.clone());
+        if images.contains(&key) {
+            let lookup = offset.saturating_sub(u64::from(frame.return_address));
+            by_file
+                .entry((&mapping.path, mapping.build_id.as_deref()))
+                .or_default()
+                .push((id as u32, lookup));
+        }
+    }
+    let macos = recording.manifest.platform.os == "macos";
+    let caches = OnceLock::new();
+    let mut symbols = Vec::new();
+    for ((path, build_id), frames) in by_file {
+        let resolved = runtime.block_on(resolve_file(path, build_id, &frames, macos, &caches));
+        let lookups: HashMap<u32, u64> = frames.iter().copied().collect();
+        // By start: where it ends, and its name.
+        let mut functions: BTreeMap<u64, (u64, Option<String>)> = BTreeMap::new();
+        for named in resolved.names {
+            let start = u64::from(named.function_address);
+            // Without an end, as far as frames show it reaches.
+            let reached = lookups[&named.frame] + 1;
+            let end = named
+                .function_end
+                .map_or(reached, |end| u64::from(end).max(reached));
+            let name = match named.name {
+                FrameName::Symbol(name) => Some(name),
+                FrameName::Placeholder(_) => None,
+            };
+            let entry = functions.entry(start).or_insert((end, name));
+            entry.0 = entry.0.max(end);
+        }
+        let starts: Vec<u64> = functions.keys().copied().collect();
+        for (i, (start, (end, name))) in functions.into_iter().enumerate() {
+            // A size wholesym approximated can reach into the next function,
+            // which starts past every frame of this one.
+            let end = starts.get(i + 1).map_or(end, |&next| end.min(next));
+            symbols.push(SystemSymbol {
+                path: path.to_owned(),
+                build_id: build_id.map(str::to_owned),
+                start,
+                end,
+                name,
+            });
+        }
+    }
+    Ok(symbols)
+}
+
 /// A frame named from its file.
 struct Named {
     frame: u32,
     function_address: u32,
+    /// Where the function ends, relative to the image's base, if known.
+    function_end: Option<u32>,
     name: FrameName,
     inline: Vec<InlineFrame>,
 }
@@ -277,12 +426,14 @@ struct Resolved {
     names: Vec<Named>,
 }
 
-/// Names the frames of one file, by their offsets in it.
+/// Names the frames of one file, by their offsets in it. On macOS, a
+/// library with no file of its own is looked for in the dyld shared cache.
 async fn resolve_file(
     path: &str,
     build_id: Option<&str>,
     frames: &[(u32, u64)],
     macos: bool,
+    caches: &OnceLock<Caches>,
 ) -> Resolved {
     let done = |status, detail: Option<String>| Resolved {
         source: Source {
@@ -302,7 +453,16 @@ async fn resolve_file(
     // On macOS, build ids are Mach-O UUIDs.
     let uuid = build_id.filter(|_| macos).and_then(macho_uuid);
     if !Path::new(path).exists() {
-        return done(SourceStatus::MissingFile, None);
+        return match (uuid, build_id) {
+            (Some(uuid), Some(build_id)) => resolve_in_cache(
+                path,
+                build_id,
+                uuid,
+                frames,
+                caches.get_or_init(Caches::open),
+            ),
+            _ => done(SourceStatus::MissingFile, None),
+        };
     }
     let manager = SymbolManager::with_helper(Files::default());
     let files = manager.helper();
@@ -432,6 +592,7 @@ async fn resolve_file(
         names.push(Named {
             frame,
             function_address: start,
+            function_end: info.symbol.size.and_then(|size| start.checked_add(size)),
             name: if made_up {
                 placeholders += 1;
                 FrameName::Placeholder(name)
@@ -483,6 +644,86 @@ async fn load_binary(
         )
         .await
         .map_err(|error| chain(&error))
+}
+
+/// Names the frames of an image of the dyld shared cache. The cache has the
+/// names of exported functions only, so others get placeholders.
+fn resolve_in_cache(
+    path: &str,
+    build_id: &str,
+    uuid: [u8; 16],
+    frames: &[(u32, u64)],
+    caches: &Caches,
+) -> Resolved {
+    let source = |status, detail: String| Source {
+        path: path.to_owned(),
+        build_id: Some(build_id.to_owned()),
+        status,
+        detail: Some(detail),
+    };
+    let image = match caches.find(path, uuid) {
+        Ok(Lookup::Found(image)) => image,
+        Ok(Lookup::Missing) => {
+            return Resolved {
+                source: Source {
+                    detail: None,
+                    ..source(SourceStatus::MissingFile, String::new())
+                },
+                names: Vec::new(),
+            };
+        }
+        Ok(Lookup::Mismatch(found)) => {
+            return Resolved {
+                source: source(
+                    SourceStatus::BuildIdMismatch,
+                    format!("recorded build-id {build_id}, the dyld shared cache has {found}"),
+                ),
+                names: Vec::new(),
+            };
+        }
+        Err(error) => {
+            return Resolved {
+                source: source(SourceStatus::Failed, error),
+                names: Vec::new(),
+            };
+        }
+    };
+    let mut names = Vec::new();
+    let mut placeholders = 0;
+    for &(frame, offset) in frames {
+        let Some((function, name)) = u32::try_from(offset)
+            .ok()
+            .and_then(|address| image.function(address))
+        else {
+            continue;
+        };
+        let name = match name {
+            Some(name) => FrameName::Symbol(name.to_owned()),
+            None => {
+                placeholders += 1;
+                FrameName::Placeholder(format!("fun_{:x}", function.start))
+            }
+        };
+        names.push(Named {
+            frame,
+            function_address: function.start,
+            function_end: Some(function.end),
+            name,
+            inline: Vec::new(),
+        });
+    }
+    let mut detail = format!(
+        "named {} of {} frames from the dyld shared cache",
+        names.len() - placeholders,
+        frames.len()
+    );
+    if placeholders > 0 {
+        detail += &format!(", {placeholders} more with placeholder names");
+    }
+    Resolved {
+        source: source(SourceStatus::Resolved, detail),
+        names,
+    }
 }
 
 /// Where in `data` the object with `uuid` is: for a universal Mach-O file,
@@ -1282,6 +1523,7 @@ mod tests {
             memory: Vec::new(),
             regions: Vec::new(),
             region_memory: Vec::new(),
+            system_symbols: Vec::new(),
         }
     }
 

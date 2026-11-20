@@ -380,6 +380,22 @@ fn example() -> Recording {
                 swap_bytes: 4_096,
             },
         ],
+        system_symbols: vec![
+            SystemSymbol {
+                path: "/usr/lib/system/libsystem_c.dylib".into(),
+                build_id: Some("4bf47ebb4cd03f4a995a717b8550cb12".into()),
+                start: 0x26bbc,
+                end: 0x26c40,
+                name: Some("clock".into()),
+            },
+            SystemSymbol {
+                path: "/usr/lib/system/libsystem_c.dylib".into(),
+                build_id: Some("4bf47ebb4cd03f4a995a717b8550cb12".into()),
+                start: 0x26c40,
+                end: 0x26d00,
+                name: None,
+            },
+        ],
     }
 }
 

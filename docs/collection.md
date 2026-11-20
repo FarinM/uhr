@@ -624,6 +624,13 @@ Most bad profiles come from here, not from the sampler.
   coverage says why.
 - In containers, binaries can have different paths inside the target's mount
   namespace. Resolve by build-id.
+- On macOS, build-ids are Mach-O UUIDs, which pick the slice of a universal
+  file that ran. Debug info comes from a dSYM beside the binary, or without
+  one from the object files it names, which keep the DWARF of builds by
+  default, as Rust's. The system's libraries are in the dyld shared cache,
+  which has names only for the functions they export, and changes with each
+  update of the system, so the recording keeps the names of the system's
+  functions frames fall in. See [format](format.md#symbols).
 - Building blocks: samply's crates (`framehop` for unwinding,
   `wholesym` for symbols) and `linux-perf-data` for perf.data.
 

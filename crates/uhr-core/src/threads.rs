@@ -121,6 +121,7 @@ mod tests {
             memory: Vec::new(),
             regions: Vec::new(),
             region_memory: Vec::new(),
+            system_symbols: Vec::new(),
         }
     }
 

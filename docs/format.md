@@ -24,6 +24,7 @@ A recording is a directory:
 | `memory.parquet` | How much memory each process had, read at intervals |
 | `regions.parquet` | The regions of each process's memory, as it mapped them |
 | `region_memory.parquet` | How much memory each process had resident in each kind of region, read at intervals |
+| `system_symbols.parquet` | The functions of the system's own code that frames fall in, which an update of the system replaces, read while recording |
 | `symbols.parquet` | Function name per frame, after symbol resolution |
 | `symbol_sources.parquet` | Files the names came from, and why some frames have none |
 | `inline_frames.parquet` | Inlined calls and source lines per frame, from debug info |
@@ -330,24 +331,28 @@ as between readings of `memory`: a large process's is read less often.
 Written by `uhr symbolize`, which `uhr record` runs unless told not to. Names
 are matched to files by build-id, and come from the binary or from a separate
 debug file found by build-id or debug link. Kernel frames are named from
-`kernel_symbols`, and JIT frames from `jit_symbols`, which the recording
-saved.
+`kernel_symbols`, JIT frames from `jit_symbols`, and frames of the system's
+own code from `system_symbols`, which the recording saved.
 
 On macOS a build-id is a Mach-O UUID. A universal file holds code for
 several architectures, and the slice with the recorded UUID is the one that
 ran. Debug info comes from the binary's dSYM beside it,
 `<binary>.dSYM/Contents/Resources/DWARF/<name>`, or without one from the
 object files the binary was linked from, which it names, as builds keep them
-by default. Those give lines, but not where functions are declared. Mach-O
-names start with an underscore that C does not write, which names leave
-out.
+by default. Those give lines, but not where functions are declared. An image
+of the dyld shared cache, which has no file of its own, is read from the
+cache on this machine, which has names only for the functions an image
+exports: the others get placeholders. Mach-O names start with an underscore
+that C does not write, which names leave out.
 
 Each file is copied to a private temporary snapshot before reading its identity
 or symbols. Subsequent reads use that snapshot while debug-file lookup retains
 the original path. Snapshots are released after resolving each binary. This
 uses temporary disk space and copy I/O proportional to that binary and its debug
 files, without requiring their entire contents to stay in RAM. An in-place
-write detected during copying fails resolution for that file.
+write detected during copying fails resolution for that file. The dyld
+shared cache, gigabytes on the sealed system volume that only an update
+changes, is mapped as it is.
 
 Function queries group by build-id, or by module path for a file without one,
 and relative function start. So distinct functions sharing a name stay
@@ -396,6 +401,20 @@ time goes to the innermost line, and total time to every line on the stack,
 which for a caller is the line of the call. Code without line info keeps its
 time in a row with no line.
 
+`system_symbols`, sorted by `path`, `build_id` and `start`, with ranges that
+don't overlap in an image. The system's own code changes only with an update
+of the system, which replaces it, so uhr reads the functions frames fall in
+right after recording, the only time it surely can, for images an update
+replaces: on macOS those of the dyld shared cache, which have no file of
+their own, and those System Integrity Protection protects, as `dyld`.
+Resolving symbols names their frames from these, on any machine.
+
+| Column | Type | Meaning |
+|---|---|---|
+| `path`, `build_id` | string, nullable `build_id` | The image, as its mappings have it |
+| `start`, `end` | uint64 | The function's range, end exclusive, as frames' `file_offset` counts. On macOS that is from the start of the image's `__TEXT`, so `start` is also where the function starts relative to the image's base. A range is the function's, where the image says where it ends, and else reaches as far as the frames in it |
+| `name` | string, nullable | Null for a function the image has no name for, as the shared cache has none for functions its images do not export |
+
 `symbols`:
 
 | Column | Type | Meaning |
@@ -423,10 +442,10 @@ one per runtime, as in `[python]`.
 
 | Status | Meaning |
 |---|---|
-| `resolved` | The file's build-id matches the recording |
+| `resolved` | The file's build-id matches the recording, or the names came from `system_symbols`, or from the dyld shared cache's image with the recorded UUID |
 | `unverified` | Resolved, but there was no recorded build-id to check |
-| `missing_file` | The file is gone |
-| `build_id_mismatch` | The file changed since recording. No names are taken from it |
+| `missing_file` | The file is gone, and no shared cache here has the image |
+| `build_id_mismatch` | The file changed since recording, or the shared cache did, with an update of the system. No names are taken from it |
 | `unsupported` | `[vdso]` and other code that is not read from a file |
 | `failed` | Reading the file failed |
 | `unavailable` | The names could not be read while recording, the only time they could be. The kernel's, when the manifest's `kernel_symbols` is unavailable |

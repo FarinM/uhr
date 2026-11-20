@@ -28,6 +28,7 @@ const MEMORY: &str = "memory.parquet";
 const PAGE_FAULTS: &str = "page_faults.parquet";
 const REGIONS: &str = "regions.parquet";
 const REGION_MEMORY: &str = "region_memory.parquet";
+const SYSTEM_SYMBOLS: &str = "system_symbols.parquet";
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -139,6 +140,8 @@ pub struct Recording {
     pub regions: Vec<MemoryRegion>,
     /// Sorted by time.
     pub region_memory: Vec<RegionMemory>,
+    /// Sorted by path, build id and start, and not overlapping in an image.
+    pub system_symbols: Vec<SystemSymbol>,
 }
 
 /// One lifetime of a thread. The kernel reuses ids, so `(pid, tid)` can
@@ -425,6 +428,23 @@ impl RegionKind {
     }
 }
 
+/// A function of the system's own code, which an update of the system
+/// replaces, as the image's file or the dyld shared cache had it while
+/// recording. Only the ones frames fall in are kept.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SystemSymbol {
+    /// The image, as in its mappings.
+    pub path: String,
+    pub build_id: Option<String>,
+    /// Where its code is, end exclusive, as frames' `file_offset` counts:
+    /// on macOS from the start of the image's `__TEXT` segment, so `start`
+    /// is also where it starts relative to the image's base.
+    pub start: u64,
+    pub end: u64,
+    /// `None` for a function the image has no name for.
+    pub name: Option<String>,
+}
+
 /// A kernel function or BPF program, as the kernel listed it while
 /// recording. Only the ones kernel frames fall in are kept: the kernel
 /// moves on every boot, so its symbols cannot be read again later.
@@ -603,6 +623,7 @@ impl Recording {
             memory: read_memory(dir)?,
             regions: read_regions(dir)?,
             region_memory: read_region_memory(dir)?,
+            system_symbols: read_system_symbols(dir)?,
         };
         recording
             .check_references()
@@ -984,6 +1005,24 @@ impl Recording {
             ],
         )?;
 
+        let symbols = &self.system_symbols;
+        table::write(
+            &dir.join(SYSTEM_SYMBOLS),
+            vec![
+                Column::string("path", symbols.iter().map(|s| s.path.as_str()).collect()),
+                Column::optional_string(
+                    "build_id",
+                    symbols.iter().map(|s| s.build_id.as_deref()).collect(),
+                ),
+                Column::u64("start", symbols.iter().map(|s| s.start).collect()),
+                Column::u64("end", symbols.iter().map(|s| s.end).collect()),
+                Column::optional_string(
+                    "name",
+                    symbols.iter().map(|s| s.name.as_deref()).collect(),
+                ),
+            ],
+        )?;
+
         let readings = &self.region_memory;
         table::write(
             &dir.join(REGION_MEMORY),
@@ -1087,6 +1126,20 @@ impl Recording {
                 return Err(format!(
                     "kernel symbol {index} starts before the one before it ends"
                 ));
+            }
+        }
+        for (index, symbol) in self.system_symbols.iter().enumerate() {
+            if symbol.start >= symbol.end {
+                return Err(format!("system symbol {index} has start >= end"));
+            }
+            if let Some(before) = index.checked_sub(1).map(|i| &self.system_symbols[i]) {
+                let key = |s: &SystemSymbol| (s.path.clone(), s.build_id.clone());
+                if (key(before), before.end) > (key(symbol), symbol.start) {
+                    return Err(format!(
+                        "system symbol {index} is not after the one before it in image and \
+                         address"
+                    ));
+                }
             }
         }
         for (index, symbol) in self.jit_symbols.iter().enumerate() {
@@ -1519,6 +1572,29 @@ fn read_regions(dir: &Path) -> Result<Vec<MemoryRegion>> {
             })
         })
         .collect()
+}
+
+/// Recordings from before the table have none.
+fn read_system_symbols(dir: &Path) -> Result<Vec<SystemSymbol>> {
+    let path = dir.join(SYSTEM_SYMBOLS);
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let table = Table::read(&path)?;
+    let mut path = table.string("path")?;
+    let mut build_id = table.optional_string("build_id")?;
+    let start = table.u64("start")?;
+    let end = table.u64("end")?;
+    let mut name = table.optional_string("name")?;
+    Ok((0..table.len())
+        .map(|i| SystemSymbol {
+            path: std::mem::take(&mut path[i]),
+            build_id: build_id[i].take(),
+            start: start[i],
+            end: end[i],
+            name: name[i].take(),
+        })
+        .collect())
 }
 
 fn read_region_memory(dir: &Path) -> Result<Vec<RegionMemory>> {
