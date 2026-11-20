@@ -5,9 +5,10 @@ use std::collections::HashMap;
 use std::io;
 use std::ops::Range;
 
-use wholesym::samply_symbols::object::{self, Object, ObjectSegment, ObjectSymbol};
+use wholesym::samply_symbols::object::{self, Object, ObjectSection, ObjectSegment, ObjectSymbol};
 
 use super::Error;
+use crate::macho;
 use crate::recording::Mapping;
 
 pub trait Memory {
@@ -40,9 +41,12 @@ pub(super) fn symbols(
     wanted: impl Fn(&str) -> bool,
 ) -> Result<HashMap<String, Range<u64>>, Error> {
     let bytes = read_file(process, mapping)?;
-    let file = parse(&bytes, mapping)?;
+    let (file, data) = parse(&bytes, mapping)?;
     let bias = bias(&file, mapping)
         .ok_or_else(|| Error::Invalid(format!("{} is not mapped as code", mapping.path)))?;
+    if file.format() == object::BinaryFormat::MachO {
+        return Ok(macho_symbols(&file, data, bias, wanted));
+    }
     let mut found = HashMap::new();
     let mut add = |file: &object::File| {
         for symbol in file.symbols().chain(file.dynamic_symbols()) {
@@ -71,6 +75,48 @@ pub(super) fn symbols(
         add(&debug);
     }
     Ok(found)
+}
+
+/// The symbols `wanted` of a Mach-O file, by their names without the
+/// underscore Mach-O starts them with, which C does not write. Its symbols
+/// have no sizes, so each ends where the next function, symbol or section
+/// starts, or where its section ends.
+fn macho_symbols(
+    file: &object::File,
+    data: &[u8],
+    bias: u64,
+    wanted: impl Fn(&str) -> bool,
+) -> HashMap<String, Range<u64>> {
+    let mut bounds = macho::function_starts(file, data);
+    bounds.extend(file.symbols().filter_map(|symbol| {
+        symbol.section_index()?;
+        Some(symbol.address())
+    }));
+    bounds.extend(
+        file.sections()
+            .flat_map(|section| [section.address(), section.address() + section.size()]),
+    );
+    bounds.sort_unstable();
+    bounds.dedup();
+    let mut found = HashMap::new();
+    for symbol in file.symbols() {
+        let Ok(name) = symbol.name() else {
+            continue;
+        };
+        let name = name.strip_prefix('_').unwrap_or(name);
+        if symbol.section_index().is_none() || !wanted(name) {
+            continue;
+        }
+        let start = symbol.address();
+        let end = bounds
+            .get(bounds.partition_point(|&bound| bound <= start))
+            .copied()
+            .unwrap_or(start);
+        found
+            .entry(name.to_owned())
+            .or_insert(start.wrapping_add(bias)..end.wrapping_add(bias));
+    }
+    found
 }
 
 /// The build id of the 64-bit ELF file a mapping maps from its start, read
@@ -172,11 +218,24 @@ fn read_file(process: &dyn Process, mapping: &Mapping) -> Result<Vec<u8>, Error>
     })
 }
 
-fn parse<'a>(bytes: &'a [u8], mapping: &Mapping) -> Result<object::File<'a>, Error> {
-    object::File::parse(bytes).map_err(|e| Error::File {
+/// The object a mapping's file holds, and its bytes: in a universal Mach-O
+/// file, the slice that ran, which has the recorded UUID. A Mach-O file
+/// with another UUID is another build than the one mapped.
+fn parse<'a>(bytes: &'a [u8], mapping: &Mapping) -> Result<(object::File<'a>, &'a [u8]), Error> {
+    let invalid = |source| Error::File {
         path: mapping.path.clone(),
-        source: io::Error::new(io::ErrorKind::InvalidData, e),
-    })
+        source: io::Error::new(io::ErrorKind::InvalidData, source),
+    };
+    let uuid = mapping.build_id.as_deref().and_then(macho::uuid);
+    let data = &bytes[macho::slice(bytes, uuid)];
+    let file = object::File::parse(data).map_err(|e| invalid(e.to_string()))?;
+    let found = file.mach_uuid().ok().flatten();
+    if let (Some(uuid), Some(found)) = (uuid, found)
+        && uuid != found
+    {
+        return Err(invalid("another build than the one mapped".into()));
+    }
+    Ok((file, data))
 }
 
 /// The most modules with thread-locals a process has, past which the
@@ -201,7 +260,13 @@ pub(super) fn thread_local(
     symbol: &str,
 ) -> Result<Option<Vec<i32>>, Error> {
     let bytes = read_file(process, mapping)?;
-    let file = parse(&bytes, mapping)?;
+    let (file, _) = parse(&bytes, mapping)?;
+    if file.format() != object::BinaryFormat::Elf {
+        return Err(Error::Invalid(format!(
+            "uhr finds thread-locals only in ELF files, not in {}",
+            mapping.path
+        )));
+    }
     let bias = bias(&file, mapping)
         .ok_or_else(|| Error::Invalid(format!("{} is not mapped as code", mapping.path)))?;
     let missing = || Error::Invalid(format!("{} has no thread-local {symbol}", mapping.path));
@@ -315,6 +380,19 @@ fn returns_its_argument(
 /// What to add to an address in the file to get where the process has it.
 fn bias(file: &object::File, mapping: &Mapping) -> Option<u64> {
     const PAGE: u64 = 4096;
+    // On macOS a mapping's offset is from the start of its image's
+    // `__TEXT`, which the image's slide moves with the rest.
+    if file.format() == object::BinaryFormat::MachO {
+        let text = file
+            .segments()
+            .find(|segment| segment.name() == Ok(Some("__TEXT")))?;
+        return Some(
+            mapping
+                .start
+                .wrapping_sub(mapping.file_offset)
+                .wrapping_sub(text.address()),
+        );
+    }
     file.segments().find_map(|segment| {
         let (offset, size) = segment.file_range();
         let inside =
@@ -545,6 +623,119 @@ mod glibc {
             let path = thread_local(&process, mapping, "current").unwrap().unwrap();
             assert_eq!(path.len(), pointers, "{name}: {path:?}");
             assert_eq!(follow(&process, &path), value, "{name}: {path:?}");
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod macho_files {
+    use std::fs;
+    use std::path::Path;
+    use std::process::Command;
+
+    use super::*;
+
+    /// A process that maps one file, whose memory uhr does not read.
+    struct Mapped(Vec<Mapping>);
+
+    impl Memory for Mapped {
+        fn read(&self, _address: u64, _into: &mut [u8]) -> io::Result<()> {
+            Err(io::ErrorKind::Unsupported.into())
+        }
+    }
+
+    impl Process for Mapped {
+        fn pid(&self) -> u32 {
+            1
+        }
+        fn mappings(&self) -> &[Mapping] {
+            &self.0
+        }
+        fn file(&self, mapping: &Mapping) -> io::Result<Vec<u8>> {
+            fs::read(&mapping.path)
+        }
+        fn memory(&self) -> &dyn Memory {
+            self
+        }
+    }
+
+    /// Each slice's UUID, as uhr records it, and the address `nm` gives each
+    /// of `names` in it.
+    fn slices(library: &Path, names: &[&str]) -> Vec<(String, Vec<u64>)> {
+        let output = Command::new("dwarfdump")
+            .arg("--uuid")
+            .arg(library)
+            .output()
+            .unwrap();
+        let text = String::from_utf8(output.stdout).unwrap();
+        text.lines()
+            .map(|line| {
+                let fields: Vec<&str> = line.split_whitespace().collect();
+                let uuid = fields[1].replace('-', "").to_lowercase();
+                let arch = fields[2].trim_matches(['(', ')']);
+                let nm = Command::new("nm")
+                    .args(["-arch", arch])
+                    .arg(library)
+                    .output()
+                    .unwrap();
+                let nm = String::from_utf8(nm.stdout).unwrap();
+                let address = |name: &str| {
+                    nm.lines()
+                        .find_map(|line| {
+                            let fields: Vec<&str> = line.split_whitespace().collect();
+                            (fields[2] == format!("_{name}"))
+                                .then(|| u64::from_str_radix(fields[0], 16).unwrap())
+                        })
+                        .unwrap()
+                };
+                (uuid, names.iter().map(|name| address(name)).collect())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn finds_the_functions_of_the_slice_that_ran() {
+        let dir = std::env::temp_dir().join(format!("uhr-macho-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("f.c");
+        fs::write(
+            &source,
+            "int counter;\n\
+             int first(int x) { counter += x; return x * 3; }\n\
+             int second(int x) { return first(x) + 1; }\n",
+        )
+        .unwrap();
+        let library = dir.join("libf.dylib");
+        let built = Command::new("cc")
+            .args(["-shared", "-O1", "-arch", "arm64", "-arch", "x86_64", "-o"])
+            .arg(&library)
+            .arg(&source)
+            .status()
+            .unwrap();
+        assert!(built.success(), "cc failed");
+        let slices = slices(&library, &["first", "second"]);
+        assert_eq!(slices.len(), 2);
+        let start = 0x1_2340_0000;
+        for (uuid, addresses) in slices {
+            let process = Mapped(vec![Mapping {
+                pid: Some(1),
+                start,
+                end: start + 0x4000,
+                file_offset: 0,
+                path: library.to_str().unwrap().to_owned(),
+                build_id: Some(uuid.clone()),
+                time_ns: None,
+            }]);
+            let found = symbols(&process, &process.0[0], |name| {
+                matches!(name, "first" | "second" | "counter")
+            })
+            .unwrap();
+            let (first, second) = (start + addresses[0], start + addresses[1]);
+            assert_eq!(found["first"], first..second, "{uuid}");
+            assert_eq!(found["second"].start, second, "{uuid}");
+            assert!(!found["second"].is_empty(), "{uuid}");
+            assert!(found.contains_key("counter"), "{uuid}");
         }
         fs::remove_dir_all(&dir).unwrap();
     }

@@ -148,7 +148,13 @@ fn find(bun: &dyn Runtime, process: &dyn Process) -> Result<Option<Box<dyn Inter
     else {
         return Ok(None);
     };
-    let build_id = mapped_build_id(process.memory(), mapping).unwrap_or_default();
+    // On macOS the recorded build id is the Mach-O UUID.
+    let build_id = mapped_build_id(process.memory(), mapping)
+        .or_else(|| {
+            let uuid = mapping.build_id.as_deref().and_then(crate::macho::uuid)?;
+            Some(uuid.to_vec())
+        })
+        .unwrap_or_default();
     let Some(&(_, layout)) = LAYOUTS.iter().find(|(id, _)| id[..] == build_id[..]) else {
         let id: String = build_id.iter().map(|b| format!("{b:02x}")).collect();
         return Err(Error::Unsupported {

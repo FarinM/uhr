@@ -257,26 +257,7 @@ fn function_starts<'data>(
     let Some(bytes) = linkedit_data.get(offset as usize..offset as usize + size as usize) else {
         return Ok(Vec::new());
     };
-    // ULEB128 deltas, the first from the start of __TEXT, ending at a 0.
-    let mut addresses = Vec::new();
-    let (mut address, mut delta, mut shift) = (text, 0u64, 0);
-    for &byte in bytes {
-        if shift >= u64::BITS {
-            break;
-        }
-        delta |= u64::from(byte & 0x7f) << shift;
-        shift += 7;
-        if byte & 0x80 != 0 {
-            continue;
-        }
-        if delta == 0 {
-            break;
-        }
-        address += delta;
-        addresses.push(address);
-        (delta, shift) = (0, 0);
-    }
-    Ok(addresses)
+    Ok(crate::macho::decode_starts(text, bytes))
 }
 
 /// Mach-O names start with an underscore that C code does not write.

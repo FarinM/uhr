@@ -652,8 +652,10 @@ mod tests {
     fn tells_runtimes_by_their_binaries() {
         assert_eq!(binary_runtime("python3.12"), Some("python"));
         assert_eq!(binary_runtime("libpython3.13.so.1.0"), Some("python"));
+        assert_eq!(binary_runtime("Python"), Some("python"));
         assert_eq!(binary_runtime("node"), Some("node"));
         assert_eq!(binary_runtime("libnode.so.115"), Some("node"));
+        assert_eq!(binary_runtime("libnode.127.dylib"), Some("node"));
         assert_eq!(binary_runtime("libruby-3.2.so.3.2"), Some("ruby"));
         assert_eq!(binary_runtime("php8.3"), Some("php"));
         assert_eq!(binary_runtime("bun"), Some("bun"));

@@ -19,9 +19,11 @@ impl Runtime for Python {
         "python"
     }
 
-    /// `python3.12`, or a `libpython3.12.so` another program embeds it with.
+    /// `python3.12`, or a `libpython3.12.so` another program embeds it
+    /// with. On macOS, a framework build's library and the program in its
+    /// app are both named `Python`.
     fn is_binary(&self, file: &str) -> bool {
-        file.starts_with("python3") || file.starts_with("libpython3")
+        file.starts_with("python3") || file.starts_with("libpython3") || file == "Python"
     }
 
     fn perf_maps(&self) -> Option<&PerfMaps> {

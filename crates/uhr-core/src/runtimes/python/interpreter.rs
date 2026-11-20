@@ -297,8 +297,8 @@ struct CPython {
     eval_loop: Vec<Range<u64>>,
 }
 
-/// The CPython in `process`: in a `libpython` it maps, which can embed it
-/// in any program, or else in a `python3` program.
+/// The CPython in `process`: in a library it maps, which can embed it in
+/// any program, or else in a `python3` program.
 pub(super) fn find(
     python: &dyn Runtime,
     process: &dyn Process,
@@ -311,7 +311,10 @@ pub(super) fn find(
             files.push(mapping);
         }
     }
-    files.sort_by_key(|m| !file_name(m).starts_with("libpython"));
+    files.sort_by_key(|m| {
+        let name = file_name(m);
+        !(name.starts_with("libpython") || name == "Python")
+    });
     for mapping in files {
         let symbols = symbols(process, mapping, |name| {
             matches!(

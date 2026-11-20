@@ -27,7 +27,7 @@ impl Runtime for Node {
     }
 
     fn is_binary(&self, file: &str) -> bool {
-        file == "node" || file == "nodejs" || file.starts_with("libnode.so")
+        file == "node" || file == "nodejs" || file.starts_with("libnode.")
     }
 
     fn perf_maps(&self) -> Option<&PerfMaps> {

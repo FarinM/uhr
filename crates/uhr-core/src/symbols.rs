@@ -5,7 +5,6 @@ mod shared_cache;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io;
-use std::ops::Range;
 use std::path::Path;
 use std::sync::OnceLock;
 
@@ -20,6 +19,7 @@ use wholesym::samply_symbols::object::{self, Object, ObjectSection, ObjectSegmen
 use wholesym::samply_symbols::relative_address_base;
 use wholesym::samply_symbols::{BinaryImage, LookupAddress, MultiArchDisambiguator, SymbolManager};
 
+use crate::macho;
 use crate::recording::table::{self, Column, Table};
 use crate::recording::{self, JIT, KERNEL, KernelSymbols, Origin, Recording, SystemSymbol};
 
@@ -451,7 +451,7 @@ async fn resolve_file(
         );
     }
     // On macOS, build ids are Mach-O UUIDs.
-    let uuid = build_id.filter(|_| macos).and_then(macho_uuid);
+    let uuid = build_id.filter(|_| macos).and_then(macho::uuid);
     if !Path::new(path).exists() {
         return match (uuid, build_id) {
             (Some(uuid), Some(build_id)) => resolve_in_cache(
@@ -726,45 +726,6 @@ fn resolve_in_cache(
     }
 }
 
-/// Where in `data` the object with `uuid` is: for a universal Mach-O file,
-/// the slice with that UUID, and else all of it.
-fn macho_slice(data: &[u8], uuid: Option<[u8; 16]>) -> Range<usize> {
-    let all = 0..data.len();
-    let Some(uuid) = uuid else {
-        return all;
-    };
-    use object::read::macho::FatArch;
-    let arches: Vec<(u64, u64)> = match object::FileKind::parse(data) {
-        Ok(object::FileKind::MachOFat32) => object::read::macho::MachOFatFile32::parse(data)
-            .map(|fat| fat.arches().iter().map(|arch| arch.file_range()).collect()),
-        Ok(object::FileKind::MachOFat64) => object::read::macho::MachOFatFile64::parse(data)
-            .map(|fat| fat.arches().iter().map(|arch| arch.file_range()).collect()),
-        _ => return all,
-    }
-    .unwrap_or_default();
-    arches
-        .into_iter()
-        .map(|(offset, size)| offset as usize..(offset + size) as usize)
-        .find(|range: &Range<usize>| {
-            data.get(range.clone())
-                .and_then(|slice| object::File::parse(slice).ok())
-                .is_some_and(|object: object::File| object.mach_uuid().ok().flatten() == Some(uuid))
-        })
-        .unwrap_or(all)
-}
-
-/// A Mach-O UUID, as uhr records build ids: lowercase hex.
-fn macho_uuid(build_id: &str) -> Option<[u8; 16]> {
-    if build_id.len() != 32 {
-        return None;
-    }
-    let mut uuid = [0; 16];
-    for (i, byte) in uuid.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(build_id.get(i * 2..i * 2 + 2)?, 16).ok()?;
-    }
-    Some(uuid)
-}
-
 /// Names kernel frames from the kernel symbols saved while recording. Starts
 /// count from the kernel's or the module's mapping, so they stay the same
 /// across boots, which move the kernel.
@@ -873,7 +834,7 @@ fn proper_symbols<'data, R: ReadRef<'data>>(
     // Its file can be universal, which `parse` below cannot read.
     add_proper_symbols(binary, starts, &mut symbols);
     for (path, data) in files.loaded() {
-        let range = macho_slice(&data, uuid);
+        let range = macho::slice(&data, uuid);
         let Ok(object) = object::File::<&[u8]>::parse(&data[range]) else {
             continue;
         };

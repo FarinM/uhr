@@ -75,7 +75,7 @@ impl<'a> DebugInfo<'a> {
         uuid: Option<[u8; 16]>,
     ) -> Result<Option<Self>, String> {
         let data = files.read(path).map_err(|e| e.to_string())?;
-        let slice = super::macho_slice(&data, uuid);
+        let slice = crate::macho::slice(&data, uuid);
         let object = object::File::parse(&data[slice.clone()]).map_err(|e| e.to_string())?;
         if object.section_by_name(".debug_info").is_none() {
             return Ok(None);

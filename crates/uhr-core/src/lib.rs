@@ -6,6 +6,7 @@ pub mod filter;
 pub mod flamegraph;
 pub mod functions;
 pub mod interrupts;
+mod macho;
 pub mod metric;
 pub mod overview;
 pub mod perf_map;
