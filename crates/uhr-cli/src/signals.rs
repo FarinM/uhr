@@ -2,10 +2,12 @@ use std::io;
 use std::mem::MaybeUninit;
 use std::ptr;
 
-use uhr_linux::launch::Interrupts;
+use uhr_core::interrupts::Interrupts;
+#[cfg(target_os = "linux")]
+use uhr_linux::launch::monotonic_ns;
 
 /// A signal handler can only reach statics.
-pub static INTERRUPTS: Interrupts = Interrupts::new();
+pub static INTERRUPTS: Interrupts = Interrupts::new(monotonic_ns);
 
 const SIGNALS: [libc::c_int; 2] = [libc::SIGINT, libc::SIGTERM];
 

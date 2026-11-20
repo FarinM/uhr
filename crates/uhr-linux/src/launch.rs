@@ -4,7 +4,6 @@ use std::io::{self, ErrorKind, Read};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command};
-use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -12,7 +11,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use rustix::io::Errno;
 use rustix::pipe::{PipeFlags, pipe_with};
-use rustix::process::{Pid, PidfdFlags, Signal, pidfd_open};
+use rustix::process::{Pid, PidfdFlags, pidfd_open};
 
 use crate::procfs;
 use uhr_core::recording::ClockReading;
@@ -207,86 +206,16 @@ impl Process {
     }
 }
 
-/// The interrupts that end a capture. Whoever owns the process's signals,
-/// such as the CLI, records them here, from a signal handler if need be.
-#[derive(Debug, Default)]
-pub struct Interrupts {
-    count: AtomicU32,
-    first_ns: AtomicU64,
-    sent: AtomicI32,
-}
-
-impl Interrupts {
-    pub const fn new() -> Self {
-        Self {
-            count: AtomicU32::new(0),
-            first_ns: AtomicU64::new(0),
-            sent: AtomicI32::new(0),
-        }
-    }
-
-    /// An interrupt the target got too, as a terminal's Ctrl-C reaches the
-    /// whole process group. Async-signal-safe: it only reads the clock and
-    /// changes atomics.
-    pub fn interrupt(&self) {
-        let _ =
-            self.first_ns
-                .compare_exchange(0, monotonic_ns(), Ordering::Relaxed, Ordering::Relaxed);
-        self.count.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// An interrupt that another process sent to uhr alone, by the number
-    /// of its signal, which is passed on to the target. Async-signal-safe.
-    pub fn interrupt_sent(&self, signal: i32) {
-        self.interrupt();
-        self.sent.store(signal, Ordering::Relaxed);
-    }
-
-    pub(crate) fn count(&self) -> u32 {
-        self.count.load(Ordering::Relaxed)
-    }
-
-    /// The signal of the last one another process sent, once.
-    pub(crate) fn take_sent(&self) -> Option<Signal> {
-        Signal::from_named_raw(self.sent.swap(0, Ordering::Relaxed))
-    }
-
-    /// When the first came, on CLOCK_MONOTONIC.
-    pub(crate) fn first_ns(&self) -> Option<u64> {
-        let first = self.first_ns.load(Ordering::Relaxed);
-        (first != 0).then_some(first)
-    }
-}
-
 /// The clock perf stamps events with, given `--clockid=CLOCK_MONOTONIC`.
-pub(crate) fn monotonic_ns() -> u64 {
+pub fn monotonic_ns() -> u64 {
     let now = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
     now.tv_sec as u64 * 1_000_000_000 + now.tv_nsec as u64
 }
 
-/// CLOCK_REALTIME at the middle of two readings of CLOCK_MONOTONIC, from
-/// the closest of a few tries, as a thread can be preempted between them.
+/// CLOCK_REALTIME against CLOCK_MONOTONIC.
 pub(crate) fn clock_reading() -> ClockReading {
-    let realtime_ns = || {
+    ClockReading::read(monotonic_ns, || {
         let now = rustix::time::clock_gettime(rustix::time::ClockId::Realtime);
         now.tv_sec * 1_000_000_000 + now.tv_nsec
-    };
-    let read = || {
-        let before = monotonic_ns();
-        let realtime_ns = realtime_ns();
-        let took = monotonic_ns() - before;
-        let time_ns = before + took / 2;
-        (
-            took,
-            ClockReading {
-                time_ns,
-                realtime_ns,
-            },
-        )
-    };
-    let first = read();
-    let closest = (1..5)
-        .map(|_| read())
-        .fold(first, |a, b| if b.0 < a.0 { b } else { a });
-    closest.1
+    })
 }

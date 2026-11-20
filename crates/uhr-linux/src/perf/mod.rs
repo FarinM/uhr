@@ -27,11 +27,12 @@ use crate::doctor;
 use crate::ebpf::{self, Programs};
 use crate::interpreters::Interpreters;
 use crate::kallsyms::Kallsyms;
-use crate::launch::{self, Held, Interrupts, Process, clock_reading, monotonic_ns};
+use crate::launch::{self, Held, Process, clock_reading, monotonic_ns};
 use crate::memory;
 use crate::perf_map;
 use crate::runtimes;
 use uhr_core::doctor::Status;
+use uhr_core::interrupts::Interrupts;
 use uhr_core::perf_map::name_jit_frames;
 use uhr_core::recording::{self, Collector, Exit, MissingSignal, Recording, StreamCoverage};
 
@@ -1467,7 +1468,7 @@ fn supervise(
             let _ = kill_process(pid, Signal::TERM);
             target_stopped = true;
         }
-        let sent = interrupts.take_sent();
+        let sent = interrupts.take_sent().and_then(Signal::from_named_raw);
         if interrupted >= 2 && target_status.is_none() && !killed {
             let _ = kill_process(pid, Signal::KILL);
             killed = true;

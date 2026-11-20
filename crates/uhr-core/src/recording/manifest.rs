@@ -88,6 +88,29 @@ pub struct ClockReading {
     pub realtime_ns: i64,
 }
 
+impl ClockReading {
+    /// The real time at the middle of two readings of the recording's
+    /// clock, from the closest of a few tries, as a thread can be
+    /// preempted between them.
+    pub fn read(clock_ns: impl Fn() -> u64, realtime_ns: impl Fn() -> i64) -> Self {
+        let read = || {
+            let before = clock_ns();
+            let realtime_ns = realtime_ns();
+            let took = clock_ns() - before;
+            let reading = Self {
+                time_ns: before + took / 2,
+                realtime_ns,
+            };
+            (took, reading)
+        };
+        (0..5)
+            .map(|_| read())
+            .min_by_key(|&(took, _)| took)
+            .expect("five readings")
+            .1
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Stream {
     pub id: String,
