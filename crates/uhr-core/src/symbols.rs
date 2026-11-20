@@ -870,6 +870,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "builds ELF binaries with GNU tools"
+    )]
     fn metadata_segments_and_symbols_share_the_snapshot_after_replacement() {
         let dir = tempfile::tempdir().unwrap();
         let original = compile(dir.path(), "app", "EntryPoint", 1);
@@ -901,6 +905,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "builds ELF binaries with GNU tools"
+    )]
     fn real_placeholder_spellings_have_symbol_provenance() {
         let dir = tempfile::tempdir().unwrap();
         let binary = compile(dir.path(), "app", "EntryPoint", 1);
@@ -932,6 +940,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "builds ELF binaries with GNU tools"
+    )]
     fn rejects_provenance_from_a_mismatched_debug_candidate() {
         let dir = tempfile::tempdir().unwrap();
         let binary = compile(dir.path(), "app.so", "EntryPoint", 1);
@@ -963,6 +975,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "builds ELF binaries with GNU tools"
+    )]
     fn keeps_accepted_debug_symbols_when_the_binary_has_no_build_id() {
         let dir = tempfile::tempdir().unwrap();
         let binary = compile(dir.path(), "app.so", "EntryPoint", 1);
@@ -1004,6 +1020,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "builds ELF binaries with GNU tools"
+    )]
     fn keeps_provenance_from_debug_links_and_minidebuginfo() {
         let dir = tempfile::tempdir().unwrap();
         for mini in [false, true] {
