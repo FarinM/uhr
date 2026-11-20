@@ -45,7 +45,7 @@ replaces them.
 | Field | Meaning |
 |---|---|
 | `format_version` | `0` |
-| `platform.os`, `platform.arch` | The system the target ran on, as Rust names them, such as `linux` and `x86_64`. It says how to read what was recorded: uhr finds syscalls only in stacks recorded on Linux, from its kernel's function names |
+| `platform.os`, `platform.arch` | The system the target ran on, as Rust names them, such as `linux`, `macos`, `x86_64` and `aarch64`. It says how to read what was recorded: uhr finds syscalls only in stacks recorded on Linux, from its kernel's function names, and frames' `file_offset` counts from the start of a Mach-O image's `__TEXT` on macOS |
 | `target.command` | Command and arguments. Empty for an attached process without a command line, such as a kernel thread |
 | `target.launched` | True if the recording started the target, false if it attached |
 | `target.runtime_support` | The runtimes whose perf maps were on in the target's environment, so that they named the code they compiled: `python`, `node`. Null for a process uhr attached to, whose environment it did not see |
@@ -124,7 +124,7 @@ Each stream has:
 | `origin` | string | `binary`, `kernel`, `jit`, `interpreted` or `unresolved`. See [frames](model.md#frames). `jit` is code a runtime compiled in anonymous memory, which its perf map names. `interpreted` is a frame of the program's code that uhr read from its runtime, such as CPython's from its memory, or V8's from the native stack, whether the runtime interpreted that code or compiled it |
 | `address` | uint64 | Address in the process, or in the kernel |
 | `mapping_id` | uint32, nullable | Region containing the address. Null if none is known |
-| `file_offset` | uint64, nullable | Offset in the mapped file. Null without a file mapping |
+| `file_offset` | uint64, nullable | Offset in the mapped file, as the mapping's `file_offset` counts. Null without a file mapping |
 | `return_address` | bool | True if the address is a return address, which points one instruction past the call |
 | `code_id` | uint32, nullable | For an `interpreted` frame, its row in `interpreted_code`, and null for any other. Its `address` is where in the code it was, as the interpreter keeps it |
 | `line` | uint32, nullable | For an `interpreted` frame, the source line it was at. Null if the interpreter does not say |
@@ -333,6 +333,15 @@ debug file found by build-id or debug link. Kernel frames are named from
 `kernel_symbols`, and JIT frames from `jit_symbols`, which the recording
 saved.
 
+On macOS a build-id is a Mach-O UUID. A universal file holds code for
+several architectures, and the slice with the recorded UUID is the one that
+ran. Debug info comes from the binary's dSYM beside it,
+`<binary>.dSYM/Contents/Resources/DWARF/<name>`, or without one from the
+object files the binary was linked from, which it names, as builds keep them
+by default. Those give lines, but not where functions are declared. Mach-O
+names start with an underscore that C does not write, which names leave
+out.
+
 Each file is copied to a private temporary snapshot before reading its identity
 or symbols. Subsequent reads use that snapshot while debug-file lookup retains
 the original path. Snapshots are released after resolving each binary. This
@@ -426,8 +435,11 @@ one per runtime, as in `[python]`.
 debug info. A frame inside inlined code has a row for each inlined call and
 one for the function the machine code belongs to; a frame without debug info
 has none. uhr reads it from the DWARF with addr2line, and demangles names by
-their source language, so ELF names keep their leading underscores. Symbols
-resolved before this table existed have to be resolved again.
+their source language, so ELF names keep their leading underscores. A
+Mach-O binary without a dSYM has its DWARF in the object files it was linked
+from, which wholesym reads instead: its rows have no `decl_file` or
+`decl_line`. Symbols resolved before this table existed have to be resolved
+again.
 
 | Column | Type | Meaning |
 |---|---|---|

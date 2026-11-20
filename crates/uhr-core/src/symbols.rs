@@ -4,15 +4,18 @@ mod files;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io;
+use std::ops::Range;
 use std::path::Path;
 
 use debug_info::DebugInfo;
 use files::{Files, Location};
 use serde::Serialize;
 use tracing::{debug, info, warn};
+use wholesym::samply_symbols::debugid::DebugId;
+use wholesym::samply_symbols::object::read::ReadRef;
 use wholesym::samply_symbols::object::{self, Object, ObjectSection, ObjectSegment, ObjectSymbol};
 use wholesym::samply_symbols::relative_address_base;
-use wholesym::samply_symbols::{LookupAddress, SymbolManager};
+use wholesym::samply_symbols::{BinaryImage, LookupAddress, MultiArchDisambiguator, SymbolManager};
 
 use crate::recording::table::{self, Column, Table};
 use crate::recording::{self, JIT, KERNEL, KernelSymbols, Origin, Recording};
@@ -242,165 +245,15 @@ async fn resolve(recording: &Recording) -> Symbols {
         ));
     }
 
+    let macos = recording.manifest.platform.os == "macos";
     for ((path, build_id), frames) in by_file {
-        let source = |status, detail: Option<String>| Source {
-            path: path.to_owned(),
-            build_id: build_id.map(str::to_owned),
-            status,
-            detail,
-        };
-        if !path.starts_with('/') {
-            sources.push(source(
-                SourceStatus::Unsupported,
-                Some(format!("{path} is not read from memory")),
-            ));
-            continue;
+        let resolved = resolve_file(path, build_id, &frames, macos).await;
+        for named in resolved.names {
+            names[named.frame as usize] = Some(named.name);
+            function_addresses[named.frame as usize] = Some(named.function_address);
+            inline[named.frame as usize] = named.inline;
         }
-        if !Path::new(path).exists() {
-            sources.push(source(SourceStatus::MissingFile, None));
-            continue;
-        }
-        let manager = SymbolManager::with_helper(Files::default());
-        let files = manager.helper();
-        let snapshot = match files.read(Path::new(path)) {
-            Ok(snapshot) => snapshot,
-            Err(error) => {
-                sources.push(source(SourceStatus::Failed, Some(error.to_string())));
-                continue;
-            }
-        };
-        let info = match manager
-            .load_binary_at_location(
-                Location(path.into()),
-                Path::new(path)
-                    .file_name()
-                    .map(|s| s.to_string_lossy().into_owned()),
-                Some(path.into()),
-                None,
-            )
-            .await
-        {
-            Ok(binary) => binary.library_info(),
-            Err(error) => {
-                sources.push(source(SourceStatus::Failed, Some(error.to_string())));
-                continue;
-            }
-        };
-        let on_disk = info
-            .code_id
-            .as_ref()
-            .map(|id| id.to_string().to_lowercase());
-        let status = match (build_id, on_disk.as_deref()) {
-            (Some(recorded), Some(on_disk)) if recorded == on_disk => SourceStatus::Resolved,
-            (Some(recorded), on_disk) => {
-                sources.push(source(
-                    SourceStatus::BuildIdMismatch,
-                    Some(format!(
-                        "recorded build-id {recorded}, file has {}",
-                        on_disk.unwrap_or("none")
-                    )),
-                ));
-                continue;
-            }
-            (None, _) => SourceStatus::Unverified,
-        };
-        let loaded = match Segments::read(&snapshot) {
-            Ok(segments) => manager
-                .load_symbol_map(&info)
-                .await
-                .map(|map| (segments, map))
-                .map_err(|error| chain(&error)),
-            Err(error) => Err(format!("parsing binary snapshot: {error}")),
-        };
-        let (segments, map) = match loaded {
-            Ok(loaded) => loaded,
-            Err(error) => {
-                sources.push(source(SourceStatus::Failed, Some(error)));
-                continue;
-            }
-        };
-        let mut found = Vec::new();
-        for &(frame, offset) in &frames {
-            let Some(address) = segments.relative_address(offset) else {
-                continue;
-            };
-            if let Some(info) = map.lookup(LookupAddress::Relative(address)).await {
-                let debug_name = info
-                    .frames
-                    .as_ref()
-                    .and_then(|frames| frames.last())
-                    .and_then(|frame| frame.function.clone());
-                found.push((
-                    frame,
-                    address,
-                    info.symbol.address,
-                    info.symbol.name,
-                    debug_name,
-                ));
-            }
-        }
-        let starts: HashSet<u32> = found.iter().map(|&(_, _, start, _, _)| start).collect();
-        let raw: HashMap<u32, String> = map
-            .iter_symbols()
-            .filter(|(start, _)| starts.contains(start))
-            .map(|(start, name)| (start, name.into_owned()))
-            .collect();
-        let debug_path = map.debug_file_location().0.clone();
-        let proper = proper_symbols(&files, Path::new(path), &snapshot, &starts, &debug_path);
-        // Not needed any more, and the inline lookup below reads the same
-        // debug info again.
-        drop(map);
-        let (debug_info, debug_problem) = match DebugInfo::load(&files, &debug_path) {
-            Ok(debug_info) => (debug_info, None),
-            Err(problem) => (None, Some(problem)),
-        };
-        if let Some(debug_info) = &debug_info {
-            for &(frame, address, ..) in &found {
-                inline[frame as usize] = debug_info.chain(u64::from(address) + segments.base);
-            }
-        }
-        let mut placeholders = 0;
-        for (frame, _, start, demangled, debug_name) in &found {
-            // wholesym's debug name loses a leading underscore of ELF names.
-            let debug_name = &inline[*frame as usize]
-                .last()
-                .and_then(|outer| outer.function.clone())
-                .or_else(|| debug_name.clone());
-            let name = match raw.get(start) {
-                // wholesym strips a leading underscore from names it cannot
-                // demangle, as Mach-O expects. On ELF that turns `_start` into
-                // `start`, so keep the raw name.
-                Some(raw) if raw.strip_prefix('_') == Some(demangled.as_str()) => raw.clone(),
-                _ => demangled.clone(),
-            };
-            // A genuine ELF symbol may have exactly the same spelling as
-            // a synthesized label. Check the verified objects, not a prefix.
-            let real_symbol = raw
-                .get(start)
-                .is_some_and(|raw| proper.contains(&(*start, raw.clone())));
-            let made_up = debug_name.is_none() && !real_symbol;
-            let name = if real_symbol {
-                name
-            } else {
-                debug_name.clone().unwrap_or(name)
-            };
-            function_addresses[*frame as usize] = Some(*start);
-            names[*frame as usize] = Some(if made_up {
-                placeholders += 1;
-                FrameName::Placeholder(name)
-            } else {
-                FrameName::Symbol(name)
-            });
-        }
-        let named = found.len() - placeholders;
-        let mut detail = format!("named {named} of {} frames", frames.len());
-        if placeholders > 0 {
-            detail += &format!(", {placeholders} more with placeholder names");
-        }
-        if let Some(problem) = debug_problem {
-            detail += &format!(", inlined calls not read: {problem}");
-        }
-        sources.push(source(status, Some(detail)));
+        sources.push(resolved.source);
     }
 
     Symbols {
@@ -409,6 +262,266 @@ async fn resolve(recording: &Recording) -> Symbols {
         inline,
         sources,
     }
+}
+
+/// A frame named from its file.
+struct Named {
+    frame: u32,
+    function_address: u32,
+    name: FrameName,
+    inline: Vec<InlineFrame>,
+}
+
+struct Resolved {
+    source: Source,
+    names: Vec<Named>,
+}
+
+/// Names the frames of one file, by their offsets in it.
+async fn resolve_file(
+    path: &str,
+    build_id: Option<&str>,
+    frames: &[(u32, u64)],
+    macos: bool,
+) -> Resolved {
+    let done = |status, detail: Option<String>| Resolved {
+        source: Source {
+            path: path.to_owned(),
+            build_id: build_id.map(str::to_owned),
+            status,
+            detail,
+        },
+        names: Vec::new(),
+    };
+    if !path.starts_with('/') {
+        return done(
+            SourceStatus::Unsupported,
+            Some(format!("{path} is not read from memory")),
+        );
+    }
+    // On macOS, build ids are Mach-O UUIDs.
+    let uuid = build_id.filter(|_| macos).and_then(macho_uuid);
+    if !Path::new(path).exists() {
+        return done(SourceStatus::MissingFile, None);
+    }
+    let manager = SymbolManager::with_helper(Files::default());
+    let files = manager.helper();
+    let binary = match load_binary(&manager, path, uuid.and(build_id)).await {
+        Ok(binary) => binary,
+        Err(error) => return done(SourceStatus::Failed, Some(error)),
+    };
+    let info = binary.library_info();
+    let on_disk = info
+        .code_id
+        .as_ref()
+        .map(|id| id.to_string().to_lowercase());
+    let status = match (build_id, on_disk.as_deref()) {
+        (Some(recorded), Some(on_disk)) if recorded == on_disk => SourceStatus::Resolved,
+        (Some(recorded), on_disk) => {
+            return done(
+                SourceStatus::BuildIdMismatch,
+                Some(format!(
+                    "recorded build-id {recorded}, file has {}",
+                    on_disk.unwrap_or("none")
+                )),
+            );
+        }
+        (None, _) => SourceStatus::Unverified,
+    };
+    let Some(object) = binary.make_object() else {
+        return done(
+            SourceStatus::Failed,
+            Some(format!("{path} is not an object file")),
+        );
+    };
+    // Mach-O names take a leading underscore that is not part of the name.
+    let macho = object.format() == object::BinaryFormat::MachO;
+    let segments = Segments::of(&object);
+    let map = match manager.load_symbol_map(&info).await {
+        Ok(map) => map,
+        Err(error) => return done(SourceStatus::Failed, Some(chain(&error))),
+    };
+    let mut found = Vec::new();
+    for &(frame, offset) in frames {
+        // On macOS, offsets are from the start of the image's __TEXT
+        // segment, its base.
+        let address = match macos {
+            true => u32::try_from(offset).ok(),
+            false => segments.relative_address(offset),
+        };
+        let Some(address) = address else {
+            continue;
+        };
+        if let Some(info) = map.lookup(LookupAddress::Relative(address)).await {
+            found.push((frame, address, info));
+        }
+    }
+    let starts: HashSet<u32> = found
+        .iter()
+        .map(|(_, _, info)| info.symbol.address)
+        .collect();
+    let raw: HashMap<u32, String> = map
+        .iter_symbols()
+        .filter(|(start, _)| starts.contains(start))
+        .map(|(start, name)| (start, name.into_owned()))
+        .collect();
+    let debug_path = map.debug_file_location().0.clone();
+    let proper = proper_symbols(&files, Path::new(path), &object, uuid, &starts, &debug_path);
+    // Not needed any more, and the inline lookup below reads the same debug
+    // info again.
+    drop(map);
+    let (debug_info, debug_problem) = match DebugInfo::load(&files, &debug_path, uuid) {
+        Ok(debug_info) => (debug_info, None),
+        Err(problem) => (None, Some(problem)),
+    };
+    let mut names = Vec::with_capacity(found.len());
+    let mut placeholders = 0;
+    for (frame, address, info) in found {
+        let inline = match &debug_info {
+            Some(debug_info) => debug_info.chain(u64::from(address) + segments.base),
+            // Without DWARF of its own, as a Mach-O binary built without a
+            // dSYM, whose DWARF stays in the object files it was linked
+            // from, wholesym reads them. It does not say where functions
+            // are declared.
+            None => info
+                .frames
+                .iter()
+                .flatten()
+                .map(|frame| InlineFrame {
+                    function: frame.function.clone(),
+                    file: frame
+                        .file_path
+                        .as_ref()
+                        .map(|path| path.raw_path().to_owned()),
+                    line: frame.line_number,
+                    decl_file: None,
+                    decl_line: None,
+                })
+                .collect(),
+        };
+        let start = info.symbol.address;
+        let demangled = info.symbol.name;
+        // wholesym's debug name loses a leading underscore of ELF names.
+        let debug_name = inline
+            .last()
+            .and_then(|outer| outer.function.clone())
+            .or_else(|| {
+                info.frames
+                    .as_ref()
+                    .and_then(|frames| frames.last())
+                    .and_then(|frame| frame.function.clone())
+            });
+        let name = match raw.get(&start) {
+            // wholesym strips a leading underscore from names it cannot
+            // demangle, as Mach-O expects. On ELF that turns `_start` into
+            // `start`, so keep the raw name.
+            Some(raw) if !macho && raw.strip_prefix('_') == Some(demangled.as_str()) => raw.clone(),
+            _ => demangled,
+        };
+        // A genuine symbol may have exactly the same spelling as a
+        // synthesized label. Check the verified objects, not a prefix.
+        let real_symbol = raw
+            .get(&start)
+            .is_some_and(|raw| proper.contains(&(start, raw.clone())));
+        let made_up = debug_name.is_none() && !real_symbol;
+        let name = if real_symbol {
+            name
+        } else {
+            debug_name.unwrap_or(name)
+        };
+        names.push(Named {
+            frame,
+            function_address: start,
+            name: if made_up {
+                placeholders += 1;
+                FrameName::Placeholder(name)
+            } else {
+                FrameName::Symbol(name)
+            },
+            inline,
+        });
+    }
+    let named = names.len() - placeholders;
+    let mut detail = format!("named {named} of {} frames", frames.len());
+    if placeholders > 0 {
+        detail += &format!(", {placeholders} more with placeholder names");
+    }
+    if let Some(problem) = debug_problem {
+        detail += &format!(", inlined calls not read: {problem}");
+    }
+    Resolved {
+        source: Source {
+            path: path.to_owned(),
+            build_id: build_id.map(str::to_owned),
+            status,
+            detail: Some(detail),
+        },
+        names,
+    }
+}
+
+/// The binary that ran: its file, or the slice of a universal Mach-O file
+/// with the recorded UUID, `macho_id`.
+async fn load_binary(
+    manager: &SymbolManager<Files>,
+    path: &str,
+    macho_id: Option<&str>,
+) -> Result<BinaryImage<files::Snapshot>, String> {
+    let name = Path::new(path)
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned());
+    // As Breakpad writes them, with an age of 0, which Mach-O has.
+    let disambiguator = macho_id
+        .and_then(|id| DebugId::from_breakpad(&format!("{}0", id.to_uppercase())).ok())
+        .map(MultiArchDisambiguator::DebugId);
+    manager
+        .load_binary_at_location(
+            Location(path.into()),
+            name,
+            Some(path.into()),
+            disambiguator,
+        )
+        .await
+        .map_err(|error| chain(&error))
+}
+
+/// Where in `data` the object with `uuid` is: for a universal Mach-O file,
+/// the slice with that UUID, and else all of it.
+fn macho_slice(data: &[u8], uuid: Option<[u8; 16]>) -> Range<usize> {
+    let all = 0..data.len();
+    let Some(uuid) = uuid else {
+        return all;
+    };
+    use object::read::macho::FatArch;
+    let arches: Vec<(u64, u64)> = match object::FileKind::parse(data) {
+        Ok(object::FileKind::MachOFat32) => object::read::macho::MachOFatFile32::parse(data)
+            .map(|fat| fat.arches().iter().map(|arch| arch.file_range()).collect()),
+        Ok(object::FileKind::MachOFat64) => object::read::macho::MachOFatFile64::parse(data)
+            .map(|fat| fat.arches().iter().map(|arch| arch.file_range()).collect()),
+        _ => return all,
+    }
+    .unwrap_or_default();
+    arches
+        .into_iter()
+        .map(|(offset, size)| offset as usize..(offset + size) as usize)
+        .find(|range: &Range<usize>| {
+            data.get(range.clone())
+                .and_then(|slice| object::File::parse(slice).ok())
+                .is_some_and(|object: object::File| object.mach_uuid().ok().flatten() == Some(uuid))
+        })
+        .unwrap_or(all)
+}
+
+/// A Mach-O UUID, as uhr records build ids: lowercase hex.
+fn macho_uuid(build_id: &str) -> Option<[u8; 16]> {
+    if build_id.len() != 32 {
+        return None;
+    }
+    let mut uuid = [0; 16];
+    for (i, byte) in uuid.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(build_id.get(i * 2..i * 2 + 2)?, 16).ok()?;
+    }
+    Some(uuid)
 }
 
 /// Names kernel frames from the kernel symbols saved while recording. Starts
@@ -505,21 +618,22 @@ fn resolve_interpreted(
 
 /// Only names from the binary or a matching debug artifact are evidence.
 /// Rejected candidates can have coincident addresses and must not contribute.
-fn proper_symbols(
+fn proper_symbols<'data, R: ReadRef<'data>>(
     files: &Files,
     binary_path: &Path,
-    binary: &[u8],
+    binary: &object::File<'data, R>,
+    uuid: Option<[u8; 16]>,
     starts: &HashSet<u32>,
     accepted_debug_path: &Path,
 ) -> HashSet<(u32, String)> {
-    let Ok(original) = object::File::parse(binary) else {
-        return HashSet::new();
-    };
-    let build_id = original.build_id().ok().flatten();
-    let debug_link = original.gnu_debuglink().ok().flatten();
+    let build_id = binary.build_id().ok().flatten();
+    let debug_link = binary.gnu_debuglink().ok().flatten();
     let mut symbols = HashSet::new();
+    // Its file can be universal, which `parse` below cannot read.
+    add_proper_symbols(binary, starts, &mut symbols);
     for (path, data) in files.loaded() {
-        let Ok(object) = object::File::parse(&*data) else {
+        let range = macho_slice(&data, uuid);
+        let Ok(object) = object::File::<&[u8]>::parse(&data[range]) else {
             continue;
         };
         let matches_id = build_id.is_some() && object.build_id().ok().flatten() == build_id;
@@ -546,8 +660,8 @@ fn proper_symbols(
     symbols
 }
 
-fn add_proper_symbols(
-    object: &object::File<'_>,
+fn add_proper_symbols<'data, R: ReadRef<'data>>(
+    object: &object::File<'data, R>,
     starts: &HashSet<u32>,
     symbols: &mut HashSet<(u32, String)>,
 ) {
@@ -584,8 +698,9 @@ struct Segments {
 }
 
 impl Segments {
-    fn read(bytes: &[u8]) -> Result<Self, object::Error> {
-        let object = object::File::parse(bytes)?;
+    /// File offsets are from the start of the object, which in a universal
+    /// file is its slice.
+    fn of<'data, R: ReadRef<'data>>(object: &object::File<'data, R>) -> Self {
         let ranges = object
             .segments()
             .map(|segment| {
@@ -593,8 +708,8 @@ impl Segments {
                 (offset, size, segment.address())
             })
             .collect();
-        let base = relative_address_base(&object);
-        Ok(Self { base, ranges })
+        let base = relative_address_base(object);
+        Self { base, ranges }
     }
 
     fn relative_address(&self, file_offset: u64) -> Option<u32> {
@@ -917,8 +1032,15 @@ mod tests {
         let address = relative_symbol(&bytes, "EntryPoint");
         let starts = HashSet::from([address]);
         assert!(
-            proper_symbols(&files, &binary, &bytes, &starts, &binary)
-                .contains(&(address, "EntryPoint".into()))
+            proper_symbols(
+                &files,
+                &binary,
+                &object::File::parse(&*bytes).unwrap(),
+                None,
+                &starts,
+                &binary
+            )
+            .contains(&(address, "EntryPoint".into()))
         );
         let renamed = dir.path().join("renamed");
         let label = format!("fun_{address:x}");
@@ -935,7 +1057,15 @@ mod tests {
         let files = Files::default();
         let bytes = files.read(&renamed).unwrap();
         assert!(
-            proper_symbols(&files, &renamed, &bytes, &starts, &renamed).contains(&(address, label))
+            proper_symbols(
+                &files,
+                &renamed,
+                &object::File::parse(&*bytes).unwrap(),
+                None,
+                &starts,
+                &renamed
+            )
+            .contains(&(address, label))
         );
     }
 
@@ -969,8 +1099,15 @@ mod tests {
                 .any(|(p, _)| p.ends_with("app.so.dbg"))
         );
         assert!(
-            !proper_symbols(&files, &binary, &bytes, &HashSet::from([address]), &binary)
-                .contains(&(address, "EntryPoint".into()))
+            !proper_symbols(
+                &files,
+                &binary,
+                &object::File::parse(&*bytes).unwrap(),
+                None,
+                &HashSet::from([address]),
+                &binary
+            )
+            .contains(&(address, "EntryPoint".into()))
         );
     }
 
@@ -1010,7 +1147,8 @@ mod tests {
                 proper_symbols(
                     &files,
                     &binary,
-                    &bytes,
+                    &object::File::parse(&*bytes).unwrap(),
+                    None,
                     &HashSet::from([address]),
                     &map.debug_file_location().0
                 )
@@ -1083,8 +1221,15 @@ mod tests {
             let files = manager.helper();
             let bytes = files.read(&binary).unwrap();
             assert!(
-                proper_symbols(&files, &binary, &bytes, &HashSet::from([address]), &binary)
-                    .contains(&(address, "EntryPoint".into())),
+                proper_symbols(
+                    &files,
+                    &binary,
+                    &object::File::parse(&*bytes).unwrap(),
+                    None,
+                    &HashSet::from([address]),
+                    &binary
+                )
+                .contains(&(address, "EntryPoint".into())),
                 "{filename}"
             );
         }

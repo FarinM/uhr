@@ -158,6 +158,20 @@ impl FileAndPathHelper for Files {
         info: &LibraryInfo,
     ) -> FileAndPathHelperResult<Vec<CandidatePathInfo<Location>>> {
         let mut paths = Vec::new();
+        // Where Apple's tools put the DWARF they gather from a build's object
+        // files.
+        if let (Some(CodeId::MachoUuid(_)), Some(path)) = (&info.code_id, &info.path) {
+            let path = Path::new(path);
+            if let Some(name) = path.file_name() {
+                let mut bundle = path.as_os_str().to_owned();
+                bundle.push(".dSYM");
+                paths.push(
+                    Path::new(&bundle)
+                        .join("Contents/Resources/DWARF")
+                        .join(name),
+                );
+            }
+        }
         if let Some(path) = info.path.as_deref().filter(|p| p.ends_with(".so")) {
             paths.push(PathBuf::from(format!("{path}.dbg")));
         }

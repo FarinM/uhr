@@ -67,14 +67,20 @@ struct LazyUnit {
 }
 
 impl<'a> DebugInfo<'a> {
-    /// `None` if the file has no DWARF.
-    pub(super) fn load(files: &'a Files, path: &Path) -> Result<Option<Self>, String> {
+    /// `None` if the file has no DWARF. In a universal Mach-O file, as a
+    /// dSYM of a universal build, the DWARF is the slice with `uuid`.
+    pub(super) fn load(
+        files: &'a Files,
+        path: &Path,
+        uuid: Option<[u8; 16]>,
+    ) -> Result<Option<Self>, String> {
         let data = files.read(path).map_err(|e| e.to_string())?;
-        let object = object::File::parse(&*data).map_err(|e| e.to_string())?;
+        let slice = super::macho_slice(&data, uuid);
+        let object = object::File::parse(&data[slice.clone()]).map_err(|e| e.to_string())?;
         if object.section_by_name(".debug_info").is_none() {
             return Ok(None);
         }
-        let dwarf = Arc::new(dwarf(&data, &object, SectionId::name)?);
+        let dwarf = Arc::new(dwarf(&data, slice.start, &object, SectionId::name)?);
         let mut units = Vec::new();
         let mut headers = dwarf.units();
         while let Ok(Some(header)) = headers.next() {
@@ -157,7 +163,7 @@ impl<'a> DebugInfo<'a> {
         if let Some(Location(path)) = dwo
             && let Ok(data) = self.files.read(&path)
             && let Ok(object) = object::File::parse(&*data)
-            && let Ok(mut dwarf) = dwarf(&data, &object, |id| id.dwo_name().unwrap_or_default())
+            && let Ok(mut dwarf) = dwarf(&data, 0, &object, |id| id.dwo_name().unwrap_or_default())
         {
             dwarf.make_dwo(&load.parent);
             return Some(Arc::new(dwarf));
@@ -168,7 +174,7 @@ impl<'a> DebugInfo<'a> {
         let endian = endian(&object);
         let empty = EndianReader::new(Bytes::Decompressed(Arc::from(&[][..])), endian);
         let package = gimli::DwarfPackage::load(
-            |id| section(&data, &object, id.dwo_name().unwrap_or_default(), endian),
+            |id| section(&data, 0, &object, id.dwo_name().unwrap_or_default(), endian),
             empty,
         )
         .ok()?;
@@ -245,19 +251,22 @@ fn file_path(unit: UnitRef<Reader>, index: u64) -> Option<String> {
     Some(path.to_string_lossy().into_owned())
 }
 
-/// `object` is parsed from `snapshot`.
+/// `object` is parsed from `snapshot` from `offset` on.
 fn dwarf(
     snapshot: &Snapshot,
+    offset: usize,
     object: &object::File,
     name: impl Fn(SectionId) -> &'static str,
 ) -> Result<gimli::Dwarf<Reader>, String> {
     let endian = endian(object);
-    gimli::Dwarf::load(|id| section(snapshot, object, name(id), endian)).map_err(|e| e.to_string())
+    gimli::Dwarf::load(|id| section(snapshot, offset, object, name(id), endian))
+        .map_err(|e| e.to_string())
 }
 
 /// Missing sections are empty, as gimli expects.
 fn section(
     snapshot: &Snapshot,
+    offset: usize,
     object: &object::File,
     name: &str,
     endian: RunTimeEndian,
@@ -270,7 +279,7 @@ fn section(
     };
     let bytes = match section.compressed_file_range() {
         Ok(range) if range.format == CompressionFormat::None => {
-            let start = range.offset as usize;
+            let start = offset + range.offset as usize;
             Bytes::Mapped(
                 snapshot.clone(),
                 start..start + range.uncompressed_size as usize,
