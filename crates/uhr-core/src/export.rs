@@ -225,6 +225,8 @@ struct Builder<'a> {
     start: u64,
     names: ThreadNames<'a>,
     lifetimes: BTreeMap<(u32, u32), Vec<usize>>,
+    /// The lifetimes of each pid's main threads, by start.
+    mains: BTreeMap<u32, Vec<usize>>,
     thread_ids: HashMap<ThreadKey, usize>,
     process_ends: HashMap<usize, Option<u64>>,
     tid_uses: HashMap<u32, usize>,
@@ -241,13 +243,17 @@ impl<'a> Builder<'a> {
         start: u64,
     ) -> Self {
         let mut lifetimes: BTreeMap<_, Vec<_>> = BTreeMap::new();
+        let mut mains: BTreeMap<_, Vec<_>> = BTreeMap::new();
         for (i, thread) in recording.threads.iter().enumerate() {
             lifetimes
                 .entry((thread.pid, thread.tid))
                 .or_default()
                 .push(i);
+            if thread.main {
+                mains.entry(thread.pid).or_default().push(i);
+            }
         }
-        for rows in lifetimes.values_mut() {
+        for rows in lifetimes.values_mut().chain(mains.values_mut()) {
             rows.sort_by_key(|&i| recording.threads[i].start_ns);
         }
         let mut builder = Self {
@@ -257,6 +263,7 @@ impl<'a> Builder<'a> {
             start,
             names: ThreadNames::new(recording),
             lifetimes,
+            mains,
             thread_ids: HashMap::new(),
             process_ends: HashMap::new(),
             tid_uses: HashMap::new(),
@@ -281,7 +288,7 @@ impl<'a> Builder<'a> {
     }
 
     fn process_row(&self, pid: u32, time: u64) -> Option<usize> {
-        let rows = self.lifetimes.get(&(pid, pid))?;
+        let rows = self.mains.get(&pid)?;
         let end =
             rows.partition_point(|&i| self.recording.threads[i].start_ns.is_none_or(|t| t <= time));
         // The main thread may exit while workers keep the process alive.
@@ -353,18 +360,15 @@ impl<'a> Builder<'a> {
                 }
                 _ => unique(tid, row, reused(tid)),
             },
-            process_name: self
-                .names
-                .of_lifetime(
-                    pid,
-                    pid,
-                    leader.and_then(|t| t.start_ns),
-                    time.saturating_add(1),
-                )
-                .last()
-                .map(|name| (*name).to_owned())
+            process_name: leader
+                .and_then(|leader| {
+                    self.names
+                        .of_lifetime(pid, leader.tid, leader.start_ns, time.saturating_add(1))
+                        .last()
+                        .map(|name| (*name).to_owned())
+                })
                 .unwrap_or_else(|| format!("Process {pid}")),
-            is_main_thread: pid == tid,
+            is_main_thread: thread.is_some_and(|t| t.main),
             process_type: "default",
             process_startup_time: relative_ms(
                 leader.and_then(|t| t.start_ns).unwrap_or(self.start),

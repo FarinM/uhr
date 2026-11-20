@@ -94,6 +94,7 @@ Each stream has:
 | `parent_pid`, `parent_tid` | uint32, nullable | The thread that created it. Null if it started before the recording |
 | `start_ns` | uint64, nullable | Null if the thread started before the recording |
 | `end_ns` | uint64, nullable | Null if the thread outlived the recording, or its exit was not seen |
+| `main` | bool | Whether it is the thread its process started with: on Linux, the one with the pid as its tid. A recording from before the column has it so |
 
 `thread_names`:
 

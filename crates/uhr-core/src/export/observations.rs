@@ -195,7 +195,11 @@ impl Builder<'_> {
             let mut readings: Vec<_> = readings.collect();
             readings.sort_by_key(|r| r.time_ns);
             for reading in readings {
-                let thread = self.thread(reading.pid, reading.pid, reading.time_ns);
+                // A process's memory goes with its main thread.
+                let tid = self
+                    .process_row(reading.pid, reading.time_ns)
+                    .map_or(reading.pid, |row| self.recording.threads[row].tid);
+                let thread = self.thread(reading.pid, tid, reading.time_ns);
                 let rss = reading.rss_bytes();
                 let (counter, previous) = counter_ids.entry(thread).or_insert_with(|| {
                     let id = counters.len();

@@ -111,6 +111,7 @@ fn thread(tid: u32, start_ns: Option<u64>, end_ns: Option<u64>) -> Thread {
         parent_tid: None,
         start_ns,
         end_ns,
+        main: tid == 1,
     }
 }
 

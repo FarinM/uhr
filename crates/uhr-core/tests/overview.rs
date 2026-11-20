@@ -12,6 +12,7 @@ fn thread(tid: u32, start_ns: Option<u64>, end_ns: Option<u64>) -> Thread {
         parent_tid: start_ns.map(|_| 1),
         start_ns,
         end_ns,
+        main: tid == 1,
     }
 }
 
@@ -417,6 +418,7 @@ fn a_reused_pid_is_two_processes() {
         parent_tid: Some(1),
         start_ns: Some(start_ns),
         end_ns: Some(end_ns),
+        main: tid == 9,
     };
     recording.threads.extend([
         thread(9, 2_000, 4_000),
@@ -742,6 +744,7 @@ fn with_memory(mut recording: Recording) -> Recording {
             parent_tid: Some(1),
             start_ns,
             end_ns,
+            main: true,
         });
     }
     let reading = |time_ns, pid, rss_anon_bytes, peak_rss_bytes| MemoryReading {

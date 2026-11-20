@@ -313,10 +313,7 @@ pub fn run(
                 names: names.during(thread.pid, thread.tid, present.0, present.1),
                 present: present.0 < present.1,
                 alive: bounds.clip(thread),
-                process: (
-                    thread.pid,
-                    lifetimes.at(thread.pid, thread.pid, thread.start_ns),
-                ),
+                process: (thread.pid, lifetimes.main_at(thread.pid, thread.start_ns)),
             }
         })
         .collect();
@@ -493,13 +490,13 @@ fn memory(
         })?;
     let mut lives: HashMap<(u32, Option<usize>), Vec<&MemoryReading>> = HashMap::new();
     for reading in filter.memory(recording)? {
-        let life = lifetimes.at(reading.pid, reading.pid, Some(reading.time_ns));
+        let life = lifetimes.main_at(reading.pid, Some(reading.time_ns));
         lives.entry((reading.pid, life)).or_default().push(reading);
     }
     // The last reading by kind of region of each process lifetime.
     let mut regions: HashMap<(u32, Option<usize>), RegionsUsage> = HashMap::new();
     for reading in filter.region_memory(recording)? {
-        let life = lifetimes.at(reading.pid, reading.pid, Some(reading.time_ns));
+        let life = lifetimes.main_at(reading.pid, Some(reading.time_ns));
         let time_ns = reading.time_ns.saturating_sub(base);
         let usage = regions.entry((reading.pid, life)).or_insert(RegionsUsage {
             time_ns,
@@ -548,7 +545,9 @@ fn memory(
                 .unwrap_or(last);
             MemoryRow {
                 pid,
-                name: names.at(pid, pid, last.time_ns).map(str::to_owned),
+                name: life
+                    .and_then(|main| names.at(pid, lifetimes.threads[main].tid, last.time_ns))
+                    .map(str::to_owned),
                 readings: readings.len() as u64,
                 first: usage(first),
                 last: usage(last),
@@ -642,6 +641,9 @@ struct Lifetimes {
     /// Lifetimes of each thread id, by start. Ones that started before the
     /// recording come first.
     by_id: HashMap<(u32, u32), Vec<usize>>,
+    /// Lifetimes of the main threads of each pid, by start: one for each
+    /// process that had the pid, and each exec on macOS.
+    mains: HashMap<u32, Vec<usize>>,
 }
 
 impl Lifetimes {
@@ -665,14 +667,25 @@ impl Lifetimes {
                     parent_tid: None,
                     start_ns: None,
                     end_ns: None,
+                    // Of a thread the recording has no row for, only Linux
+                    // tells, by its id.
+                    main: pid == tid,
                 });
                 vec![threads.len() - 1]
             });
         }
-        for ids in by_id.values_mut() {
+        let mut mains: HashMap<u32, Vec<usize>> = HashMap::new();
+        for (id, thread) in threads.iter().enumerate().filter(|(_, t)| t.main) {
+            mains.entry(thread.pid).or_default().push(id);
+        }
+        for ids in by_id.values_mut().chain(mains.values_mut()) {
             ids.sort_by_key(|&id| threads[id].start_ns);
         }
-        Self { threads, by_id }
+        Self {
+            threads,
+            by_id,
+            mains,
+        }
     }
 
     /// The last lifetime of a thread id that started by `time`, where
@@ -690,6 +703,19 @@ impl Lifetimes {
     fn of(&self, pid: u32, tid: u32, time_ns: u64) -> usize {
         self.at(pid, tid, Some(time_ns))
             .expect("every thread id seen has a lifetime")
+    }
+
+    /// The lifetime of the main thread of the process that had `pid` at
+    /// `time`, where `None` is before the recording: the last that started
+    /// by then.
+    fn main_at(&self, pid: u32, time: Option<u64>) -> Option<usize> {
+        let ids = self.mains.get(&pid)?;
+        let started = ids.partition_point(|&id| match (self.threads[id].start_ns, time) {
+            (None, _) => true,
+            (Some(_), None) => false,
+            (Some(start), Some(time)) => start <= time,
+        });
+        Some(ids[started.saturating_sub(1)])
     }
 }
 

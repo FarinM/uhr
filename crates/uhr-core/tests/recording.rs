@@ -116,6 +116,7 @@ fn example() -> Recording {
                 parent_tid: None,
                 start_ns: None,
                 end_ns: Some(9_000),
+                main: true,
             },
             Thread {
                 pid: 7,
@@ -124,6 +125,7 @@ fn example() -> Recording {
                 parent_tid: Some(7),
                 start_ns: Some(1_500),
                 end_ns: None,
+                main: false,
             },
         ],
         thread_names: vec![ThreadName {

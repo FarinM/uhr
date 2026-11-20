@@ -192,6 +192,12 @@ impl Table {
         self.added(column, Self::optional_string)
     }
 
+    pub fn added_bool(&self, column: &str) -> Result<Vec<Option<bool>>> {
+        self.added(column, |table, column| {
+            Ok(table.bool(column)?.into_iter().map(Some).collect())
+        })
+    }
+
     fn added<T: Clone>(
         &self,
         column: &str,

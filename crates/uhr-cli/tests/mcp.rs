@@ -140,6 +140,7 @@ fn unsymbolized(name: &str) -> PathBuf {
         parent_tid: None,
         start_ns: None,
         end_ns: None,
+        main: tid == 1,
     };
     let thread_name = |tid, name: &str| ThreadName {
         pid: 1,

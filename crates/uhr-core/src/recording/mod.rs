@@ -155,6 +155,9 @@ pub struct Thread {
     pub start_ns: Option<u64>,
     /// `None` if the thread outlived the recording, or its exit was not seen.
     pub end_ns: Option<u64>,
+    /// The thread its process started with, which on Linux has the pid as
+    /// its tid.
+    pub main: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -705,6 +708,7 @@ impl Recording {
                 Column::optional_u32("parent_tid", threads.iter().map(|t| t.parent_tid).collect()),
                 Column::optional_u64("start_ns", threads.iter().map(|t| t.start_ns).collect()),
                 Column::optional_u64("end_ns", threads.iter().map(|t| t.end_ns).collect()),
+                Column::bool("main", threads.iter().map(|t| t.main).collect()),
             ],
         )?;
 
@@ -1176,6 +1180,7 @@ fn read_threads(dir: &Path) -> Result<Vec<Thread>> {
     let parent_tid = table.optional_u32("parent_tid")?;
     let start_ns = table.optional_u64("start_ns")?;
     let end_ns = table.optional_u64("end_ns")?;
+    let main = table.added_bool("main")?;
     Ok((0..table.len())
         .map(|i| Thread {
             pid: pid[i],
@@ -1184,6 +1189,8 @@ fn read_threads(dir: &Path) -> Result<Vec<Thread>> {
             parent_tid: parent_tid[i],
             start_ns: start_ns[i],
             end_ns: end_ns[i],
+            // Recordings from before the column are of Linux.
+            main: main[i].unwrap_or(pid[i] == tid[i]),
         })
         .collect())
 }

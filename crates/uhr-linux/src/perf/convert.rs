@@ -1203,6 +1203,7 @@ impl State {
             parent_tid: None,
             start_ns: None,
             end_ns: None,
+            main: pid == tid,
         })
     }
 
@@ -1253,6 +1254,7 @@ impl State {
                 parent_tid: parent.map(|(_, ptid)| ptid),
                 start_ns: time,
                 end_ns: None,
+                main: pid == tid,
             },
         );
         // The kernel sends no COMM event for the name a child inherits.
