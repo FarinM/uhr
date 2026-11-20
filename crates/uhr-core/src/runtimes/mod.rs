@@ -16,7 +16,9 @@ mod php;
 mod process;
 mod python;
 mod ruby;
+pub mod stacks;
 mod text;
+pub mod walker;
 
 /// A runtime uhr supports.
 pub trait Runtime: Sync {
