@@ -148,6 +148,23 @@ fn macho_symbols(
     found
 }
 
+/// Where the section `name` of a mapping's file is in the process.
+pub(super) fn section(
+    process: &dyn Process,
+    mapping: &Mapping,
+    name: &str,
+) -> Result<Option<Range<u64>>, Error> {
+    let bytes = read_file(process, mapping)?;
+    let (file, _) = parse(&bytes, mapping)?;
+    let Some(bias) = bias(&file, mapping) else {
+        return Ok(None);
+    };
+    Ok(file.section_by_name(name).map(|section| {
+        let start = section.address().wrapping_add(bias);
+        start..start + section.size()
+    }))
+}
+
 /// The build id of the 64-bit ELF file a mapping maps from its start, read
 /// from the notes the program headers say it holds, in the process's
 /// memory, which saves reading the file.

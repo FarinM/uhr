@@ -364,18 +364,29 @@ fn node() -> Option<PathBuf> {
     node
 }
 
-/// A `bun` whose frames uhr reads: the release whose offsets it knows, of
-/// which uhr knows the build for arm64.
 fn bun() -> Option<PathBuf> {
-    let bun = find("bun").filter(|bun| {
-        let output = Command::new(bun).arg("--revision").output();
-        cfg!(target_arch = "aarch64")
-            && output.is_ok_and(|output| output.stdout.starts_with(b"1.4.3+c6da4a4d3"))
-    });
+    let bun = find("bun");
     if bun.is_none() {
-        eprintln!("skipped: needs Bun 1.4.3 for arm64");
+        eprintln!("skipped: needs Bun");
     }
     bun
+}
+
+/// A `bun` whose promises keep the function that waits for each, as those
+/// of 1.4 and later do.
+fn bun_whose_promises_say_who_waits() -> Option<PathBuf> {
+    let bun = bun()?;
+    let version = Command::new(&bun).arg("--version").output().ok()?;
+    let version = String::from_utf8_lossy(&version.stdout);
+    let mut parts = version
+        .trim()
+        .split('.')
+        .map(|part| part.parse::<u32>().unwrap_or(0));
+    if (parts.next()?, parts.next()?) < (1, 4) {
+        eprintln!("skipped: needs Bun 1.4 or later, not {}", version.trim());
+        return None;
+    }
+    Some(bun)
 }
 
 /// What the stream says of the interpreters whose frames it read.
@@ -599,7 +610,7 @@ fn names_the_functions_that_wait_for_one() {
     if let Some(node) = node() {
         has_the_functions_that_waited(&node, "node");
     }
-    if let Some(bun) = bun() {
+    if let Some(bun) = bun_whose_promises_say_who_waits() {
         has_the_functions_that_waited(&bun, "bun");
     }
 }

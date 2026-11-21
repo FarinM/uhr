@@ -25,17 +25,17 @@ one of two samplers:
 - **perf**, without root, or with `--sampler perf`.
 - **uhr's eBPF sampler**, as root (or with CAP_BPF and CAP_PERFMON). It also
   counts and times syscalls, sees what woke each thread that waited, and
-  reads the frames of CPython 3.11 to 3.14,
-  Node 20 to 24, Bun 1.4.3, Ruby 3.2, PHP 8.3, Lua 5.4 and Java's interpreter
+  reads the frames of CPython 3.11 to 3.14, Node 20 to 24, Bun 1.2 to 1.4,
+  Ruby 3.2, PHP 8.3, Lua 5.4 and Java's interpreter
   ([limits](docs/collection.md#runtimes)), with the async functions of Node
-  and Bun that wait for the one that runs as its callers.
+  and Bun 1.4 and later that wait for the one that runs as its callers.
 
 On macOS uhr samples with a sampler of its own, without root for a program
 it starts, and records CPU time in user and kernel mode with user stacks,
 time off CPU with the stacks threads waited at, and each process's memory.
-It reads the frames of CPython, Node and Bun 1.4.3's build for arm64 as the
-eBPF sampler does, checked with CPython 3.13 and Node 24, but not yet those
-of the other runtimes.
+It reads the frames of CPython, Node and Bun as the eBPF sampler does,
+checked with CPython 3.13, Node 24 and Bun 1.2 to 1.4, but not yet those of
+the other runtimes.
 macOS shows no process the kernel's stacks, so time in the kernel is under
 the user code that entered it, and there are no wakeups, syscall counts or
 page faults. dyld leaves uhr's library out of programs the system protects,

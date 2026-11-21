@@ -820,16 +820,29 @@ fn calls_from_known_lines(recording: &str, function: &str, caller: &str, line: u
     assert!(share(calls, "total_share") > 0.5, "{calls}");
 }
 
-/// A `bun` whose frames uhr reads: the release whose offsets it knows.
 fn bun() -> Option<PathBuf> {
-    let bun = find("bun").filter(|bun| {
-        let output = Command::new(bun).arg("--revision").output();
-        output.is_ok_and(|output| output.stdout.starts_with(b"1.4.3+c6da4a4d3"))
-    });
+    let bun = find("bun");
     if bun.is_none() {
-        eprintln!("skipped: needs Bun 1.4.3");
+        eprintln!("skipped: needs Bun");
     }
     bun
+}
+
+/// A `bun` whose promises keep the function that waits for each, as those
+/// of 1.4 and later do.
+fn bun_whose_promises_say_who_waits() -> Option<PathBuf> {
+    let bun = bun()?;
+    let version = Command::new(&bun).arg("--version").output().ok()?;
+    let version = String::from_utf8_lossy(&version.stdout);
+    let mut parts = version
+        .trim()
+        .split('.')
+        .map(|part| part.parse::<u32>().unwrap_or(0));
+    if (parts.next()?, parts.next()?) < (1, 4) {
+        eprintln!("skipped: needs Bun 1.4 or later, not {}", version.trim());
+        return None;
+    }
+    Some(bun)
 }
 
 #[test]
@@ -869,7 +882,7 @@ fn has_the_functions_that_waited(recording: &str, runtime: &str) {
 
 #[test]
 fn names_the_bun_functions_that_wait_for_one() {
-    let Some(bun) = bun() else {
+    let Some(bun) = bun_whose_promises_say_who_waits() else {
         return;
     };
     let dir = scratch("interpreters_bun_await");

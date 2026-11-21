@@ -386,6 +386,12 @@ pub enum Error {
     /// does while the process runs: look again soon.
     #[error("still learning where {runtime} keeps its frames")]
     Learning { runtime: &'static str },
+    #[error("learning where {runtime} keeps its frames, by running {program}: {reason}")]
+    Probe {
+        runtime: &'static str,
+        program: String,
+        reason: String,
+    },
     #[error("{0}")]
     Invalid(String),
 }

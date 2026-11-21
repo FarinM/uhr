@@ -610,26 +610,52 @@ programs read the frames of:
   result, whose reaction leads to that of the function that waits for it,
   as V8's own async stack traces follow them. What `.then` or a
   `Promise.all` waits for ends there. Checked on Node 24 only.
-- JavaScriptCore as Bun 1.4.3 runs it, by its build id. Bun's releases keep
-  no symbols, and JavaScriptCore publishes no offsets, so they are those
-  found in the build with symbols Bun publishes with each release, from the
-  code that reads them, and other releases are not read. Of 1.4.3's builds,
-  uhr knows those for x86-64 Linux and arm64 macOS. Each JavaScript
-  function's frame holds its `CodeBlock`, whose executable names it and its
-  script. Where the build with symbols is kept by its build id with the
-  system's debug info, or on macOS the dSYM Bun publishes with it is in a
-  bundle beside `bun`, it also names the interpreter's code, so that its
-  frames take the place of the interpreter's native ones; without it they go
-  just above them. Bun publishes the dSYM as a single file,
-  `bun-profile.dSYM` in `bun-darwin-aarch64-profile.zip`, which goes in the
-  bundle as `bun.dSYM/Contents/Resources/DWARF/bun`: a file named `bun.dSYM`
-  is not read. Lines are not read yet. An async function that is resumed
-  gets its `JSAsyncFunctionGenerator` as an argument, which holds the
-  promise of its result, and a pending promise that of the function that
-  waits for it, or the promise of the `Promise.all`, `allSettled` or `any`
-  it is one of, as JavaScriptCore's own async stack traces follow them. What
-  `.then` or `Promise.race` waits for ends there, and so does a promise more
-  than one function waits for.
+- JavaScriptCore as Bun runs it. Bun's releases keep no symbols and
+  JavaScriptCore publishes no offsets, so uhr learns where each build keeps
+  what it reads by running it, once for each build it records, by its build
+  id: a build without one is not read. The build runs `probe.mjs`, uhr's
+  script, which holds functions, strings and promises uhr knows, says where
+  they are, as `bun:jsc`'s `describe` gives them, and waits in frames of
+  global, module, eval and function code while uhr reads its stack and
+  memory. Each offset is the only one that leads from what the probe holds
+  to what uhr knows of it, as a function's name, its frame or the promise of
+  its result: where none does, or more than one, uhr reads no frames of that
+  build, and says why. It takes about 40 ms on an Apple M5, with uhr built
+  for release, and gives up after 10 s. uhr learns before it starts a
+  program that is Bun's binary, which runs as uhr's user. For a process uhr
+  finds that runs a build it has not run, as one it attaches to or that
+  another program starts, it learns while the process runs, and what that
+  runs meanwhile has no frames of its runtime. Where uhr runs as root and
+  the process does not, the probe runs as the process's user and group, so
+  that it can do no more than they can, and what uhr learns from it is only
+  for that user's processes, as they could change what it says. On Linux it
+  runs the process's `/proc/<pid>/exe`, which is the file it runs even where
+  its path holds another since, or is in a container's mount namespace. It
+  runs there with the host's libraries, so a build for musl, as Alpine's,
+  runs only where the host has musl. Checked with Bun 1.2.23, 1.3.0, 1.3.14,
+  1.4.0, 1.4.3, 1.4.4 and 1.4.5 for arm64 macOS, and 1.2.23, 1.3.14, 1.4.3
+  and 1.4.5 for x86-64 Linux. Each JavaScript function's frame holds its
+  `CodeBlock`, whose executable names it and its script, and whose type says
+  what code it is. The interpreter's code, whose frames JavaScript frames
+  take the place of, is on macOS the section `__jsc_int`, and on Linux where
+  the build with symbols says, where the system keeps it as debug info by
+  build id, or else from the code of the first of its opcodes to that of the
+  last, in the table of them JavaScriptCore fills as it starts. That leaves
+  out the code that enters it, 16 KB in 1.4.3, whose frames stay native
+  ones, and where the opcodes are not all in one mapping of Bun's code, uhr
+  takes none of it for the interpreter's. Lines are not read yet. From Bun
+  1.4, an async function that is resumed gets its `JSAsyncFunctionGenerator`
+  as an argument, which holds the promise of its result, and a pending
+  promise that of the function that waits for it, or the promise of the
+  `Promise.all`, `allSettled` or `any` it is one of, as JavaScriptCore's own
+  async stack traces follow them. What `.then` or `Promise.race` waits for
+  ends there, and so does a promise more than one function waits for.
+  Earlier releases keep no waiting function in a promise, so uhr finds none
+  of theirs. Bun's own functions are named from the build with symbols it
+  publishes with each release: on macOS the dSYM, the single file
+  `bun-profile.dSYM` in `bun-darwin-aarch64-profile.zip`, which goes in a
+  bundle beside `bun`, as `bun.dSYM/Contents/Resources/DWARF/bun`; a file
+  named `bun.dSYM` is not read.
 - CRuby 3.2, in a `ruby` program or a `libruby`, from the headers of 3.2.
   CRuby keeps its frames in an array in each thread's execution context,
   which the thread-local `ruby_current_ec` points to, and says the line of
@@ -708,13 +734,14 @@ Of each frame they copy the bytes at an offset from it, and up to two words
 read at the time of the sample at an offset from a pointer the copy holds,
 as for objects a garbage collector can move before uhr reads them. The
 offsets come from what the runtime publishes, such as CPython's
-`_Py_DebugOffsets` and V8's `v8dbg_` symbols, from debug info, or from tables
-by version. A thread-local's path from the thread pointer comes from where
-glibc keeps the thread-locals of each module, and what the dynamic linker
-writes where the module's relocations say: the index it gave the module,
-or, for a TLS descriptor, as arm64 builds use, the variable's offset from
-the thread pointer or the module's index. Until it has written them, uhr
-looks again later.
+`_Py_DebugOffsets` and V8's `v8dbg_` symbols, from debug info, from tables
+by version, or, for Bun, from running its build with a script of uhr's. A
+thread-local's path from the thread pointer comes from where glibc keeps the
+thread-locals of each module, and what the dynamic linker writes where the
+module's relocations say: the index it gave the module, or, for a TLS
+descriptor, as arm64 builds use, the variable's offset from the thread
+pointer or the module's index. Until it has written them, uhr looks again
+later.
 
 uhr looks for a process's runtime at its first sample, and again each time
 the process maps more code, as a runtime's library can be mapped after the
@@ -769,12 +796,11 @@ walked alike, so time off CPU has the runtime's frames too. Between a
 process's exec and the next program's hello, the program's memory is gone,
 and walks that fail then count as none. Checked with Homebrew's CPython
 3.13, a framework build whose library is named `Python`, and Node 24 from
-nodejs.org, on arm64. Bun 1.4.3's build for arm64 is read by its UUID, with
-the offsets of its build for Linux, which name its functions, their scripts
-and the async functions that wait there as on Linux. A runtime's separate
-debug info is the DWARF in the dSYM bundle beside its file, whose UUID is
-the file's, where the single file Bun publishes with each release goes.
-Bun's builds for x86-64 Macs are not read.
+nodejs.org, on arm64. Bun's are read as on Linux, by what uhr learns of
+each build running it, as it launches a target, with its library. A
+runtime's separate debug info is the DWARF in the dSYM bundle beside its
+file, whose UUID is the file's, where the single file Bun publishes with
+each release goes. Bun's builds for x86-64 Macs are not checked.
 The other runtimes' frames are not read on macOS yet: CRuby's state is in a
 thread-local, which uhr finds only in ELF files, HotSpot's library is looked
 for as `libjvm.so`, and PHP and Lua are not checked.
