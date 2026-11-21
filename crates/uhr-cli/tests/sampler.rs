@@ -9,7 +9,7 @@ use std::fs;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
@@ -184,22 +184,33 @@ fn stops_sampling_when_perf_stops() {
     let dir = scratch("sampler_perf_stops");
     let recording = dir.join("rec");
     let rec = recording.to_str().unwrap();
-    // Computes until told to stop, and then for a second or two.
-    let script = "trap 'end=$((SECONDS + 2)); while [ $SECONDS -lt $end ]; do :; done; exit' \
-                  TERM; while :; do :; done";
+    // Computes until told to stop, and then for two seconds, or for a
+    // minute, so that a test that fails leaves nothing running.
+    let script = "end=$((SECONDS + 60)); trap 'end=$((SECONDS + 2))' TERM; \
+                  while [ $SECONDS -lt $end ]; do :; done";
     let mut recorder = Command::new("sudo")
         .args(["-n", UHR, "record", "-o", rec, "--", "bash", "-c", script])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
-    thread::sleep(Duration::from_secs(1));
-    let children = |parent: u32, name: &str| {
-        let found = sudo(&["pgrep", "-P", &parent.to_string(), "-x", name]);
-        String::from_utf8_lossy(&found.stdout).trim().to_owned()
+    let child = |parent: u32, name: &str| {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let found = sudo(&["pgrep", "-P", &parent.to_string(), "-x", name]);
+            let found = String::from_utf8_lossy(&found.stdout).trim().to_owned();
+            if let Ok(pid) = found.parse::<u32>() {
+                return pid;
+            }
+            assert!(Instant::now() < deadline, "no {name} under {parent}");
+            thread::sleep(Duration::from_millis(50));
+        }
     };
-    let uhr_pid = children(recorder.id(), "uhr");
-    let perf = children(uhr_pid.parse().unwrap(), "perf");
+    let uhr_pid = child(recorder.id(), "uhr");
+    // uhr holds the target before it runs bash until perf samples it.
+    child(uhr_pid, "bash");
+    thread::sleep(Duration::from_millis(500));
+    let perf = child(uhr_pid, "perf").to_string();
     assert!(
         sudo(&["kill", "-INT", &perf]).status.success(),
         "perf {perf:?}"
@@ -218,7 +229,7 @@ fn stops_sampling_when_perf_stops() {
     if sampled_by_ebpf(&recording).is_none() {
         return;
     }
-    // perf ran a second, and the target computed a second or two after.
+    // perf ran half a second, and the target computed two seconds after.
     let overview = json(&["overview", rec]);
     let cpu = overview["cpu_ns"].as_f64().unwrap() / 1e9;
     assert!(cpu < 1.5, "{cpu} s of CPU time");

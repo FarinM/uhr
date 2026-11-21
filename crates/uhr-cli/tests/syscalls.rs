@@ -151,9 +151,15 @@ fn the_time_is_in_the_kernel_on_behalf_of_read_zero() {
             .find(|r| r["module"].as_str().is_some_and(path))
             .unwrap_or_else(|| panic!("no such module in {modules}"))
     };
-    let in_kernel = module(&|path| path == "[kernel]")["self_share"]
-        .as_f64()
-        .unwrap();
+    // Where the kernel hides its addresses, its code is in no module that
+    // uhr can name, but still the kernel's.
+    let in_kernel: f64 = modules["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|r| r["origin"] == "kernel")
+        .map(|r| r["self_share"].as_f64().unwrap())
+        .sum();
     assert!(
         (in_kernel - kernel).abs() <= 0.05,
         "{in_kernel} of the time in kernel code, {kernel} in kernel mode"
