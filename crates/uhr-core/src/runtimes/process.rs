@@ -8,6 +8,7 @@ use std::ops::Range;
 use wholesym::samply_symbols::object::{self, Object, ObjectSection, ObjectSegment, ObjectSymbol};
 
 use super::Error;
+use super::probe::Prober;
 use crate::macho;
 use crate::recording::Mapping;
 
@@ -30,6 +31,23 @@ pub trait Process {
         None
     }
     fn memory(&self) -> &dyn Memory;
+    /// How to run a probe of the runtime the process runs, where the
+    /// platform can.
+    fn prober(&self) -> Option<&'static dyn Prober> {
+        None
+    }
+    /// The user and group a probe of the process's runtime runs as, where
+    /// not uhr's: the process's own, where uhr runs as root and it does
+    /// not.
+    fn probe_user(&self) -> Option<(u32, u32)> {
+        None
+    }
+    /// A path that runs the file of the process's program, where its path
+    /// may not: one that holds another file since, or that is in another
+    /// mount namespace.
+    fn executable(&self) -> Option<String> {
+        None
+    }
 }
 
 /// Where the symbols `wanted` of a mapping's file are in the process: from

@@ -312,6 +312,8 @@ fn launch(
     interrupts: &Interrupts,
 ) -> Result<Captured> {
     let program = &command[0];
+    // Before it runs, so that its first frames are read.
+    uhr_core::runtimes::prepare(program, &crate::runtime::Probing);
     let service = Service::register()?;
     let environment = launch::environment(&service)?;
     let child = Command::new(program)
@@ -820,6 +822,9 @@ impl Process {
         first: bool,
     ) -> bool {
         self.update_images(tables, counts, (!first).then(monotonic_ns));
+        if self.runtime.looks_again() {
+            self.look_for_runtime(tables);
+        }
         let names: Vec<mach_port_t> = self.threads.keys().copied().collect();
         let mut lost = Vec::new();
         for name in names {

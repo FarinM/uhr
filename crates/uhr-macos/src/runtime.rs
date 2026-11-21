@@ -5,15 +5,22 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io;
+use std::ops::Range;
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use tracing::debug;
 use uhr_core::recording::{Frame, Mapping};
 use uhr_core::runtimes::stacks::{self, Interpreters, Program, code_addresses};
 use uhr_core::runtimes::walker::{Status, Walked, Walker};
-use uhr_core::runtimes::{self, Code, Frames, Interpreter, Memory, Process};
+use uhr_core::runtimes::{
+    self, Child, Code, Frames, Interpreter, Memory, Probe, ProbeCommand, Prober, Process,
+};
 
-use crate::mach::Task;
+use crate::images::{ImageInfos, read_listed_image};
+use crate::launch::{self, Service};
+use crate::mach::{Task, suspend};
+use crate::process;
 
 /// A process as runtimes read it.
 struct Live<'a> {
@@ -58,6 +65,133 @@ impl Process for Live<'_> {
     fn memory(&self) -> &dyn Memory {
         self.task
     }
+
+    fn prober(&self) -> Option<&'static dyn Prober> {
+        Some(&Probing)
+    }
+
+    /// Switched to only as root, for one that runs as another user.
+    fn probe_user(&self) -> Option<(u32, u32)> {
+        // SAFETY: neither has preconditions.
+        let own = unsafe { (libc::geteuid(), libc::getegid()) };
+        if own.0 != 0 {
+            return None;
+        }
+        process::owner(self.pid).filter(|&theirs| theirs != own)
+    }
+}
+
+/// Runs probes as uhr launches targets, with the library that sends uhr
+/// their task ports.
+pub(crate) struct Probing;
+
+impl Prober for Probing {
+    fn probe(&self, command: &ProbeCommand) -> io::Result<Box<dyn Probe>> {
+        Ok(Box::new(Probed::run(command)?))
+    }
+}
+
+/// How often to look for a runtime again while uhr learns where it keeps
+/// its frames.
+const LEARNING: Duration = Duration::from_millis(50);
+
+/// How much of a probe's stack above where its main thread is uhr reads.
+const PROBE_STACK: u64 = 1 << 20;
+
+/// A probe uhr runs, which sends uhr its task port as a target uhr launches
+/// does.
+struct Probed {
+    child: Child,
+    said: String,
+    pid: u32,
+    task: Task,
+    mappings: Vec<Mapping>,
+}
+
+impl Probed {
+    fn run(command: &ProbeCommand) -> io::Result<Self> {
+        let service = Service::register().map_err(io::Error::other)?;
+        let added =
+            launch::probe_environment(&service, &command.files).map_err(io::Error::other)?;
+        let mut child = Child::spawn(command, &added)?;
+        let hello = loop {
+            let remaining = child.remaining().as_millis() as u32;
+            match service.receive(remaining).map_err(io::Error::other)? {
+                Some(hello) if hello.pid == child.id() => break hello,
+                Some(_) => {}
+                None => return Err(io::Error::other("it sent uhr no task port")),
+            }
+        };
+        // It waits for the answer before it runs its own code.
+        hello.waiting.answer();
+        let said = child.line()?;
+        let mappings = mappings(&hello.task, hello.pid)?;
+        Ok(Self {
+            child,
+            said,
+            pid: hello.pid,
+            task: hello.task,
+            mappings,
+        })
+    }
+}
+
+/// The code a process maps, from the images dyld lists.
+fn mappings(task: &Task, pid: u32) -> io::Result<Vec<Mapping>> {
+    let info = task.dyld_info().map_err(io::Error::other)?;
+    let infos = ImageInfos::at(task, info.all_image_info_addr)?;
+    let listed = infos
+        .list(task)?
+        .ok_or_else(|| io::Error::other("dyld was changing its list of images"))?;
+    let mut mappings = Vec::new();
+    for (address, path) in listed.images {
+        if let Ok(image) = read_listed_image(task, address, path, || process::path(pid)) {
+            mappings.extend(image.mappings(pid, None));
+        }
+    }
+    mappings.sort_by_key(|mapping| mapping.start);
+    Ok(mappings)
+}
+
+impl Process for Probed {
+    fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    fn mappings(&self) -> &[Mapping] {
+        &self.mappings
+    }
+
+    fn file(&self, mapping: &Mapping) -> io::Result<Vec<u8>> {
+        fs::read(&mapping.path)
+    }
+
+    fn memory(&self) -> &dyn Memory {
+        &self.task
+    }
+}
+
+impl Probe for Probed {
+    fn said(&self) -> &str {
+        &self.said
+    }
+
+    fn resume(&mut self) -> io::Result<()> {
+        self.child.resume()?;
+        self.said = self.child.line()?;
+        Ok(())
+    }
+
+    /// From where its main thread is, the oldest, which runs JavaScript.
+    fn stack(&self) -> io::Result<Range<u64>> {
+        let threads = self.task.threads().map_err(io::Error::other)?;
+        let main = threads
+            .first()
+            .ok_or_else(|| io::Error::other("it has no threads"))?;
+        let held = suspend(main).map_err(io::Error::other)?;
+        let sp = held.registers().map_err(io::Error::other)?.sp;
+        Ok(sp..sp + PROBE_STACK)
+    }
 }
 
 /// The runtime of one program a process runs.
@@ -71,9 +205,13 @@ pub(crate) struct Runtime {
 
 enum State {
     /// Not found yet: looked for again when dyld lists more images, as a
-    /// runtime's library can be loaded after the program starts. Counts the
-    /// samples taken meanwhile.
-    Looking { samples: u64 },
+    /// runtime's library can be loaded after the program starts, and from
+    /// `again`, while uhr learns where the runtime keeps its frames. Counts
+    /// the samples taken meanwhile.
+    Looking {
+        samples: u64,
+        again: Option<Instant>,
+    },
     Walking {
         interpreter: Box<dyn Interpreter>,
         walker: Walker,
@@ -98,7 +236,10 @@ impl Runtime {
     pub(crate) fn new(program: Program) -> Self {
         Self {
             program,
-            state: State::Looking { samples: 0 },
+            state: State::Looking {
+                samples: 0,
+                again: None,
+            },
             code: HashMap::new(),
         }
     }
@@ -112,7 +253,7 @@ impl Runtime {
         interpreters: &mut Interpreters,
         unsupported: &mut Vec<String>,
     ) {
-        let (&State::Looking { samples }, Some(first)) = (&self.state, mappings.first()) else {
+        let (&State::Looking { samples, .. }, Some(first)) = (&self.state, mappings.first()) else {
             return;
         };
         let (pid, _) = self.program;
@@ -140,12 +281,24 @@ impl Runtime {
             Err(error @ runtimes::Error::Read { .. }) => {
                 debug!(pid, %error, "looking for its runtime again when it loads more");
             }
+            Err(runtimes::Error::Learning { .. }) => {
+                self.state = State::Looking {
+                    samples,
+                    again: Some(Instant::now() + LEARNING),
+                };
+            }
             Err(reason) => {
                 debug!(pid, %reason, "not reading the frames of its runtime");
                 unsupported.push(reason.to_string());
                 self.state = State::Unsupported;
             }
         }
+    }
+
+    /// Whether to look for the runtime again now, as uhr learns where it
+    /// keeps its frames.
+    pub(crate) fn looks_again(&self) -> bool {
+        matches!(self.state, State::Looking { again: Some(again), .. } if Instant::now() >= again)
     }
 
     /// Walks the interpreter's frames of the thread with the id `thread`,
@@ -211,7 +364,7 @@ impl Runtime {
         sample: Sample,
     ) {
         let interpreter = match &mut self.state {
-            State::Looking { samples } => {
+            State::Looking { samples, .. } => {
                 *samples += 1;
                 return;
             }

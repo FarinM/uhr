@@ -1029,6 +1029,8 @@ fn run(
                 .flatten();
             let glibc_names = tunables.is_some();
             environment.extend(tunables);
+            // Before it runs, so that its first frames are read.
+            uhr_core::runtimes::prepare(&command[0], &crate::interpreters::Probing);
             let held = Held::spawn(command, &environment)?;
             let pid = held.pid();
             let mut ebpf = start_ebpf(pid, true, options, tick, fault_period, samples)?;

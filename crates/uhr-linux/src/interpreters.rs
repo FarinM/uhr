@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io;
+use std::ops::Range;
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
@@ -13,7 +14,10 @@ use aya::maps::{HashMap as BpfHashMap, MapData};
 use tracing::{debug, warn};
 use uhr_core::recording::Mapping;
 use uhr_core::runtimes::stacks::code_addresses;
-use uhr_core::runtimes::{self, Code, Frames, Interpreter, Memory, Process, States, Step, Thread};
+use uhr_core::runtimes::{
+    self, Child, Code, Frames, Interpreter, Memory, Probe, ProbeCommand, Prober, Process, States,
+    Step, Thread,
+};
 use uhr_ebpf::{MAX_FRAME_CHECKS, MAX_NEXT, MAX_PATH, MAX_READS, MAX_WALKED_BYTES, ONE_LIST, walk};
 
 use crate::launch::monotonic_ns;
@@ -144,6 +148,10 @@ const LOOKING: State = State::Looking {
 /// The longest to wait before looking for a process's runtime again.
 const MAX_WAIT_NS: u64 = 5_000_000_000;
 
+/// How long to wait before looking again while uhr learns where a runtime
+/// keeps its frames.
+const LEARNING_NS: u64 = 100_000_000;
+
 /// The least time between telling the programs where a process's threads'
 /// states are.
 const THREADS_EVERY_NS: u64 = 200_000_000;
@@ -182,11 +190,15 @@ fn find(receiver: Receiver<Walked>, mut maps: Maps, frame_pointers: bool) -> Int
                 wait_ns,
             } if mapped.is_none_or(|had| walked.mapped > had) || monotonic_ns() >= *next_ns => {
                 match look(program, &mut maps, &mut found, frame_pointers) {
-                    Ok(Some(next)) => *state = next,
-                    Ok(None) => {
+                    Ok(Looked::Found(next)) => *state = next,
+                    Ok(Looked::Later) => {
                         *mapped = (*mapped).max(Some(walked.mapped));
                         *next_ns = monotonic_ns() + *wait_ns;
                         *wait_ns = (*wait_ns * 2).min(MAX_WAIT_NS);
+                    }
+                    Ok(Looked::Soon) => {
+                        *mapped = (*mapped).max(Some(walked.mapped));
+                        *next_ns = monotonic_ns() + LEARNING_NS;
                     }
                     Err(reason) => {
                         debug!(pid, %reason, "not reading the frames of its runtime");
@@ -304,26 +316,35 @@ fn pid_namespace_of(process: &str) -> Option<(u64, u64)> {
     Some((file.dev(), file.ino()))
 }
 
+/// What a look for a process's runtime found.
+enum Looked {
+    Found(State),
+    /// None that uhr knows yet.
+    Later,
+    /// One whose frames uhr learns where it keeps.
+    Soon,
+}
+
 /// Looks for the runtime of `program`, and tells uhr's programs how to walk
-/// its frames. `None` if it runs none uhr knows yet, and an error for one
-/// it cannot read.
+/// its frames. An error for one it cannot read.
 fn look(
     program: Program,
     maps: &mut Maps,
     found: &mut Interpreters,
     frame_pointers: bool,
-) -> Result<Option<State>, String> {
+) -> Result<Looked, String> {
     let pid = program.0;
     let Ok(process) = LiveProcess::open(pid) else {
         // Gone, or not started yet.
-        return Ok(None);
+        return Ok(Looked::Later);
     };
     let interpreter = match runtimes::interpreter(&process) {
         Ok(Some(interpreter)) => interpreter,
-        Ok(None) => return Ok(None),
+        Ok(None) => return Ok(Looked::Later),
+        Err(runtimes::Error::Learning { .. }) => return Ok(Looked::Soon),
         Err(error @ runtimes::Error::Read { .. }) => {
             debug!(pid, %error, "looking for its runtime again later");
-            return Ok(None);
+            return Ok(Looked::Later);
         }
         Err(error) => return Err(error.to_string()),
     };
@@ -379,7 +400,7 @@ fn look(
         .entry(program)
         .or_default()
         .push((since_ns, interpreter));
-    Ok(Some(State::Walking {
+    Ok(Looked::Found(State::Walking {
         since_ns,
         memory: process.memory,
         threads_ns: None,
@@ -607,6 +628,104 @@ impl Process for LiveProcess {
 
     fn memory(&self) -> &dyn Memory {
         &self.memory
+    }
+
+    fn prober(&self) -> Option<&'static dyn Prober> {
+        Some(&Probing)
+    }
+
+    /// By its effective ids, which uhr switches to only as root, for one
+    /// that runs as another user.
+    fn probe_user(&self) -> Option<(u32, u32)> {
+        let own = (
+            rustix::process::geteuid().as_raw(),
+            rustix::process::getegid().as_raw(),
+        );
+        if own.0 != 0 {
+            return None;
+        }
+        let status = fs::read(format!("/proc/{}/status", self.pid)).ok()?;
+        let effective = |field| {
+            procfs::status_field(&status, field)?
+                .split_whitespace()
+                .nth(1)?
+                .parse()
+                .ok()
+        };
+        let theirs = (effective("Uid")?, effective("Gid")?);
+        (theirs != own).then_some(theirs)
+    }
+
+    /// Its `exe`, which runs the file even from another mount namespace,
+    /// as a container's.
+    fn executable(&self) -> Option<String> {
+        Some(format!("/proc/{}/exe", self.pid))
+    }
+}
+
+/// Runs probes, read through `/proc`, as uhr may read a process it started.
+pub(crate) struct Probing;
+
+impl Prober for Probing {
+    fn probe(&self, command: &ProbeCommand) -> io::Result<Box<dyn Probe>> {
+        let mut child = Child::spawn(command, &[])?;
+        let said = child.line()?;
+        let process = LiveProcess::open(child.id())?;
+        Ok(Box::new(Probed {
+            child,
+            said,
+            process,
+        }))
+    }
+}
+
+/// A probe uhr runs.
+struct Probed {
+    child: Child,
+    said: String,
+    process: LiveProcess,
+}
+
+impl Process for Probed {
+    fn pid(&self) -> u32 {
+        self.process.pid()
+    }
+
+    fn mappings(&self) -> &[Mapping] {
+        self.process.mappings()
+    }
+
+    fn file(&self, mapping: &Mapping) -> io::Result<Vec<u8>> {
+        self.process.file(mapping)
+    }
+
+    fn debug_file(&self, build_id: &[u8]) -> Option<Vec<u8>> {
+        self.process.debug_file(build_id)
+    }
+
+    fn memory(&self) -> &dyn Memory {
+        self.process.memory()
+    }
+}
+
+impl Probe for Probed {
+    fn said(&self) -> &str {
+        &self.said
+    }
+
+    fn resume(&mut self) -> io::Result<()> {
+        self.child.resume()?;
+        self.said = self.child.line()?;
+        Ok(())
+    }
+
+    /// The main thread's, which runs JavaScript.
+    fn stack(&self) -> io::Result<Range<u64>> {
+        let maps = fs::read(format!("/proc/{}/maps", self.process.pid))?;
+        procfs::maps(&maps)
+            .find(|line| line.path.as_deref() == Some("[stack]"))
+            .map(|line| line.start..line.end)
+            .ok_or_else(|| io::Error::other("it maps no stack"))
     }
 }
 

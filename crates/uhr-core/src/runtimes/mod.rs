@@ -2,10 +2,14 @@
 //! runs from, how it names the code it compiles, and how to read its
 //! interpreter's frames.
 
+use std::env;
 use std::ffi::OsString;
+use std::fs;
 use std::io;
 use std::ops::Range;
+use std::path::{Path, PathBuf};
 
+pub use probe::{Child, Probe, ProbeCommand, Prober};
 pub use process::{Memory, Process};
 
 mod bun;
@@ -13,6 +17,7 @@ mod jvm;
 mod lua;
 mod node;
 mod php;
+mod probe;
 mod process;
 mod python;
 mod ruby;
@@ -36,6 +41,10 @@ pub trait Runtime: Sync {
     fn interpreter(&self, _process: &dyn Process) -> Result<Option<Box<dyn Interpreter>>, Error> {
         Ok(None)
     }
+    /// Learns what it can of the runtime's binary `program` before a
+    /// process runs it, so that uhr reads the frames of that process from
+    /// its start.
+    fn prepare(&self, _program: &Path, _prober: &dyn Prober) {}
 }
 
 /// A runtime's interpreter found in one process: how uhr's sampler walks
@@ -373,8 +382,37 @@ pub enum Error {
         runtime: &'static str,
         version: String,
     },
+    /// uhr is learning where the runtime keeps what it reads, which it
+    /// does while the process runs: look again soon.
+    #[error("still learning where {runtime} keeps its frames")]
+    Learning { runtime: &'static str },
     #[error("{0}")]
     Invalid(String),
+}
+
+/// Learns what uhr can of the runtime `program` is before uhr starts it,
+/// as `Runtime::prepare` does: `program` as a command names it.
+pub fn prepare(program: &str, prober: &dyn Prober) {
+    let Some(path) = resolve(program) else {
+        return;
+    };
+    let Some(file) = path.file_name().and_then(|file| file.to_str()) else {
+        return;
+    };
+    for runtime in RUNTIMES.iter().filter(|runtime| runtime.is_binary(file)) {
+        runtime.prepare(&path, prober);
+    }
+}
+
+/// The file a command runs, through `PATH` and links.
+fn resolve(program: &str) -> Option<PathBuf> {
+    if program.contains('/') {
+        return fs::canonicalize(program).ok();
+    }
+    env::split_paths(&env::var_os("PATH")?)
+        .map(|dir| dir.join(program))
+        .find(|path| path.is_file())
+        .and_then(|path| fs::canonicalize(path).ok())
 }
 
 /// The interpreter of the first runtime found in `process`.

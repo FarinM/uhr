@@ -1,5 +1,5 @@
 //! What the BSD side of the kernel says of a process: whether it exists,
-//! and its name, parent and command line.
+//! and its name, parent, owner and command line.
 
 use std::io;
 use std::mem::{self, MaybeUninit};
@@ -61,6 +61,15 @@ pub(crate) fn thread_count(pid: u32) -> Option<usize> {
 }
 
 pub(crate) fn parent(pid: u32) -> Option<u32> {
+    bsd_info(pid).map(|info| info.pbi_ppid)
+}
+
+/// The user and group it runs as.
+pub(crate) fn owner(pid: u32) -> Option<(u32, u32)> {
+    bsd_info(pid).map(|info| (info.pbi_uid, info.pbi_gid))
+}
+
+fn bsd_info(pid: u32) -> Option<libc::proc_bsdinfo> {
     let mut info = MaybeUninit::<libc::proc_bsdinfo>::zeroed();
     let size = mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
     // SAFETY: `info` has room for `size` bytes.
@@ -74,7 +83,7 @@ pub(crate) fn parent(pid: u32) -> Option<u32> {
         )
     };
     // SAFETY: the kernel filled it.
-    (written == size).then(|| unsafe { info.assume_init() }.pbi_ppid)
+    (written == size).then(|| unsafe { info.assume_init() })
 }
 
 /// Its arguments, from the kernel's copy of what it exec'd with. Only root

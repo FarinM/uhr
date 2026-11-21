@@ -289,6 +289,24 @@ pub(crate) fn environment(service: &Service) -> Result<Vec<(OsString, OsString)>
     ])
 }
 
+/// The variables a probe uhr runs needs: uhr's library, which it writes
+/// into `dir`, a directory of uhr's that the probe's user can read, and the
+/// service. None of the libraries uhr's own environment inserts.
+pub(crate) fn probe_environment(
+    service: &Service,
+    dir: &Path,
+) -> Result<Vec<(OsString, OsString)>, Error> {
+    let library = dir.join("uhr-preload.dylib");
+    fs::write(&library, LIBRARY).map_err(|source| Error::Library {
+        path: library.clone(),
+        source,
+    })?;
+    Ok(vec![
+        (INSERT.into(), library.into_os_string()),
+        (SERVICE.into(), service.name().into()),
+    ])
+}
+
 /// uhr's library, written where dyld can load it. Never removed: every
 /// process the target starts inherits the variable that names it, also
 /// those left running after uhr ends, and dyld ends a process whose
