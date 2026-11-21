@@ -502,6 +502,7 @@ async fn resolve_file(
         Err(error) => return done(SourceStatus::Failed, Some(chain(&error))),
     };
     let mut found = Vec::new();
+    let mut unfound = Vec::new();
     for &(frame, offset) in frames {
         // On macOS, offsets are from the start of the image's __TEXT
         // segment, its base.
@@ -512,8 +513,9 @@ async fn resolve_file(
         let Some(address) = address else {
             continue;
         };
-        if let Some(info) = map.lookup(LookupAddress::Relative(address)).await {
-            found.push((frame, address, info));
+        match map.lookup(LookupAddress::Relative(address)).await {
+            Some(info) => found.push((frame, address, info)),
+            None => unfound.push((frame, address)),
         }
     }
     let starts: HashSet<u32> = found
@@ -527,6 +529,12 @@ async fn resolve_file(
         .collect();
     let debug_path = map.debug_file_location().0.clone();
     let proper = proper_symbols(&files, Path::new(path), &object, uuid, &starts, &debug_path);
+    // wholesym takes a Mach-O file's functions from `__text` alone, but
+    // JavaScriptCore keeps its interpreter in `__jsc_int`.
+    let other = match macho && !unfound.is_empty() {
+        true => other_code(&files, &debug_path, uuid),
+        false => Vec::new(),
+    };
     // Not needed any more, and the inline lookup below reads the same debug
     // info again.
     drop(map);
@@ -601,6 +609,21 @@ async fn resolve_file(
             },
             inline,
         });
+    }
+    for (frame, address) in unfound {
+        let at = other.partition_point(|(start, _, _)| *start <= address);
+        let Some((start, end, name)) = at.checked_sub(1).map(|at| &other[at]) else {
+            continue;
+        };
+        if address < *end {
+            names.push(Named {
+                frame,
+                function_address: *start,
+                function_end: Some(*end),
+                name: FrameName::Symbol(name.clone()),
+                inline: Vec::new(),
+            });
+        }
     }
     let named = names.len() - placeholders;
     let mut detail = format!("named {named} of {} frames", frames.len());
@@ -816,6 +839,19 @@ fn resolve_interpreted(
             detail: Some(format!("named {named} of {all} frames")),
         })
         .collect()
+}
+
+/// The functions of the Mach-O file at `path`, the binary or its dSYM, in
+/// its sections of code other than `__text`.
+fn other_code(files: &Files, path: &Path, uuid: Option<[u8; 16]>) -> Vec<(u32, u32, String)> {
+    let Ok(data) = files.read(path) else {
+        return Vec::new();
+    };
+    let slice = macho::slice(&data, uuid);
+    match object::File::parse(&data[slice]) {
+        Ok(object) => macho::other_code(&object, relative_address_base(&object)),
+        Err(_) => Vec::new(),
+    }
 }
 
 /// Only names from the binary or a matching debug artifact are evidence.

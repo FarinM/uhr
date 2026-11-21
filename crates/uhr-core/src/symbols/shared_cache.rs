@@ -9,7 +9,6 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use memmap2::Mmap;
-use wholesym::samply_symbols::demangle_any;
 use wholesym::samply_symbols::object::macho::{self, DyldCacheHeader, MachHeader64};
 use wholesym::samply_symbols::object::read::macho::{
     DyldCache, DyldSubCacheSlice, LoadCommandVariant, MachHeader, Segment,
@@ -149,7 +148,7 @@ impl Mapped {
                     .name()
                     .ok()
                     .filter(|n| !n.is_empty() && *n != "<redacted>")?;
-                Some((start, Some(demangle(name))))
+                Some((start, Some(crate::macho::demangle(name))))
             })
             .collect();
         // Every function's start, named or not, so that one without a name
@@ -258,18 +257,6 @@ fn function_starts<'data>(
         return Ok(Vec::new());
     };
     Ok(crate::macho::decode_starts(text, bytes))
-}
-
-/// Mach-O names start with an underscore that C code does not write.
-fn demangle(name: &str) -> String {
-    let name = name.strip_prefix('_').unwrap_or(name);
-    // Mangled C++ and Rust names keep the underscore their scheme starts
-    // with.
-    if name.starts_with("_Z") || name.starts_with("_R") {
-        demangle_any(name)
-    } else {
-        name.to_owned()
-    }
 }
 
 fn hex(uuid: [u8; 16]) -> String {

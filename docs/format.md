@@ -394,8 +394,11 @@ object files the binary was linked from, which it names, as builds keep them
 by default. Those give lines, but not where functions are declared. An image
 of the dyld shared cache, which has no file of its own, is read from the
 cache on this machine, which has names only for the functions an image
-exports: the others get placeholders. Mach-O names start with an underscore
-that C does not write, which names leave out.
+exports: the others get placeholders. Functions in a section of code other
+than `__text`, as JavaScriptCore keeps its interpreter in `__jsc_int`, are
+named from the symbol table of the dSYM or the binary, which wholesym does not
+read there. Mach-O names start with an underscore that C does not write,
+which names leave out.
 
 Each file is copied to a private temporary snapshot before reading its identity
 or symbols. Subsequent reads use that snapshot while debug-file lookup retains
