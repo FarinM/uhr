@@ -378,7 +378,7 @@ pub fn write_flamegraph(out: &mut impl Write, graph: &FlameGraph, output: &Path)
     for (origin, share) in &coverage.unnamed_by_origin {
         writeln!(out, "  unnamed {}: {:.1}%", origin.as_str(), share * 100.0)?;
     }
-    write_no_stack(out, coverage.no_stack_share)?;
+    write_no_stack(out, graph.metric, coverage.no_stack_share)?;
     write_symbol_coverage(out, &coverage.symbols)?;
     write_coverage(out, &coverage.recording)
 }
@@ -443,7 +443,7 @@ pub fn write_call_paths(out: &mut impl Write, result: &CallPaths) -> io::Result<
     for (origin, share) in &coverage.unnamed_by_origin {
         writeln!(out, "  unnamed {}: {:.1}%", origin.as_str(), share * 100.0)?;
     }
-    write_no_stack(out, coverage.no_stack_share)?;
+    write_no_stack(out, result.metric, coverage.no_stack_share)?;
     write_symbol_coverage(out, &coverage.symbols)?;
     write_coverage(out, &coverage.recording)
 }
@@ -555,7 +555,7 @@ pub fn write_query(out: &mut impl Write, result: &QueryResult) -> io::Result<()>
             coverage.no_stack_share * 100.0
         )?,
         GroupBy::WakerFunction => {}
-        _ => write_no_stack(out, coverage.no_stack_share)?,
+        _ => write_no_stack(out, result.metric, coverage.no_stack_share)?,
     }
     if let Some(share) = coverage.own_programs_share {
         writeln!(
@@ -758,9 +758,14 @@ fn counted(unit: Unit) -> &'static str {
     }
 }
 
-fn write_no_stack(out: &mut impl Write, share: f64) -> io::Result<()> {
+fn write_no_stack(out: &mut impl Write, metric: Metric, share: f64) -> io::Result<()> {
+    let what = match metric {
+        Metric::OnCPU => "CPU time",
+        Metric::OffCPU => "off-CPU time",
+        Metric::Wall | Metric::PageFaults => "time",
+    };
     if share > 0.0 {
-        writeln!(out, "  off-CPU time without a stack: {:.1}%", share * 100.0)?;
+        writeln!(out, "  {what} without a stack: {:.1}%", share * 100.0)?;
     }
     Ok(())
 }

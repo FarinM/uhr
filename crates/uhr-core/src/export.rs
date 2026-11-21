@@ -96,7 +96,10 @@ pub fn run(
         .collect();
     for sample in &samples {
         let thread = builder.thread(sample.pid, sample.tid, sample.time_ns);
-        let stack = builder.stack(thread, sample.stack);
+        let stack = match sample.stack {
+            Some(stack) => builder.stack(thread, stack),
+            None => Some(builder.threads[thread].no_stack()),
+        };
         builder.threads[thread]
             .data
             .samples
@@ -107,7 +110,7 @@ pub fn run(
                 weight: ms(sample.cpu_ns),
             });
         cpu_ns += sample.cpu_ns;
-        if unnamed[sample.stack as usize] {
+        if sample.stack.is_some_and(|stack| unnamed[stack as usize]) {
             unnamed_cpu_ns += sample.cpu_ns;
         }
     }
@@ -501,9 +504,40 @@ struct ThreadBuilder {
     stacks: HashMap<u32, Option<usize>>,
     prefixes: HashMap<(Option<usize>, usize), usize>,
     resources: HashMap<usize, usize>,
+    /// The stack of CPU time whose stack was not recorded.
+    no_stack: Option<usize>,
 }
 
 impl ThreadBuilder {
+    /// A stack of one frame of its own for CPU time whose stack was not
+    /// recorded, so that its time is in the call tree, which leaves out
+    /// samples without a stack.
+    fn no_stack(&mut self) -> usize {
+        if let Some(id) = self.no_stack {
+            return id;
+        }
+        let name = self.string("[CPU time without a stack]");
+        let function = self.data.func_table.0.len();
+        self.data.func_table.0.push(firefox::Function {
+            name,
+            resource: -1,
+            file: None,
+            line: None,
+            column: None,
+        });
+        let frame = self.data.frame_table.0.len();
+        self.data.frame_table.0.push(firefox::Frame {
+            function,
+            category: category(Origin::Unresolved),
+            line: None,
+            inlined: false,
+        });
+        let id = self.data.stack_table.0.len();
+        self.data.stack_table.0.push((None, frame));
+        self.no_stack = Some(id);
+        id
+    }
+
     fn string(&mut self, text: &str) -> usize {
         *self.strings.entry(text.into()).or_insert_with(|| {
             let id = self.data.string_array.len();

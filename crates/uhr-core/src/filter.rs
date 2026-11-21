@@ -105,7 +105,7 @@ impl Filter {
             tid: s.tid,
             mode: s.mode,
             time_ns: s.time_ns,
-            stack: s.stack,
+            stack: Some(s.stack),
         })?;
         Ok(taken.filter(move |&(at, _)| {
             in_regions.as_ref().is_none_or(|in_regions| {
@@ -137,7 +137,7 @@ impl Filter {
                 && self.in_time_range(sample.time_ns, start_ns)
                 && stacks
                     .as_ref()
-                    .is_none_or(|stacks| stacks[sample.stack as usize])
+                    .is_none_or(|stacks| sample.stack.is_some_and(|stack| stacks[stack as usize]))
                 && names
                     .as_mut()
                     .is_none_or(|names| names.matches(self, sample.pid, sample.tid, sample.time_ns))
@@ -349,7 +349,7 @@ struct Taken {
     tid: u32,
     mode: Mode,
     time_ns: u64,
-    stack: u32,
+    stack: Option<u32>,
 }
 
 struct NameMatcher<'a> {

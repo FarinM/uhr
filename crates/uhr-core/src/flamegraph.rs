@@ -82,8 +82,8 @@ pub struct FlameGraphCoverage {
     /// Share of the graphed amount with an unnamed frame of each origin. A
     /// stack with unnamed frames of two origins counts for both.
     pub unnamed_by_origin: BTreeMap<Origin, f64>,
-    /// Share of all the amount with no stack: off-CPU time whose stack was
-    /// not recorded. It is not in the graph.
+    /// Share of all the amount with no stack: CPU or off-CPU time whose
+    /// stack was not recorded. It is not in the graph.
     pub no_stack_share: f64,
     #[serde(flatten)]
     pub symbols: SymbolCoverage,

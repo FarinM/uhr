@@ -84,7 +84,7 @@ fn recording() -> (Recording, Symbols) {
             tid: 1,
             cpu: None,
             mode: Mode::User,
-            stack: id as u32,
+            stack: Some(id as u32),
             cpu_ns: *cpu_ns,
         })
         .collect();

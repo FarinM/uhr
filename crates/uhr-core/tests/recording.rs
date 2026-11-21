@@ -180,7 +180,7 @@ fn example() -> Recording {
                 tid: 7,
                 cpu: Some(3),
                 mode: Mode::User,
-                stack: 0,
+                stack: Some(0),
                 cpu_ns: 1_001_001,
             },
             Sample {
@@ -189,7 +189,7 @@ fn example() -> Recording {
                 tid: 7,
                 cpu: None,
                 mode: Mode::Kernel,
-                stack: 1,
+                stack: Some(1),
                 cpu_ns: 1_001_001,
             },
         ],

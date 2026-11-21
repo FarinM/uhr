@@ -72,7 +72,7 @@ fn recording() -> Recording {
             } else {
                 Mode::User
             },
-            stack: id as u32,
+            stack: Some(id as u32),
             cpu_ns,
         })
         .collect();
@@ -338,7 +338,7 @@ fn a_binary_that_ran_from_two_paths_is_one_function() {
     symbols.inline.extend([Vec::new(), Vec::new()]);
     recording.stacks.push(vec![9, 10]);
     recording.samples.push(Sample {
-        stack: recording.stacks.len() as u32 - 1,
+        stack: Some(recording.stacks.len() as u32 - 1),
         cpu_ns: 5,
         ..recording.samples[0].clone()
     });
@@ -546,7 +546,7 @@ fn counts_a_call_a_perf_map_and_the_interpreter_both_show_once() {
             tid: 1,
             cpu: None,
             mode: Mode::User,
-            stack: recording.stacks.len() as u32 - 1,
+            stack: Some(recording.stacks.len() as u32 - 1),
             cpu_ns,
         });
     }

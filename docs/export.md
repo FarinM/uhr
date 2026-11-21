@@ -45,7 +45,10 @@ Unknown lifetimes use the observed IDs, with a suffix when needed to avoid
 merging them with known lifetimes.
 
 Stacks use uhr's resolved functions, with inline frames expanded and native,
-kernel, JIT, interpreted and unresolved code categorized. Functions sharing a
+kernel, JIT, interpreted and unresolved code categorized. CPU time whose
+stack was not recorded has a stack of one frame, `[CPU time without a
+stack]`, as Firefox Profiler leaves samples without a stack out of its call
+tree. Functions sharing a
 name are labelled distinctly so the viewer does not merge them. Unnamed
 frames remain visible. Source file and line information is included when
 known, including lines in files other than a function's declaration; source text and disassembly are not embedded or served.

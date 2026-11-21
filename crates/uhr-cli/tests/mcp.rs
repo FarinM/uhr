@@ -130,7 +130,7 @@ fn unsymbolized(name: &str) -> PathBuf {
         tid,
         cpu: None,
         mode: Mode::User,
-        stack,
+        stack: Some(stack),
         cpu_ns: cpu_ms * MS,
     };
     let thread = |tid| Thread {

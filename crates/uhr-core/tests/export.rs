@@ -123,7 +123,7 @@ fn sample(tid: u32, time: u64, stack: u32, cpu_ns: u64) -> Sample {
         time_ns: START + time,
         cpu: Some(0),
         mode: Mode::User,
-        stack,
+        stack: Some(stack),
         cpu_ns,
     }
 }
@@ -197,6 +197,24 @@ fn preserves_cpu_weights_timestamps_and_thread_lifetimes() {
     let a = chain(main, main["samples"]["stack"][0].as_u64().unwrap() as usize);
     let b = chain(main, main["samples"]["stack"][1].as_u64().unwrap() as usize);
     assert_ne!(a[1], b[1]);
+}
+
+#[test]
+fn gives_cpu_time_without_a_stack_a_frame_of_its_own() {
+    let (mut recording, symbols) = recording();
+    // The main thread's last.
+    recording.samples.push(Sample {
+        stack: None,
+        ..sample(1, 9_500_000, 0, 1_000_000)
+    });
+    let profile = json(&recording, Some(&symbols), &Filter::default());
+    let threads = profile["threads"].as_array().unwrap();
+    let thread = threads.iter().find(|t| t["name"] == "main").unwrap();
+    let samples = &thread["samples"];
+    let last = samples["stack"].as_array().unwrap().len() - 1;
+    let stack = samples["stack"][last].as_u64().unwrap() as usize;
+    assert_eq!(chain(thread, stack), ["[CPU time without a stack]"]);
+    assert_eq!(samples["weight"][last], 1.0);
 }
 
 #[test]

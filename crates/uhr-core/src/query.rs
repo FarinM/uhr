@@ -125,8 +125,8 @@ pub struct SyscallRow {
     /// Whether the amount was in a syscall. `None` when the stack does not
     /// show it: its kernel functions have no names, it may have been cut
     /// short, or it has none and the CPU was not in user mode, as when
-    /// running a virtual machine's guest code. Off-CPU time without a stack
-    /// is `None` too.
+    /// running a virtual machine's guest code. Time without a stack is
+    /// `None` too.
     pub in_syscall: Option<bool>,
     /// The name in the syscall's kernel function, as `read` in
     /// `__x64_sys_read`. `None` outside syscalls, and in a syscall whose
@@ -205,9 +205,9 @@ pub struct QueryCoverage {
     pub named_share: Option<f64>,
     /// Share of the amount whose leaf frame has no name, by origin.
     pub unnamed_by_origin: BTreeMap<Origin, f64>,
-    /// Share of the amount with no stack: off-CPU time whose stack was not
-    /// recorded, or grouped by waker function, that no wakeup with a stack
-    /// ended. It is in no row.
+    /// Share of the amount with no stack: CPU or off-CPU time whose stack
+    /// was not recorded, or grouped by waker function, off-CPU time that no
+    /// wakeup with a stack ended. It is in no row.
     pub no_stack_share: f64,
     /// Share of the amount in uhr's own eBPF programs, which the target's
     /// threads run at their syscalls. `None` without them.

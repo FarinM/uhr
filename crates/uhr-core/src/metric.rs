@@ -78,7 +78,7 @@ pub(crate) struct StackAmounts {
     pub by_stack: Vec<u64>,
     /// Of `by_stack`, the amount of samples taken in user mode.
     pub user: Vec<u64>,
-    /// Off-CPU time whose stack was not recorded.
+    /// CPU and off-CPU time whose stack was not recorded.
     pub no_stack: u64,
     /// CPU samples, or page-fault samples, as the metric counts.
     pub samples: u64,
@@ -120,9 +120,14 @@ pub(crate) fn stack_amounts(
     }
     if metric != Metric::OffCPU {
         for sample in filter.samples(recording, functions)? {
-            amounts.by_stack[sample.stack as usize] += sample.cpu_ns;
-            if sample.mode == Mode::User {
-                amounts.user[sample.stack as usize] += sample.cpu_ns;
+            match sample.stack {
+                Some(stack) => {
+                    amounts.by_stack[stack as usize] += sample.cpu_ns;
+                    if sample.mode == Mode::User {
+                        amounts.user[stack as usize] += sample.cpu_ns;
+                    }
+                }
+                None => amounts.no_stack += sample.cpu_ns,
             }
             amounts.samples += 1;
         }

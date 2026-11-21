@@ -32,7 +32,7 @@ fn sample(pid: u32, tid: u32, time_ns: u64, mode: Mode, cpu_ns: u64) -> Sample {
         tid,
         cpu: None,
         mode,
-        stack: 0,
+        stack: Some(0),
         cpu_ns,
     }
 }

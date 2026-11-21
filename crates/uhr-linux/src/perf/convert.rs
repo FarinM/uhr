@@ -1403,7 +1403,7 @@ impl State {
             tid: taken.tid,
             cpu: sample.cpu,
             mode: taken.mode,
-            stack: taken.stack,
+            stack: Some(taken.stack),
             cpu_ns: taken.period,
         });
         Ok(())
@@ -1545,7 +1545,7 @@ impl State {
             tid,
             cpu: Some(header.cpu),
             mode,
-            stack,
+            stack: Some(stack),
             cpu_ns: period_ns,
         });
     }
@@ -2668,7 +2668,7 @@ mod tests {
             .map(|f| (f.pid, f.faults, f.address))
             .collect();
         assert_eq!(faults, [(1, 167, 0x7f00_0000)]);
-        assert_eq!(state.page_faults[0].stack, state.samples[0].stack);
+        assert_eq!(Some(state.page_faults[0].stack), state.samples[0].stack);
     }
 
     #[test]

@@ -106,8 +106,9 @@ pub struct CallPathsCoverage {
     /// within the depth limit. A path with unnamed frames of two origins
     /// counts for both.
     pub unnamed_by_origin: BTreeMap<Origin, f64>,
-    /// Share of all the amount with no stack: off-CPU time whose stack was
-    /// not recorded. It is on no path, so the function may have more.
+    /// Share of all the amount with no stack: CPU or off-CPU time whose
+    /// stack was not recorded. It is on no path, so the function may have
+    /// more.
     pub no_stack_share: f64,
     #[serde(flatten)]
     pub symbols: SymbolCoverage,

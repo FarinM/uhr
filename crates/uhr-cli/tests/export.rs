@@ -60,7 +60,7 @@ fn recording(name: &str) -> (PathBuf, PathBuf) {
                 tid: 1,
                 cpu: None,
                 mode: Mode::User,
-                stack: 0,
+                stack: Some(0),
                 cpu_ns: 123_456,
             },
             Sample {
@@ -69,7 +69,7 @@ fn recording(name: &str) -> (PathBuf, PathBuf) {
                 tid: 2,
                 cpu: None,
                 mode: Mode::User,
-                stack: 0,
+                stack: Some(0),
                 cpu_ns: 987_654,
             },
         ],

@@ -169,7 +169,7 @@ the poll at which uhr found the image in dyld's list.
 | `pid`, `tid` | uint32 | |
 | `cpu` | uint32, nullable | Null if not recorded |
 | `mode` | string | `user`, `kernel` or `unknown` (hypervisor, guest) |
-| `stack_id` | uint32 | |
+| `stack_id` | uint32, nullable | Null for CPU time whose stack was not seen. Never null on Linux |
 | `cpu_ns` | uint64 | CPU time this sample stands for |
 
 On macOS a sample stands for the CPU time a thread used in one mode between

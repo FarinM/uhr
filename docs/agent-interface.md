@@ -132,7 +132,7 @@ cut a fault or interrupt off from the syscall it happened in, since x86
 enters the kernel the same way for one in a syscall as for one in user code.
 Time without kernel functions on the stack is unknown too unless the CPU was
 in user mode, as a virtual machine's guest code runs inside a syscall of the
-host, and so is off-CPU time without a stack. The kernel functions known are
+host, and so is time without a stack. The kernel functions known are
 those of x86-64, arm64 and riscv, so on other architectures all kernel time is
 unknown.
 

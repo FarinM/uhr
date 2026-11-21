@@ -154,7 +154,7 @@ impl Timeline {
                     tid: self.tid,
                     cpu: None,
                     mode,
-                    stack,
+                    stack: Some(stack),
                     cpu_ns: ns,
                 });
             }
@@ -285,8 +285,8 @@ mod tests {
                 .map(|s| (s.time_ns, s.mode, s.cpu_ns, s.stack))
                 .collect::<Vec<_>>(),
             [
-                (MS, Mode::User, MS * 3 / 4, 7),
-                (MS, Mode::Kernel, MS / 4, 7)
+                (MS, Mode::User, MS * 3 / 4, Some(7)),
+                (MS, Mode::Kernel, MS / 4, Some(7))
             ]
         );
         assert!(out.off_cpu.is_empty());
@@ -385,8 +385,8 @@ mod tests {
                 .map(|s| (s.time_ns, s.mode, s.cpu_ns, s.stack))
                 .collect::<Vec<_>>(),
             [
-                (5 * MS, Mode::User, MS / 2, 3),
-                (5 * MS, Mode::Kernel, MS / 4, 3)
+                (5 * MS, Mode::User, MS / 2, Some(3)),
+                (5 * MS, Mode::Kernel, MS / 4, Some(3))
             ]
         );
         assert!(out.off_cpu.is_empty());

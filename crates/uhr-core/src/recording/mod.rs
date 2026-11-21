@@ -469,7 +469,9 @@ pub struct Sample {
     pub tid: u32,
     pub cpu: Option<u32>,
     pub mode: Mode,
-    pub stack: u32,
+    /// `None` for CPU time whose stack no sampler saw: on macOS, what a
+    /// thread used that no poll found it running for.
+    pub stack: Option<u32>,
     pub cpu_ns: u64,
 }
 
@@ -825,7 +827,7 @@ impl Recording {
                 Column::u32("tid", samples.iter().map(|s| s.tid).collect()),
                 Column::optional_u32("cpu", samples.iter().map(|s| s.cpu).collect()),
                 Column::string("mode", samples.iter().map(|s| s.mode.as_str()).collect()),
-                Column::u32("stack_id", samples.iter().map(|s| s.stack).collect()),
+                Column::optional_u32("stack_id", samples.iter().map(|s| s.stack).collect()),
                 Column::u64("cpu_ns", samples.iter().map(|s| s.cpu_ns).collect()),
             ],
         )?;
@@ -1092,7 +1094,9 @@ impl Recording {
             }
         }
         for (index, sample) in self.samples.iter().enumerate() {
-            check_id("sample", index, "stack", sample.stack, self.stacks.len())?;
+            if let Some(stack) = sample.stack {
+                check_id("sample", index, "stack", stack, self.stacks.len())?;
+            }
         }
         for (index, sample) in self.page_faults.iter().enumerate() {
             check_id(
@@ -1341,7 +1345,7 @@ fn read_samples(dir: &Path) -> Result<Vec<Sample>> {
     let tid = table.u32("tid")?;
     let cpu = table.optional_u32("cpu")?;
     let mode = table.string("mode")?;
-    let stack = table.u32("stack_id")?;
+    let stack = table.optional_u32("stack_id")?;
     let cpu_ns = table.u64("cpu_ns")?;
     (0..table.len())
         .map(|i| {

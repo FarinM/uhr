@@ -750,7 +750,7 @@ fn add_ebpf(
             recording
                 .samples
                 .iter()
-                .filter(|s| own[s.stack as usize])
+                .filter(|s| s.stack.is_some_and(|stack| own[stack as usize]))
                 .map(|s| s.cpu_ns)
                 .sum()
         });

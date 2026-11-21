@@ -32,7 +32,7 @@ fn sample(stack: u32, cpu_ns: u64) -> Sample {
         tid: 1,
         cpu: None,
         mode: Mode::User,
-        stack,
+        stack: Some(stack),
         cpu_ns,
     }
 }
@@ -192,6 +192,30 @@ fn reports_named_share_and_symbol_problems() {
     assert_eq!(coverage.unnamed_by_origin[&Origin::Kernel], 0.1);
     assert!(coverage.symbols.symbolized);
     assert_eq!(coverage.symbols.symbol_problems.len(), 1);
+}
+
+#[test]
+fn keeps_cpu_time_without_a_stack_in_no_row() {
+    let mut recording = recording();
+    recording.samples.push(Sample {
+        stack: None,
+        ..sample(0, 10)
+    });
+    let result = run(&recording, Some(&symbols()), &query(10)).unwrap();
+    assert_eq!(result.value, 20);
+    assert_eq!(result.coverage.no_stack_share, 0.5);
+    let main = function_rows(&result)
+        .iter()
+        .find(|r| r.function.name.as_deref() == Some("main"))
+        .unwrap();
+    assert_eq!((main.total, main.total_share), (10, 0.5));
+    let mut text = Vec::new();
+    text::write_query(&mut text, &result).unwrap();
+    let text = String::from_utf8(text).unwrap();
+    assert!(text.contains("CPU time without a stack: 50.0%"), "{text}");
+    // It is under no function.
+    let result = run(&recording, Some(&symbols()), &under(&["main"])).unwrap();
+    assert_eq!(result.value, 10);
 }
 
 #[test]
@@ -1919,7 +1943,9 @@ fn with_interpreter() -> (Recording, Symbols) {
             .samples
             .push(sample(recording.stacks.len() as u32 - 1, cpu_ns));
     }
-    recording.samples.retain(|s| s.stack >= 3);
+    recording
+        .samples
+        .retain(|s| s.stack.is_some_and(|stack| stack >= 3));
     (recording, symbols)
 }
 
