@@ -24,7 +24,8 @@ pub trait Process {
     /// now holds another.
     fn file(&self, mapping: &Mapping) -> io::Result<Vec<u8>>;
     /// The separate file of debug info of the file whose build id is
-    /// `build_id`, where the system keeps one.
+    /// `build_id`, where the system keeps one: on macOS, the Mach-O UUID,
+    /// and the file in a dSYM.
     fn debug_file(&self, _build_id: &[u8]) -> Option<Vec<u8>> {
         None
     }
@@ -45,7 +46,17 @@ pub(super) fn symbols(
     let bias = bias(&file, mapping)
         .ok_or_else(|| Error::Invalid(format!("{} is not mapped as code", mapping.path)))?;
     if file.format() == object::BinaryFormat::MachO {
-        return Ok(macho_symbols(&file, data, bias, wanted));
+        let mut found = macho_symbols(&file, data, bias, &wanted);
+        // A dSYM keeps its binary's addresses.
+        if let Some(uuid) = file.mach_uuid().ok().flatten()
+            && let Some(debug) = process.debug_file(&uuid)
+            && let Some((debug, data)) = parse_debug(&debug, &uuid)
+        {
+            for (name, range) in macho_symbols(&debug, data, bias, &wanted) {
+                found.entry(name).or_insert(range);
+            }
+        }
+        return Ok(found);
     }
     let mut found = HashMap::new();
     let mut add = |file: &object::File| {
@@ -191,12 +202,15 @@ pub(super) fn debug_symbols(
     let Some(bytes) = process.debug_file(build_id) else {
         return found;
     };
-    let Ok(file) = object::File::parse(&*bytes) else {
+    let Some((file, data)) = parse_debug(&bytes, build_id) else {
         return found;
     };
     let Some(bias) = bias(&file, mapping) else {
         return found;
     };
+    if file.format() == object::BinaryFormat::MachO {
+        return macho_symbols(&file, data, bias, wanted);
+    }
     for symbol in file.symbols() {
         if let Ok(name) = symbol.name()
             && symbol.section_index().is_some()
@@ -209,6 +223,19 @@ pub(super) fn debug_symbols(
         }
     }
     found
+}
+
+/// A file of debug info for the file with `build_id`, and its bytes: in a
+/// universal Mach-O file, the slice with that UUID. One with another UUID,
+/// as a dSYM of another build, is not.
+fn parse_debug<'a>(bytes: &'a [u8], build_id: &[u8]) -> Option<(object::File<'a>, &'a [u8])> {
+    let uuid = <[u8; 16]>::try_from(build_id).ok();
+    let data = &bytes[macho::slice(bytes, uuid)];
+    let file = object::File::parse(data).ok()?;
+    match file.mach_uuid().ok().flatten() {
+        Some(found) if Some(found) != uuid => None,
+        _ => Some((file, data)),
+    }
 }
 
 fn read_file(process: &dyn Process, mapping: &Mapping) -> Result<Vec<u8>, Error> {
@@ -631,7 +658,7 @@ mod glibc {
 #[cfg(all(test, target_os = "macos"))]
 mod macho_files {
     use std::fs;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::process::Command;
 
     use super::*;
@@ -655,9 +682,91 @@ mod macho_files {
         fn file(&self, mapping: &Mapping) -> io::Result<Vec<u8>> {
             fs::read(&mapping.path)
         }
+        /// As uhr's sampler finds it: in the dSYM beside the file.
+        fn debug_file(&self, _build_id: &[u8]) -> Option<Vec<u8>> {
+            let path = Path::new(&self.0[0].path);
+            let name = path.file_name()?.to_str()?;
+            fs::read(format!(
+                "{}.dSYM/Contents/Resources/DWARF/{name}",
+                path.display()
+            ))
+            .ok()
+        }
         fn memory(&self) -> &dyn Memory {
             self
         }
+    }
+
+    fn uuid(file: &Path) -> String {
+        let output = Command::new("dwarfdump")
+            .arg("--uuid")
+            .arg(file)
+            .output()
+            .unwrap();
+        let text = String::from_utf8(output.stdout).unwrap();
+        text.split_whitespace()
+            .nth(1)
+            .unwrap()
+            .replace('-', "")
+            .to_lowercase()
+    }
+
+    /// Builds `source` into a library in `dir`, with a dSYM beside it, and
+    /// strips what the library says of its own functions.
+    fn stripped(dir: &Path, name: &str, source: &str) -> PathBuf {
+        let path = dir.join(format!("{name}.c"));
+        fs::write(&path, source).unwrap();
+        let object = dir.join(format!("{name}.o"));
+        let library = dir.join(format!("lib{name}.dylib"));
+        let run = |command: &mut Command| assert!(command.status().unwrap().success());
+        // dsymutil reads the DWARF from the object files the library names.
+        run(Command::new("cc")
+            .args(["-c", "-g", "-O1", "-o"])
+            .arg(&object)
+            .arg(&path));
+        run(Command::new("cc")
+            .args(["-shared", "-o"])
+            .arg(&library)
+            .arg(&object));
+        run(Command::new("dsymutil").arg(&library));
+        run(Command::new("strip").arg("-x").arg(&library));
+        library
+    }
+
+    #[test]
+    fn finds_what_only_the_dsym_names() {
+        let dir = std::env::temp_dir().join(format!("uhr-dsym-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let source = "static int __attribute__((noinline)) hidden(int x) { return x * 7; }\n\
+                      int shown(int x) { return hidden(x) + 1; }\n";
+        let library = stripped(&dir, "hidden", source);
+        let mapping = |library: &Path, build_id: String| Mapping {
+            pid: Some(1),
+            start: 0x1_0000_0000,
+            end: 0x1_0000_4000,
+            file_offset: 0,
+            path: library.to_str().unwrap().to_owned(),
+            build_id: Some(build_id),
+            time_ns: None,
+        };
+        let process = Mapped(vec![mapping(&library, uuid(&library))]);
+        let wanted = |name: &str| matches!(name, "hidden" | "shown");
+        let found = symbols(&process, &process.0[0], wanted).unwrap();
+        assert!(found.contains_key("shown"), "{found:?}");
+        assert!(found.contains_key("hidden"), "{found:?}");
+        let id = super::macho::uuid(&uuid(&library)).unwrap();
+        let debug = debug_symbols(&process, &process.0[0], &id, wanted);
+        assert_eq!(debug.get("hidden"), found.get("hidden"));
+
+        // The dSYM of another build names nothing.
+        let other = stripped(&dir, "other", "int shown(int x) { return x; }\n");
+        let dsym = |library: &Path| library.with_extension("dylib.dSYM");
+        fs::remove_dir_all(dsym(&library)).unwrap();
+        fs::rename(dsym(&other), dsym(&library)).unwrap();
+        let found = symbols(&process, &process.0[0], wanted).unwrap();
+        assert!(!found.contains_key("hidden"), "{found:?}");
+        assert!(debug_symbols(&process, &process.0[0], &id, wanted).is_empty());
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     /// Each slice's UUID, as uhr records it, and the address `nm` gives each

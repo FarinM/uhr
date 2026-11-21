@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io;
+use std::path::Path;
 
 use tracing::debug;
 use uhr_core::recording::{Frame, Mapping};
@@ -35,6 +36,23 @@ impl Process for Live<'_> {
     /// UUID.
     fn file(&self, mapping: &Mapping) -> io::Result<Vec<u8>> {
         fs::read(&mapping.path)
+    }
+
+    /// The DWARF of the dSYM beside the file with that UUID, as Apple's
+    /// tools leave it, `<file>.dSYM/Contents/Resources/DWARF/<name>`.
+    fn debug_file(&self, build_id: &[u8]) -> Option<Vec<u8>> {
+        let id: String = build_id.iter().map(|b| format!("{b:02x}")).collect();
+        let mapping = self
+            .mappings
+            .iter()
+            .find(|m| m.build_id.as_deref() == Some(&id))?;
+        let path = Path::new(&mapping.path);
+        let mut bundle = path.as_os_str().to_owned();
+        bundle.push(".dSYM");
+        let dwarf = Path::new(&bundle)
+            .join("Contents/Resources/DWARF")
+            .join(path.file_name()?);
+        fs::read(dwarf).ok()
     }
 
     fn memory(&self) -> &dyn Memory {

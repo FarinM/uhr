@@ -597,9 +597,13 @@ programs read the frames of:
   uhr knows those for x86-64 Linux and arm64 macOS. Each JavaScript
   function's frame holds its `CodeBlock`, whose executable names it and its
   script. Where the build with symbols is kept by its build id with the
-  system's debug info, it also names the interpreter's code, so that its
+  system's debug info, or on macOS the dSYM Bun publishes with it is in a
+  bundle beside `bun`, it also names the interpreter's code, so that its
   frames take the place of the interpreter's native ones; without it they go
-  just above them. Lines are not read yet. An async function that is resumed
+  just above them. Bun publishes the dSYM as a single file,
+  `bun-profile.dSYM` in `bun-darwin-aarch64-profile.zip`, which goes in the
+  bundle as `bun.dSYM/Contents/Resources/DWARF/bun`: a file named `bun.dSYM`
+  is not read. Lines are not read yet. An async function that is resumed
   gets its `JSAsyncFunctionGenerator` as an argument, which holds the
   promise of its result, and a pending promise that of the function that
   waits for it, or the promise of the `Promise.all`, `allSettled` or `any`
@@ -747,10 +751,11 @@ and walks that fail then count as none. Checked with Homebrew's CPython
 3.13, a framework build whose library is named `Python`, and Node 24 from
 nodejs.org, on arm64. Bun 1.4.3's build for arm64 is read by its UUID, with
 the offsets of its build for Linux, which name its functions, their scripts
-and the async functions that wait there as on Linux. No debug info names its
-interpreter's code on macOS, so the frames it runs go just above the
-interpreter's native ones. Bun's builds for x86-64 Macs are not read. The
-other runtimes' frames are not read on macOS yet: CRuby's state is in a
+and the async functions that wait there as on Linux. A runtime's separate
+debug info is the DWARF in the dSYM bundle beside its file, whose UUID is
+the file's, where the single file Bun publishes with each release goes.
+Bun's builds for x86-64 Macs are not read.
+The other runtimes' frames are not read on macOS yet: CRuby's state is in a
 thread-local, which uhr finds only in ELF files, HotSpot's library is looked
 for as `libjvm.so`, and PHP and Lua are not checked.
 
