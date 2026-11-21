@@ -179,6 +179,22 @@ impl Unwinding {
     }
 }
 
+/// Whether a thread held still at `pc` is in a syscall: the instruction
+/// before it makes the call, and the thread goes on there once the kernel
+/// returns, so that the kernel runs it, or it waits there.
+pub(crate) fn in_syscall(task: &Task, pc: u64) -> bool {
+    // `svc #0x80`, as libsystem_kernel makes its calls.
+    #[cfg(target_arch = "aarch64")]
+    let (call, at): (&[u8], u64) = (&0xd400_1001u32.to_le_bytes(), 4);
+    // `syscall`.
+    #[cfg(target_arch = "x86_64")]
+    let (call, at): (&[u8], u64) = (&[0x0f, 0x05], 2);
+    let mut code = [0; 4];
+    let code = &mut code[..call.len()];
+    pc.checked_sub(at)
+        .is_some_and(|before| task.read(before, code).is_ok() && code == call)
+}
+
 /// On arm64e, the processes Apple builds sign return addresses, which
 /// framehop strips with this mask; it changes none of another process's.
 #[cfg(target_arch = "aarch64")]
@@ -195,4 +211,23 @@ fn regs(registers: Registers) -> (u64, UnwindRegsX86_64) {
         registers.pc,
         UnwindRegsX86_64::new(registers.pc, registers.sp, registers.fp),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn knows_a_thread_in_a_syscall_by_the_code_before_it() {
+        let task = Task::for_pid(std::process::id()).unwrap();
+        // libsystem_kernel's function for the call makes it at once.
+        let getpid = libc::getpid as *const () as u64;
+        let after: Vec<u64> = (1..64)
+            .map(|offset| getpid + offset)
+            .filter(|&pc| in_syscall(&task, pc))
+            .collect();
+        assert_eq!(after.len(), 1, "{getpid:#x}");
+        assert!(!in_syscall(&task, getpid));
+        assert!(!in_syscall(&task, 0));
+    }
 }

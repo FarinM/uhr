@@ -161,6 +161,69 @@ fn a_blocked_threads_time_off_cpu_is_under_its_wait() {
 }
 
 #[test]
+fn cpu_time_before_a_wait_is_not_in_the_wait() {
+    let dir = scratch("macos_bursts");
+    let program = dir.join("bursts");
+    compile("bursts", &program, "-O2");
+    let recording = dir.join("rec");
+    record(&recording, &[program.to_str().unwrap()]);
+    let path = recording.to_str().unwrap();
+
+    // Polls find it asleep more often than computing.
+    let user = json(&[
+        "query",
+        path,
+        "--group-by",
+        "function",
+        "--mode",
+        "user",
+        "--top",
+        "100",
+    ]);
+    let burst = share(&user, "burst", "self_share");
+    assert!(burst > 0.9, "burst has {burst} of the user time");
+    let slept = rows(&user)
+        .iter()
+        .find(|r| r["function"] == "__semwait_signal")
+        .map_or(0.0, |r| r["self_share"].as_f64().unwrap());
+    assert!(slept < 0.02, "the sleep has {slept} of the user time");
+    let without = user["coverage"]["no_stack_share"].as_f64().unwrap();
+    assert!(without < 0.02, "{without} of the user time has no stack");
+}
+
+#[test]
+fn time_in_a_page_fault_is_under_the_code_that_faulted() {
+    let dir = scratch("macos_faults");
+    let program = dir.join("faults");
+    compile("faults", &program, "-O2");
+    let recording = dir.join("rec");
+    record(&recording, &[program.to_str().unwrap()]);
+    let path = recording.to_str().unwrap();
+
+    let kernel = json(&[
+        "query",
+        path,
+        "--group-by",
+        "function",
+        "--mode",
+        "kernel",
+        "--top",
+        "100",
+    ]);
+    // Its faults have about four fifths of it, which polls in a syscall
+    // alone would put in the syscall the thread is next found in.
+    let touch = share(&kernel, "touch", "self_share");
+    assert!(touch > 0.6, "touch has {touch} of the kernel time");
+    let unmapping = rows(&kernel)
+        .iter()
+        .find(|r| r["function"] == "__munmap")
+        .map_or(0.0, |r| r["self_share"].as_f64().unwrap());
+    assert!(unmapping < 0.4, "munmap has {unmapping} of the kernel time");
+    let without = kernel["coverage"]["no_stack_share"].as_f64().unwrap();
+    assert!(without < 0.02, "{without} of the kernel time has no stack");
+}
+
+#[test]
 fn follows_a_child_through_its_fork_and_its_exec() {
     let dir = scratch("macos_follows_a_child");
     let program = dir.join("spawns");

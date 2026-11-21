@@ -38,7 +38,7 @@ use crate::mach::{
 use crate::polling::{Poll, Polled, RunState, Timeline};
 use crate::process;
 use crate::runtime::{Runtime, Sample};
-use crate::unwind::{End, Unwinding as Unwinder, Walk};
+use crate::unwind::{End, Unwinding as Unwinder, Walk, in_syscall};
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -657,6 +657,9 @@ struct Process {
     unwinder: Unwinder,
     /// What a walk read of the process's memory while it held a thread.
     chunks: Chunks,
+    /// Whether each address a walk started from is just past a syscall,
+    /// read once for each, as code stays where it is.
+    syscalls: HashMap<u64, bool>,
     runtime: Runtime,
     /// By the name of uhr's right to each thread's port, which stays the
     /// same while uhr holds it.
@@ -698,6 +701,7 @@ impl Process {
             code: BTreeMap::new(),
             unwinder: Unwinder::new(),
             chunks: Chunks::default(),
+            syscalls: HashMap::new(),
             runtime: Runtime::new((pid, exec)),
             threads: HashMap::new(),
             unnumbered: HashMap::new(),
@@ -864,8 +868,8 @@ impl Process {
             .copied()
             .collect();
         for name in gone {
-            let followed = self.threads.remove(&name).expect("followed");
-            tables.threads[followed.row].end_ns = followed.timeline.last_ns();
+            let mut followed = self.threads.remove(&name).expect("followed");
+            followed.end(tables);
         }
         self.unnumbered.retain(|name, _| listed.contains(name));
         true
@@ -969,6 +973,7 @@ impl Process {
                 user_ns: info.user_ns,
                 system_ns: info.system_ns,
                 state,
+                in_kernel: false,
                 stack: None,
             });
         }
@@ -978,6 +983,7 @@ impl Process {
         let (user_ns, system_ns) = thread_cpu_ns(port).ok()?;
         let time_ns = monotonic_ns();
         let registers = held.registers().ok()?;
+        let in_page_fault = held.in_page_fault().ok()?;
         let walk = self.unwinder.walk(
             &self.task,
             &mut self.chunks,
@@ -1007,6 +1013,13 @@ impl Process {
         if let Some(walked) = &walked {
             self.runtime.read_code(&self.task, walked);
         }
+        let pc = walk.frames[0].address();
+        let task = &self.task;
+        let in_kernel = in_page_fault
+            || *self
+                .syscalls
+                .entry(pc)
+                .or_insert_with(|| in_syscall(task, pc));
         let mut stack = tables.native_stack(&self.code, &walk);
         self.runtime.place(
             &mut tables.interpreted,
@@ -1024,14 +1037,15 @@ impl Process {
             user_ns,
             system_ns,
             state,
+            in_kernel,
             stack: Some(intern(&mut tables.stacks, &mut tables.stack_ids, stack)),
         })
     }
 
     /// Ends every thread at its last poll, as the process exited or exec'd.
     fn end(self, tables: &mut Tables) {
-        for followed in self.threads.into_values() {
-            tables.threads[followed.row].end_ns = followed.timeline.last_ns();
+        for mut followed in self.threads.into_values() {
+            followed.end(tables);
         }
     }
 
@@ -1058,6 +1072,12 @@ impl Process {
 }
 
 impl Followed {
+    /// Ends the thread at its last poll, as it exited.
+    fn end(&mut self, tables: &mut Tables) {
+        tables.threads[self.row].end_ns = self.timeline.last_ns();
+        self.timeline.end(&mut tables.polled);
+    }
+
     /// Adds a poll, at which the thread had `name`.
     fn add(&mut self, poll: Poll, name: String, pid: u32, tables: &mut Tables) {
         let time_ns = poll.time_ns;
@@ -1188,6 +1208,11 @@ impl<'a> Sampler<'a> {
     /// Ends the capture, with a last reading of the memory of the processes
     /// still running. `stopped_ns` is when uhr stopped it, if it did.
     fn finish(mut self, stopped_ns: Option<u64>, ticks: Ticks) -> Captured {
+        for process in &mut self.processes {
+            for followed in process.threads.values_mut() {
+                followed.timeline.end(&mut self.tables.polled);
+            }
+        }
         if self.options.memory {
             for process in &mut self.processes {
                 process.memory_due = Instant::now();
@@ -1336,11 +1361,12 @@ impl Captured {
         let held_us = counts.held_ns / counts.walks.max(1) / 1000;
         let mut known_biases = vec![
             format!(
-                "uhr polls each thread every {period_us} µs, and samples the CPU time it used \
-                 since the last poll with the stack it has at this one, so code that ran early \
-                 in the period is counted for the code that runs at its end."
+                "uhr polls each thread every {period_us} µs, and samples its CPU time only at a \
+                 poll that finds it running, with the stack it has then, as a CPU-clock sampler \
+                 samples a thread only while it runs: each sample has the CPU time since the \
+                 thread's last one, which can include code it ran before it last waited."
             ),
-            "Time in the kernel is under the user stack of the call that entered it, without \
+            "Time in the kernel is under the user stack of the code that entered it, without \
              the kernel's own frames. A thread's syscall is the function of libsystem_kernel \
              that stack ends in, which is named for the call; time in the kernel at a stack \
              that ends elsewhere, as in a page fault, is in no known syscall."
@@ -1358,6 +1384,20 @@ impl Captured {
                 "Time a thread spent off CPU between two polls at which it ran, as waits shorter \
                  than the {period_us} µs between polls, is counted, but without a stack and in \
                  an unknown state."
+            ));
+        }
+        let stackless_ns: u64 = samples
+            .iter()
+            .filter(|s| s.stack.is_none())
+            .map(|s| s.cpu_ns)
+            .sum();
+        if stackless_ns > 0 {
+            let cpu_ns: u64 = samples.iter().map(|s| s.cpu_ns).sum();
+            known_biases.push(format!(
+                "{:.1}% of the CPU time has no stack: threads used it in a mode after the last \
+                 poll that found them running in that mode, before they exited or the capture \
+                 ended, as threads that run only briefly between waits do.",
+                stackless_ns as f64 / cpu_ns.max(1) as f64 * 100.0
             ));
         }
         if ticks.missed > 0 {

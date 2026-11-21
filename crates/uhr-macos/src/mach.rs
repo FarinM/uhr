@@ -23,9 +23,9 @@ use mach2::task_info::{
 };
 use mach2::thread_act::{thread_get_state, thread_resume, thread_suspend};
 #[cfg(target_arch = "aarch64")]
-use mach2::thread_status::ARM_THREAD_STATE64;
+use mach2::thread_status::{ARM_EXCEPTION_STATE64, ARM_THREAD_STATE64};
 #[cfg(target_arch = "x86_64")]
-use mach2::thread_status::x86_THREAD_STATE64;
+use mach2::thread_status::{x86_EXCEPTION_STATE64, x86_THREAD_STATE64};
 use mach2::traps::{mach_task_self, task_for_pid};
 use mach2::vm::{mach_vm_deallocate, mach_vm_read, mach_vm_read_overwrite};
 use mach2::vm_types::{mach_vm_address_t, mach_vm_size_t, natural_t};
@@ -400,6 +400,73 @@ impl Suspended<'_> {
     }
 }
 
+/// What the kernel saved of how a thread last entered it, as
+/// `arm_exception_state64_t` has it.
+#[cfg(target_arch = "aarch64")]
+#[repr(C)]
+#[derive(Default)]
+struct ExceptionState {
+    far: u64,
+    esr: u32,
+    _exception: u32,
+}
+
+#[cfg(target_arch = "aarch64")]
+impl ExceptionState {
+    /// An instruction or data abort from user mode. The kernel clears the
+    /// address for an interrupt, as the one that stops a thread running its
+    /// own code, whose syndrome is left from an earlier exception.
+    fn page_fault(&self) -> bool {
+        matches!(self.esr >> 26, 0x20 | 0x24) && self.far != 0
+    }
+}
+
+/// What the kernel saved of how a thread last entered it, as
+/// `x86_exception_state64_t` has it.
+#[cfg(target_arch = "x86_64")]
+#[repr(C)]
+#[derive(Default)]
+struct ExceptionState {
+    trapno: u16,
+    _cpu: u16,
+    _err: u32,
+    _faultvaddr: u64,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl ExceptionState {
+    /// The kernel saves the trap number at every entry.
+    fn page_fault(&self) -> bool {
+        const T_PAGE_FAULT: u16 = 14;
+        self.trapno == T_PAGE_FAULT
+    }
+}
+
+impl Suspended<'_> {
+    /// Whether the thread is in a page fault, which the kernel handles
+    /// before it lets the thread stop, at the instruction that faulted.
+    pub(crate) fn in_page_fault(&self) -> Result<bool, Failed> {
+        #[cfg(target_arch = "aarch64")]
+        let flavor = ARM_EXCEPTION_STATE64;
+        #[cfg(target_arch = "x86_64")]
+        let flavor = x86_EXCEPTION_STATE64;
+        let mut state = ExceptionState::default();
+        let mut count = (mem::size_of::<ExceptionState>() / mem::size_of::<natural_t>())
+            as mach_msg_type_number_t;
+        // SAFETY: `state` has room for `count` integers.
+        let code = unsafe {
+            thread_get_state(
+                self.0.name(),
+                flavor,
+                (&mut state as *mut ExceptionState).cast(),
+                &mut count,
+            )
+        };
+        check("thread_get_state", code)?;
+        Ok(state.page_fault())
+    }
+}
+
 /// CLOCK_MONOTONIC, which recordings are timed on. Async-signal-safe.
 pub fn monotonic_ns() -> u64 {
     clock_ns(libc::CLOCK_MONOTONIC) as u64
@@ -416,4 +483,79 @@ fn clock_ns(clock: libc::clockid_t) -> i64 {
 
 pub(crate) fn realtime_ns() -> i64 {
     clock_ns(libc::CLOCK_REALTIME)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, mpsc};
+    use std::thread;
+    use std::time::Duration;
+
+    use super::*;
+
+    /// How many of 400 polls of a thread that runs `work` until told to stop
+    /// find it in a page fault.
+    fn in_page_fault(work: fn(&AtomicBool)) -> usize {
+        let stop = Arc::new(AtomicBool::new(false));
+        let (sender, port) = mpsc::channel();
+        let worker = thread::spawn({
+            let stop = Arc::clone(&stop);
+            move || {
+                sender.send(thread_self()).unwrap();
+                work(&stop);
+            }
+        });
+        let port = port.recv().unwrap();
+        thread::sleep(Duration::from_millis(20));
+        let found = (0..400)
+            .filter(|_| {
+                thread::sleep(Duration::from_micros(200));
+                suspend(&port).unwrap().in_page_fault().unwrap()
+            })
+            .count();
+        stop.store(true, Ordering::Relaxed);
+        worker.join().unwrap();
+        found
+    }
+
+    fn touch_new_pages(stop: &AtomicBool) {
+        // SAFETY: sysconf has no preconditions.
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        let len = 64 << 20;
+        while !stop.load(Ordering::Relaxed) {
+            // SAFETY: an anonymous mapping of uhr's own, which it writes in
+            // and then unmaps.
+            unsafe {
+                let start = libc::mmap(
+                    ptr::null_mut(),
+                    len,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_ANON | libc::MAP_PRIVATE,
+                    -1,
+                    0,
+                );
+                assert_ne!(start, libc::MAP_FAILED);
+                for offset in (0..len).step_by(page) {
+                    ptr::write_volatile(start.cast::<u8>().add(offset), 1);
+                }
+                libc::munmap(start, len);
+            }
+        }
+    }
+
+    fn compute(stop: &AtomicBool) {
+        let mut sum = 0u64;
+        while !stop.load(Ordering::Relaxed) {
+            sum = std::hint::black_box(sum.wrapping_add(1));
+        }
+    }
+
+    #[test]
+    fn knows_a_thread_in_a_page_fault() {
+        let touching = in_page_fault(touch_new_pages);
+        assert!(touching > 400 / 3, "{touching} of 400 polls in a fault");
+        // Its last fault was long ago.
+        assert_eq!(in_page_fault(compute), 0);
+    }
 }

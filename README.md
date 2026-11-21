@@ -47,11 +47,13 @@ About a thousand times a second, uhr reads each thread's CPU time and state. A
 thread that ran since the last time, or can run now, it holds still for about
 16 microseconds and walks its stack with the unwind tables of the images in
 its process, and if it runs Python or JavaScript, their frames from the
-process's memory. The CPU time since the last poll goes to that stack. A
-thread that waits costs one call, and its time off CPU goes to the stack it
-waits at. uhr gets each process's task port from a small library it has dyld
-load into the program and every process that program starts, which sends the
-port to uhr before the program's own code runs.
+process's memory. The CPU time it used since its last sample goes to that
+stack if the poll finds it running, and else to the next poll that does: a
+thread that waits at a poll ran its code before it waited. A thread that waits
+costs one call, and its time off CPU goes to the stack it waits at. uhr gets
+each process's task port from a small library it has dyld load into the
+program and every process that program starts, which sends the port to uhr
+before the program's own code runs.
 
 ## How the eBPF sampler works
 

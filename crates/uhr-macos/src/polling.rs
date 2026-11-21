@@ -5,6 +5,14 @@
 //! so one that can run: the kernel counts the time of a thread on a CPU only
 //! as it enters the kernel, as much as a quantum, 10 ms, late, so it may have
 //! run since. Held still, its count is up to date.
+//!
+//! CPU time is sampled only at a poll that finds the thread running, as a
+//! CPU-clock sampler samples a thread only while it runs: a thread that
+//! waits at a poll ran its code before it waited, not where it waits. Each
+//! mode's time waits for a poll that finds the thread running in that mode,
+//! as one in a syscall or a page fault runs no user code. Polls come at
+//! fixed times, so the stacks of those that find it running in a mode are a
+//! fair sample of where its time in that mode goes.
 
 use uhr_core::recording::{Mode, OffCPUInterval, Sample, ThreadState};
 
@@ -16,6 +24,9 @@ pub(crate) struct Poll {
     pub user_ns: u64,
     pub system_ns: u64,
     pub state: RunState,
+    /// Whether it was in a syscall or a page fault, so that running, it ran
+    /// in the kernel.
+    pub in_kernel: bool,
     /// Its stack, walked at this poll. `None` if it was not walked, which
     /// `Timeline::needs_stack` allows only for a waiting thread that did not
     /// run.
@@ -50,6 +61,9 @@ pub(crate) struct Timeline {
     /// The interval in `Polled::off_cpu` that ends at the last poll, which a
     /// wait that goes on extends.
     open: Option<usize>,
+    /// CPU time in user and in kernel mode since the last poll that found
+    /// the thread running in that mode, which the next such poll samples.
+    unsampled: (u64, u64),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -72,6 +86,7 @@ impl Timeline {
             off_cpu,
             last: None,
             open: None,
+            unsampled: (0, 0),
         }
     }
 
@@ -91,9 +106,9 @@ impl Timeline {
 
     /// Adds the first poll of a thread that started since the last poll of
     /// its process, which must walk its stack. All its CPU time so far ran
-    /// since then, so it is sampled at this poll, as `add` samples the time
-    /// between two polls. When it started, and so how long it was off CPU
-    /// before, is not known.
+    /// since then, so it is sampled as `add` samples the time between two
+    /// polls. When it started, and so how long it was off CPU before, is not
+    /// known.
     pub(crate) fn started(&mut self, poll: Poll, out: &mut Polled) {
         assert!(self.last.is_none(), "a thread starts once");
         let stack = poll
@@ -112,14 +127,16 @@ impl Timeline {
     }
 
     /// Adds a poll, which must come after the last. The first only sets
-    /// where the next count from. The CPU time between two polls is
-    /// sampled at the second with its stack, as a CPU-clock sampler would
-    /// at the end of its period. The rest of the time between them the
-    /// thread was off CPU: all of it where its CPU time did not move, with
-    /// the stack it had and its state at the second poll, or where it ran,
-    /// for as long as it did not. A wait it was in at the first poll then
-    /// most likely lasted until it ran, so that time goes to the wait;
-    /// otherwise it waited between running, where and why not known.
+    /// where the next count from. The CPU time in each mode between two
+    /// polls is sampled at the second with its stack if it finds the thread
+    /// running in that mode, and else at the next poll that does, with all
+    /// the time in the mode since its last sample. The rest of the time
+    /// between them the thread was off CPU: all of it where its CPU time did
+    /// not move, with the stack it had and its state at the second poll, or
+    /// where it ran, for as long as it did not. A wait it was in at the
+    /// first poll then most likely lasted until it ran, so that time goes to
+    /// the wait; otherwise it waited between running, where and why not
+    /// known.
     pub(crate) fn add(&mut self, poll: Poll, out: &mut Polled) {
         let cpu_ns = poll.user_ns + poll.system_ns;
         let Some(last) = self.last else {
@@ -143,21 +160,14 @@ impl Timeline {
             None => panic!("a poll of a thread that ran walks its stack"),
         };
         let elapsed_ns = poll.time_ns.saturating_sub(last.time_ns);
-        for (mode, ns) in [
-            (Mode::User, poll.user_ns.saturating_sub(last.user_ns)),
-            (Mode::Kernel, poll.system_ns.saturating_sub(last.system_ns)),
-        ] {
-            if ns > 0 {
-                out.samples.push(Sample {
-                    time_ns: poll.time_ns,
-                    pid: self.pid,
-                    tid: self.tid,
-                    cpu: None,
-                    mode,
-                    stack: Some(stack),
-                    cpu_ns: ns,
-                });
-            }
+        self.unsampled.0 += poll.user_ns.saturating_sub(last.user_ns);
+        self.unsampled.1 += poll.system_ns.saturating_sub(last.system_ns);
+        if poll.state == RunState::Running {
+            let mode = match poll.in_kernel {
+                true => Mode::Kernel,
+                false => Mode::User,
+            };
+            self.sample(poll.time_ns, Some(stack), &[mode], out);
         }
         // The kernel counts CPU time in microseconds, so a thread that ran
         // the whole time can show a little more than passed.
@@ -214,6 +224,38 @@ impl Timeline {
             stack,
         });
     }
+
+    /// Samples the CPU time in `modes` since their last samples, at
+    /// `time_ns`.
+    fn sample(&mut self, time_ns: u64, stack: Option<u32>, modes: &[Mode], out: &mut Polled) {
+        for &mode in modes {
+            let unsampled = match mode {
+                Mode::Kernel => &mut self.unsampled.1,
+                _ => &mut self.unsampled.0,
+            };
+            let cpu_ns = std::mem::take(unsampled);
+            if cpu_ns > 0 {
+                out.samples.push(Sample {
+                    time_ns,
+                    pid: self.pid,
+                    tid: self.tid,
+                    cpu: None,
+                    mode,
+                    stack,
+                    cpu_ns,
+                });
+            }
+        }
+    }
+
+    /// Ends the thread's polls, as it exited or the capture ended. The CPU
+    /// time no poll found it running for since its last sample is sampled at
+    /// the last poll without a stack, as where it ran was not seen.
+    pub(crate) fn end(&mut self, out: &mut Polled) {
+        if let Some(last) = self.last {
+            self.sample(last.time_ns, None, &[Mode::User, Mode::Kernel], out);
+        }
+    }
 }
 
 fn state(state: RunState) -> ThreadState {
@@ -242,8 +284,24 @@ mod tests {
             user_ns,
             system_ns,
             state,
+            in_kernel: false,
             stack,
         }
+    }
+
+    /// A poll that finds the thread running in a syscall.
+    fn in_kernel(time_ns: u64, user_ns: u64, system_ns: u64, stack: u32) -> Poll {
+        Poll {
+            in_kernel: true,
+            ..poll(time_ns, user_ns, system_ns, RunState::Running, Some(stack))
+        }
+    }
+
+    fn samples(out: &Polled) -> Vec<(u64, Mode, u64, Option<u32>)> {
+        out.samples
+            .iter()
+            .map(|s| (s.time_ns, s.mode, s.cpu_ns, s.stack))
+            .collect()
     }
 
     fn timeline() -> Timeline {
@@ -271,7 +329,7 @@ mod tests {
     }
 
     #[test]
-    fn cpu_time_is_sampled_by_mode_at_the_later_poll() {
+    fn each_mode_is_sampled_at_a_poll_that_finds_the_thread_running_in_it() {
         let mut thread = timeline();
         let mut out = Polled::default();
         thread.add(poll(0, 0, 0, RunState::Running, Some(0)), &mut out);
@@ -279,17 +337,66 @@ mod tests {
             poll(MS, MS * 3 / 4, MS / 4, RunState::Running, Some(7)),
             &mut out,
         );
+        assert_eq!(samples(&out), [(MS, Mode::User, MS * 3 / 4, Some(7))]);
+        // In a syscall, which runs no user code.
+        thread.add(in_kernel(2 * MS, MS, MS / 2, 8), &mut out);
+        assert_eq!(
+            samples(&out)[1..],
+            [(2 * MS, Mode::Kernel, MS / 2, Some(8))]
+        );
+        thread.add(in_kernel(3 * MS, MS * 5 / 4, MS / 2, 8), &mut out);
+        assert_eq!(out.samples.len(), 2);
+        thread.add(
+            poll(4 * MS, MS * 3 / 2, MS / 2, RunState::Running, Some(9)),
+            &mut out,
+        );
+        assert_eq!(
+            samples(&out)[2..],
+            [(4 * MS, Mode::User, MS * 3 / 4, Some(9))]
+        );
+    }
+
+    #[test]
+    fn cpu_time_before_a_wait_is_sampled_where_the_thread_is_next_found_running() {
+        let mut thread = timeline();
+        let mut out = Polled::default();
+        thread.add(poll(0, 0, 0, RunState::Running, Some(1)), &mut out);
+        // It ran, then waited at 2 by the poll, which is no place it ran.
+        thread.add(
+            poll(MS, MS / 4, MS / 8, RunState::Waiting, Some(2)),
+            &mut out,
+        );
+        assert!(out.samples.is_empty());
+        thread.add(
+            poll(2 * MS, MS / 2, MS / 8, RunState::Running, Some(3)),
+            &mut out,
+        );
+        assert_eq!(samples(&out), [(2 * MS, Mode::User, MS / 2, Some(3))]);
+        // No poll found it in a syscall.
+        thread.end(&mut out);
+        assert_eq!(samples(&out)[1..], [(2 * MS, Mode::Kernel, MS / 8, None)]);
+    }
+
+    #[test]
+    fn cpu_time_no_poll_found_the_thread_running_for_has_no_stack() {
+        let mut thread = timeline();
+        let mut out = Polled::default();
+        thread.add(poll(0, 0, 0, RunState::Waiting, Some(1)), &mut out);
+        thread.add(poll(MS, MS / 10, 0, RunState::Waiting, Some(2)), &mut out);
+        thread.add(poll(2 * MS, MS / 5, 0, RunState::Other, Some(2)), &mut out);
+        assert!(out.samples.is_empty());
+        thread.end(&mut out);
         assert_eq!(
             out.samples
                 .iter()
                 .map(|s| (s.time_ns, s.mode, s.cpu_ns, s.stack))
                 .collect::<Vec<_>>(),
-            [
-                (MS, Mode::User, MS * 3 / 4, Some(7)),
-                (MS, Mode::Kernel, MS / 4, Some(7))
-            ]
+            [(2 * MS, Mode::User, MS / 5, None)]
         );
-        assert!(out.off_cpu.is_empty());
+        // Only once.
+        thread.end(&mut out);
+        assert_eq!(out.samples.len(), 1);
+        assert_eq!(total_ns(&out), 2 * MS);
     }
 
     #[test]
@@ -355,6 +462,7 @@ mod tests {
             waits,
             [(0, MS + MS * 9 / 10, Some(1)), (2 * MS, 3 * MS, Some(2)),]
         );
+        thread.end(&mut out);
         assert_eq!(total_ns(&out), 3 * MS);
     }
 
@@ -376,28 +484,35 @@ mod tests {
         let mut thread = timeline();
         let mut out = Polled::default();
         thread.started(
-            poll(5 * MS, MS / 2, MS / 4, RunState::Waiting, Some(3)),
+            poll(5 * MS, MS / 2, 0, RunState::Running, Some(3)),
             &mut out,
         );
+        assert_eq!(samples(&out), [(5 * MS, Mode::User, MS / 2, Some(3))]);
+        assert!(out.off_cpu.is_empty());
+        // From here on it is polled as any other.
+        assert!(!thread.needs_stack(MS / 2, 0, RunState::Waiting));
+        thread.add(poll(6 * MS, MS / 2, 0, RunState::Waiting, None), &mut out);
+        assert_eq!(out.off_cpu.len(), 1);
+        assert_eq!(out.off_cpu[0].stack, Some(3));
+    }
+
+    #[test]
+    fn a_thread_that_started_waiting_has_its_cpu_time_sampled_once_found_running() {
+        let mut thread = timeline();
+        let mut out = Polled::default();
+        thread.started(
+            poll(5 * MS, MS / 2, 0, RunState::Waiting, Some(3)),
+            &mut out,
+        );
+        assert!(out.samples.is_empty());
+        thread.add(poll(6 * MS, MS, 0, RunState::Running, Some(4)), &mut out);
         assert_eq!(
             out.samples
                 .iter()
-                .map(|s| (s.time_ns, s.mode, s.cpu_ns, s.stack))
+                .map(|s| (s.time_ns, s.cpu_ns, s.stack))
                 .collect::<Vec<_>>(),
-            [
-                (5 * MS, Mode::User, MS / 2, Some(3)),
-                (5 * MS, Mode::Kernel, MS / 4, Some(3))
-            ]
+            [(6 * MS, MS, Some(4))]
         );
-        assert!(out.off_cpu.is_empty());
-        // From here on it is polled as any other.
-        assert!(!thread.needs_stack(MS / 2, MS / 4, RunState::Waiting));
-        thread.add(
-            poll(6 * MS, MS / 2, MS / 4, RunState::Waiting, None),
-            &mut out,
-        );
-        assert_eq!(out.off_cpu.len(), 1);
-        assert_eq!(out.off_cpu[0].stack, Some(3));
     }
 
     #[test]

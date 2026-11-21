@@ -169,16 +169,20 @@ the poll at which uhr found the image in dyld's list.
 | `pid`, `tid` | uint32 | |
 | `cpu` | uint32, nullable | Null if not recorded |
 | `mode` | string | `user`, `kernel` or `unknown` (hypervisor, guest) |
-| `stack_id` | uint32, nullable | Null for CPU time whose stack was not seen. Never null on Linux |
+| `stack_id` | uint32, nullable | Null for CPU time whose stack was not seen: on macOS, what a thread used in a mode after the last poll that found it running in that mode, before it exited or the capture ended. Never null on Linux |
 | `cpu_ns` | uint64 | CPU time this sample stands for |
 
-On macOS a sample stands for the CPU time a thread used in one mode between
-two polls of it, which the kernel counts to the microsecond, and has the
-stack the thread had at the later poll, where it is timed. A poll's samples
-of user and kernel time share that stack, which has no kernel frames: time
-in the kernel is under the user code that entered it. `cpu` is null. A
-thread first seen after its process's first poll has its CPU time until then
-in the samples of that poll.
+On macOS a sample stands for the CPU time a thread used in one mode since
+its last sample of that mode, which the kernel counts to the microsecond,
+and has the stack the thread had at a poll that found it running in that
+mode, where it is timed: in a syscall or a page fault for kernel time, and
+in its own code for user time. A poll that finds the thread waiting samples
+none of its time, as it ran its code before it waited, not where it waits,
+so a sample can hold time the thread used before an earlier wait, as a
+CPU-clock sampler's does. The stack has no kernel frames: time in the
+kernel is under the user code that entered it. `cpu` is null. A thread
+first seen after its process's first poll has its CPU time until then in
+the first sample of each mode after.
 
 `page_faults`, one row per sample of the page faults a thread took. The
 collector samples one fault in every period, its `page_faults.period`, and

@@ -415,12 +415,32 @@ them 999 times a second by default (`-F`), at fixed deadlines.
   threads than uhr follows, which `proc_pidinfo` says, or one could not be
   polled, as one that exited, so it finds a new thread at the first poll
   after the thread starts.
-- The CPU time a thread used between two polls becomes a sample in each
-  mode at the later poll, with the stack it has then, as a CPU-clock
-  sampler takes one at the end of its period. Totals are what the kernel
-  counts, to the microsecond, and time is put on the stack at the poll. A
-  thread first seen after its process's first poll has its CPU time so far
-  sampled there.
+- A thread's CPU time is sampled at a poll that finds it running, with the
+  stack it has then, as a CPU-clock sampler samples a thread only while it
+  runs: a sample has the time the thread used in its mode since its last
+  one. A thread that waits at a poll ran its code before it waited, not
+  where it waits, so its time waits for the next poll that finds it
+  running. Each mode's time waits for a poll that finds the thread running
+  in that mode, kernel time for one in a syscall or a page fault, neither
+  of which runs user code. One in a syscall is held at an instruction that
+  follows an `svc` on arm64 and a `syscall` on x86-64. The kernel handles a
+  page fault before it lets the thread stop, at the instruction that
+  faulted, and the exception state it saved of the thread says so: on
+  arm64 an abort with the address that faulted, which it clears for an
+  interrupt, and on x86-64 the trap number of a page fault, which is from
+  XNU's source and not checked on an Intel Mac. Polls come at fixed times,
+  so the stacks of those that find a thread running in a mode are a fair
+  sample of where its time in that mode goes. Totals are what the kernel
+  counts, to the microsecond. What a thread used in a mode after the last
+  poll that found it running in that mode, before it exited or the capture
+  ended, is sampled without a stack: in a Bun program, 0.6% of its CPU
+  time, next to none of it on its main thread. Putting the time since the
+  last poll on the stack the poll found instead gave the event loop of the
+  same program, which ran short bursts between waits, a third of its user
+  time in `kevent64`, its wait, and taking kernel time only at polls in a
+  syscall put a program's page faults in the syscall it was next found in,
+  as its `munmap`. A thread first seen after its process's first poll has
+  its CPU time so far sampled at the first poll that finds it running.
 - The rest of the time between two polls the thread was off CPU: all of it
   for a thread that did not run, with its stack, `blocked` if it waited and
   `runnable` if it could run, and for one that ran, the part it did not,
