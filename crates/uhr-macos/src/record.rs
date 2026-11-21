@@ -27,7 +27,7 @@ use uhr_core::runtimes::stacks::Interpreters;
 use uhr_core::symbols;
 
 use crate::held::{Chunks, Held};
-use crate::images::{Image, ImageInfos, read_image};
+use crate::images::{Image, ImageInfos, read_listed_image};
 use crate::launch::{self, Hello, Service, Waiting};
 use mach2::port::mach_port_t;
 
@@ -753,15 +753,8 @@ impl Process {
                 continue;
             }
             added = true;
-            let image = match read_image(&self.task, address, path) {
-                // dyld lists the program by the path it was exec'd with,
-                // which can be relative to where that was.
-                Ok(mut image) if image.header.executable() => {
-                    if let Some(path) = process::path(self.pid) {
-                        image.path = path;
-                    }
-                    image
-                }
+            let pid = self.pid;
+            let image = match read_listed_image(&self.task, address, path, || process::path(pid)) {
                 Ok(image) => image,
                 Err(error) => {
                     warn!(pid = self.pid, address, %error, "reading an image's header");
@@ -774,18 +767,10 @@ impl Process {
             if replaced {
                 tables.system.insert((image.path.clone(), build_id.clone()));
             }
-            for code in image.code() {
+            for mapping in image.mappings(self.pid, time_ns) {
                 let id = tables.mappings.len() as u32;
-                tables.mappings.push(Mapping {
-                    pid: Some(self.pid),
-                    start: code.start,
-                    end: code.end,
-                    file_offset: code.offset,
-                    path: image.path.clone(),
-                    build_id: build_id.clone(),
-                    time_ns,
-                });
-                self.code.insert(code.start, (code.end, id));
+                self.code.insert(mapping.start, (mapping.end, id));
+                tables.mappings.push(mapping);
             }
             if self.unwinder.add(&self.task, &image).is_err() {
                 counts.no_unwind_tables += 1;
@@ -794,18 +779,23 @@ impl Process {
         }
         self.timestamp = Some(listed.timestamp);
         if added {
-            let mappings: Vec<Mapping> = self
-                .code
-                .values()
-                .map(|&(_, id)| tables.mappings[id as usize].clone())
-                .collect();
-            self.runtime.look(
-                &self.task,
-                &mappings,
-                &mut tables.interpreted,
-                &mut tables.unsupported,
-            );
+            self.look_for_runtime(tables);
         }
+    }
+
+    /// Looks for the runtime among the code the process maps.
+    fn look_for_runtime(&mut self, tables: &mut Tables) {
+        let mappings: Vec<Mapping> = self
+            .code
+            .values()
+            .map(|&(_, id)| tables.mappings[id as usize].clone())
+            .collect();
+        self.runtime.look(
+            &self.task,
+            &mappings,
+            &mut tables.interpreted,
+            &mut tables.unsupported,
+        );
     }
 
     /// `None` once it is gone. An exited process can have no threads left

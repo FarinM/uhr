@@ -4,6 +4,7 @@
 
 use std::io;
 
+use uhr_core::recording::Mapping;
 use uhr_core::runtimes::Memory;
 
 use crate::macho::{self, Header};
@@ -41,6 +42,24 @@ impl Image {
                 start: s.vmaddr.wrapping_add(slide),
                 end: s.vmaddr.wrapping_add(slide) + s.vmsize,
                 offset: s.vmaddr.wrapping_sub(text.vmaddr),
+            })
+            .collect()
+    }
+
+    /// Its code's mappings in process `pid`, by its path and UUID, which
+    /// uhr saw at `time_ns`.
+    pub(crate) fn mappings(&self, pid: u32, time_ns: Option<u64>) -> Vec<Mapping> {
+        let build_id = self.build_id();
+        self.code()
+            .into_iter()
+            .map(|code| Mapping {
+                pid: Some(pid),
+                start: code.start,
+                end: code.end,
+                file_offset: code.offset,
+                path: self.path.clone(),
+                build_id: build_id.clone(),
+                time_ns,
             })
             .collect()
     }
@@ -152,6 +171,24 @@ impl ImageInfos {
         }
         Ok(Some(Listed { timestamp, images }))
     }
+}
+
+/// Reads the image dyld lists at `address` by `path`, or for the program,
+/// by `program`'s, as dyld lists it by the path it was exec'd with, which
+/// can be relative to where that was.
+pub(crate) fn read_listed_image(
+    memory: &dyn Memory,
+    address: u64,
+    path: String,
+    program: impl FnOnce() -> Option<String>,
+) -> io::Result<Image> {
+    let mut image = read_image(memory, address, path)?;
+    if image.header.executable()
+        && let Some(path) = program()
+    {
+        image.path = path;
+    }
+    Ok(image)
 }
 
 /// Reads the header and load commands of the image at `address`.
