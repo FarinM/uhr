@@ -606,6 +606,56 @@ fn counts_each_program_a_process_runs_apart() {
     assert!(old < 50 && new > 300, "{found:?}");
 }
 
+/// That each of the `count` functions of reuse.py or reuse.js, which
+/// `runtime` made one at a time and freed before the next, has its share of
+/// their time, and none more: its code can be where that of one before
+/// was. The first of them run while uhr finds the runtime, so only the
+/// later half must have theirs. Each runs for 200 ms, long next to the
+/// time uhr takes to read the code a sample ran, in which the runtime can
+/// have put the next there.
+fn names_each_function_made_in_turn(runtime: &Path, name: &str, program: &str, count: usize) {
+    let dir = scratch(&format!("interpreters_{name}_reuse"));
+    let program = format!("{PROGRAMS}/{program}");
+    let command = [runtime.to_str().unwrap(), &program, "200"];
+    let Some(recording) = record(&dir, &[], &command) else {
+        return;
+    };
+    let rows = functions(&recording);
+    let made = |i: usize| {
+        let function = format!("gen_{i}");
+        rows.iter()
+            .find(|r| r["module"] == format!("[{name}]") && r["function"] == function.as_str())
+            .map_or(0.0, |row| share(row, "total_share"))
+    };
+    let shares: Vec<f64> = (0..count).map(made).collect();
+    let later = &shares[count / 2..];
+    let even = later.iter().sum::<f64>() / later.len() as f64;
+    assert!(even * count as f64 > 0.5, "{name}: {shares:?}");
+    assert!(
+        later.iter().all(|share| *share > 0.6 * even),
+        "{name}: {shares:?}"
+    );
+    assert!(
+        shares.iter().all(|share| *share < 1.6 * even),
+        "{name}: {shares:?}"
+    );
+}
+
+#[test]
+fn names_code_put_where_a_runtime_kept_other_code() {
+    for python in ["python3.11", "python3.12", "python3.13", "python3.14"] {
+        if let Some(found) = find(python) {
+            names_each_function_made_in_turn(&found, "python", "reuse.py", 6);
+        }
+    }
+    if let Some(node) = node() {
+        names_each_function_made_in_turn(&node, "node", "reuse.js", 8);
+    }
+    if let Some(bun) = bun() {
+        names_each_function_made_in_turn(&bun, "bun", "reuse.js", 8);
+    }
+}
+
 /// The major version of the V8 `node` runs.
 fn v8_major(node: &Path) -> Option<u32> {
     let output = Command::new(node)

@@ -11,10 +11,10 @@ use std::time::{Duration, Instant};
 
 use tracing::debug;
 use uhr_core::recording::{Frame, Mapping};
-use uhr_core::runtimes::stacks::{self, Interpreters, Program, code_addresses};
+use uhr_core::runtimes::stacks::{self, Interpreters, Program, ReadCode, code_addresses};
 use uhr_core::runtimes::walker::{Status, Walked, Walker};
 use uhr_core::runtimes::{
-    self, Child, Code, Frames, Interpreter, Memory, Probe, ProbeCommand, Prober, Process,
+    self, Child, Frames, Interpreter, Memory, Probe, ProbeCommand, Prober, Process,
 };
 
 use crate::images::{ImageInfos, read_listed_image};
@@ -198,9 +198,8 @@ impl Probe for Probed {
 pub(crate) struct Runtime {
     program: Program,
     state: State,
-    /// The code its frames ran, by address. `None` for code that could not
-    /// be read.
-    code: HashMap<u64, Option<Code>>,
+    /// What uhr last read of the code its frames ran, by address.
+    code: HashMap<u64, ReadCode>,
 }
 
 enum State {
@@ -329,27 +328,25 @@ impl Runtime {
         (walked.status != Status::Failed || !gone()).then_some(walked)
     }
 
-    /// Reads the code the frames of `walked` ran that uhr has not read,
-    /// once the thread runs again, as code can be long.
+    /// Reads the code the frames of `walked` ran, once the thread runs
+    /// again, as code can be long: what uhr has not read, and again what
+    /// the runtime put where it kept other code, which it freed.
     pub(crate) fn read_code(&mut self, memory: &dyn Memory, walked: &Walked) {
         let State::Walking { interpreter, .. } = &self.state else {
             return;
         };
-        let codes = code_addresses(
+        let addresses = code_addresses(
             &**interpreter,
             &walked.records,
             walked.record_bytes,
             walked.awaited,
         );
-        for code in codes {
-            if self.code.contains_key(&code) {
-                continue;
+        let pid = self.program.0;
+        for address in addresses {
+            let before = self.code.get(&address);
+            if let Some(read) = ReadCode::again(&**interpreter, memory, pid, address, before) {
+                self.code.insert(address, read);
             }
-            let read = interpreter.code(memory, code);
-            if let Err(error) = &read {
-                debug!(pid = self.program.0, code, %error, "reading interpreted code");
-            }
-            self.code.insert(code, read.ok());
         }
     }
 
@@ -374,7 +371,7 @@ impl Runtime {
         let Some(walked) = sample.walked else {
             return;
         };
-        let code = |address| self.code.get(&address).and_then(Option::as_ref);
+        let code = |address| self.code.get(&address).and_then(|read| read.code.as_ref());
         let walk = stacks::Walk {
             program: self.program,
             walked: Some(interpreter),

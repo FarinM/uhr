@@ -21,7 +21,9 @@ use tracing::debug;
 
 use self::layout::{CELL_TYPE_SHIFT, Layout, MAX_STRING, POINTER_BITS, Waiting};
 use super::probe::{ProbeCommand, Prober};
-use super::process::{bytes_at, debug_symbols, mapped_build_id, section, u32_at, u64_at};
+use super::process::{
+    bytes_at, debug_symbols, identity_of, mapped_build_id, section, u32_at, u64_at,
+};
 use super::text;
 use super::{
     Awaits, Code, Copy, Error, Frames, Interpreter, Memory, PathStep, Process, Read, Runtime, Walk,
@@ -512,6 +514,35 @@ impl Interpreter for JavaScriptCore {
             first_column: None,
             lines: Vec::new(),
         })
+    }
+
+    /// The `CodeBlock`'s type and executable, and of that its type and
+    /// what holds its name and its script's URL: JavaScriptCore gives its
+    /// code no number of its own, and counts in a `CodeBlock` as it runs.
+    /// Code whose executable and what that points to are all where those
+    /// of the code before were is taken for it.
+    fn identity(&self, memory: &dyn Memory, code_block: u64) -> Result<Option<u64>, Error> {
+        let layout = &self.layout;
+        let words = |what, from: u64, at: &[u64]| -> Result<Vec<u64>, Error> {
+            let len = at.iter().max().map_or(0, |last| last + 8) as usize;
+            let bytes = bytes_at(memory, what, from, len)?;
+            let word = |at: &u64| {
+                let at = *at as usize;
+                u64::from_ne_bytes(bytes[at..at + 8].try_into().expect("eight bytes"))
+            };
+            Ok(at.iter().map(word).collect())
+        };
+        let block = words(
+            "a CodeBlock",
+            code_block,
+            &[0, layout.code_block_executable],
+        )?;
+        let executable = words(
+            "an executable",
+            block[1],
+            &[0, layout.name[0], layout.url[0]],
+        )?;
+        Ok(Some(identity_of((block, executable))))
     }
 }
 

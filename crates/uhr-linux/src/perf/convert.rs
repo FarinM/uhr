@@ -1673,12 +1673,7 @@ impl State {
             walk::CUT => Some(Status::Cut),
             _ => Some(Status::Done),
         };
-        let code = |address| {
-            interpreters
-                .code
-                .get(&(program, address))
-                .and_then(Option::as_ref)
-        };
+        let code = |address| interpreters.code(program, address, header.time_ns);
         let walk = stacks::Walk {
             program,
             walked: at,

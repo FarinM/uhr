@@ -263,7 +263,10 @@ newer name holds, so samples of the older code there get the newer name.
 process, such as a Python function's code object or a JavaScript function's
 `SharedFunctionInfo`. uhr reads it from the process's memory while
 recording, the only time it can. A process can free code and put other code
-at its address later, which then keeps the name of the first.
+at its address later. uhr tells the two apart for CPython, V8 and
+JavaScriptCore, see [runtimes](collection.md#runtimes), and each has a row
+of its own, with the same `address`. For the other runtimes the later code
+keeps the name of the first.
 
 | Column | Type | Meaning |
 |---|---|---|

@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::iter::Peekable;
 use std::ops::Range;
 
-use super::super::process::{bytes_at, symbols, u32_at, u64_at};
+use super::super::process::{bytes_at, identity_of, symbols, u32_at, u64_at};
 use super::super::text;
 use super::super::{
     Code, Copy, Error, Frames, Interpreter, Memory, Process, Runtime, States, Step, Thread, Walk,
@@ -85,6 +85,9 @@ struct CodeLayout {
     first_line: u32,
     line_table: u32,
     instructions: u32,
+    /// Whether a code object holds a version CPython gives no other, as
+    /// those of 3.12 and later do, before their instructions.
+    numbered: bool,
 }
 
 fn python311() -> Layout {
@@ -110,6 +113,7 @@ fn python311() -> Layout {
             first_line: 72,
             line_table: 136,
             instructions: 184,
+            numbered: false,
         },
         ascii_data: 48,
         compact_data: 72,
@@ -140,6 +144,7 @@ fn python312() -> Layout {
             first_line: 68,
             line_table: 136,
             instructions: 192,
+            numbered: true,
         },
         ascii_data: 40,
         compact_data: 56,
@@ -282,6 +287,7 @@ fn debug_layout(memory: &dyn Memory, runtime: u64, minor: u8) -> Result<Layout, 
             first_line: offset(positions.code_first_line),
             line_table: offset(positions.code_line_table),
             instructions: offset(positions.code_instructions),
+            numbered: true,
         },
         ascii_data,
         // `PyCompactUnicodeObject` adds the length and pointer of its UTF-8.
@@ -516,6 +522,29 @@ impl Interpreter for CPython {
             first_column: None,
             lines: lines(&table, field(code.instructions), first_line),
         })
+    }
+
+    /// All a code object holds before its instructions, but its count of
+    /// references, which changes as it runs: its type, what it points to,
+    /// and from 3.12 a version CPython gives no other code object. The rest
+    /// changes a few times in a code object's life, as when CPython
+    /// specializes it, after which uhr reads the same code again. 3.11
+    /// numbers no code, and can put all a code object points to where it
+    /// kept that of the one before, so there its name and file tell it.
+    fn identity(&self, memory: &dyn Memory, address: u64) -> Result<Option<u64>, Error> {
+        let code = &self.layout.code;
+        let len = u64::from(code.instructions).saturating_sub(OB_TYPE);
+        let header = bytes_at(memory, "a code object", address + OB_TYPE, len as usize)?;
+        if code.numbered {
+            return Ok(Some(identity_of(header)));
+        }
+        let pointer = |offset: u32| {
+            let at = (u64::from(offset) - OB_TYPE) as usize;
+            u64::from_ne_bytes(header[at..at + 8].try_into().expect("eight bytes"))
+        };
+        let name = self.string(memory, "a code object's name", pointer(code.qualname))?;
+        let file = self.string(memory, "a code object's file", pointer(code.filename))?;
+        Ok(Some(identity_of((header, name, file))))
     }
 }
 

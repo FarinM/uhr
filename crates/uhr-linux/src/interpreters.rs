@@ -13,7 +13,7 @@ use std::thread::{self, JoinHandle};
 use aya::maps::{HashMap as BpfHashMap, MapData};
 use tracing::{debug, warn};
 use uhr_core::recording::Mapping;
-use uhr_core::runtimes::stacks::code_addresses;
+use uhr_core::runtimes::stacks::{ReadCode, code_addresses};
 use uhr_core::runtimes::{
     self, Child, Code, Frames, Interpreter, Memory, Probe, ProbeCommand, Prober, Process, States,
     Step, Thread,
@@ -49,13 +49,43 @@ pub(crate) struct Interpreters {
     /// Where uhr can't tell how many times a process exec'd, its programs
     /// share an entry, and the latest interpreter found holds.
     pub(crate) programs: Programs,
-    /// By program and address. `None` for code that could not be read.
-    pub(crate) code: HashMap<(Program, u64), Option<Code>>,
+    /// By program and address: a runtime frees code and puts other code
+    /// at its address.
+    code: HashMap<(Program, u64), ReadAt>,
     /// Programs that run a runtime uhr cannot read the frames of, and why.
     pub(crate) unsupported: HashMap<Program, String>,
 }
 
 type Programs = HashMap<Program, Vec<(u64, Box<dyn Interpreter>)>>;
+
+/// What uhr read of the code at one address of a program.
+#[derive(Default)]
+struct ReadAt {
+    /// When uhr last read there, on the samples' clock.
+    read_ns: u64,
+    /// Each code it read there, with the time from which samples ran it,
+    /// in order.
+    codes: Vec<(u64, ReadCode)>,
+}
+
+impl ReadAt {
+    /// Keeps `code`, which uhr read there at `now_ns`, as other than the
+    /// last. uhr reads a while after the sample, and the runtime put the
+    /// code there at some time since uhr last read there.
+    fn add(&mut self, code: ReadCode, now_ns: u64) {
+        let since = match (&code.code, self.codes.last()) {
+            (_, None) => 0,
+            // What a sample ran was code when it ran it, so one before
+            // code that is gone by now ran what uhr read before.
+            (None, Some(_)) => now_ns,
+            // Half that time ago is as likely as not: long ago for code
+            // not sampled for long, and between this sample and the one
+            // before for code that runs.
+            (Some(_), Some((last, _))) => self.read_ns.midpoint(now_ns).max(*last),
+        };
+        self.codes.push((since, code));
+    }
+}
 
 impl Interpreters {
     /// The interpreter of `program` that walked the frames of a sample of it
@@ -66,6 +96,14 @@ impl Interpreters {
         time_ns: u64,
     ) -> (Option<&dyn Interpreter>, Option<&dyn Interpreter>) {
         interpreter_of(&self.programs, program, time_ns)
+    }
+
+    /// The code at `address` in `program` that a sample at `time_ns` ran,
+    /// `None` where it could not be read.
+    pub(crate) fn code(&self, program: Program, address: u64, time_ns: u64) -> Option<&Code> {
+        let codes = &self.code.get(&(program, address))?.codes;
+        let by_then = codes.partition_point(|(since, _)| *since <= time_ns);
+        codes[by_then.checked_sub(1)?].1.code.as_ref()
     }
 }
 
@@ -231,15 +269,15 @@ fn find(receiver: Receiver<Walked>, mut maps: Maps, frame_pointers: bool) -> Int
                 let bytes = walked.frame_bytes.max(9) as usize;
                 let codes =
                     code_addresses(interpreter, &walked.frames, bytes, walked.awaited as usize);
-                for code in codes {
-                    if found.code.contains_key(&(program, code)) {
-                        continue;
+                for address in codes {
+                    let at = found.code.entry((program, address)).or_default();
+                    let before = at.codes.last().map(|(_, code)| code);
+                    let again = ReadCode::again(interpreter, memory, pid, address, before);
+                    let now_ns = monotonic_ns();
+                    if let Some(code) = again {
+                        at.add(code, now_ns);
                     }
-                    let read = interpreter.code(memory, code);
-                    if let Err(error) = &read {
-                        debug!(pid, code, %error, "reading interpreted code");
-                    }
-                    found.code.insert((program, code), read.ok());
+                    at.read_ns = now_ns;
                 }
             }
             _ => {}

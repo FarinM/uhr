@@ -761,10 +761,31 @@ native frames, and coverage counts them. Each sample says how many times its
 process had exec'd, as the kernel counts in its task, so each program a
 process runs is looked at and counted apart. While the process runs, uhr
 reads the code its frames run from its memory, and turns them into functions
-and lines. Each time native code called into the interpreter, that call ran
-a group of the frames, which go into the native stack just above the call's
-run of eval-loop frames. An interpreter can keep the frame that starts each
-call in the call's native frame. Then, on x86-64, the programs walk the
+and lines. A runtime frees code and puts other code at its address, as
+CPython does with the code of a module's top level once it has run, so uhr
+keeps what it read of the code at an address only while what tells that
+code from other code stays the same, which it reads again for each sample,
+in one read for each code on the stack, or two for JavaScriptCore: for
+CPython, all a code object holds before its instructions but its count of
+references, which from 3.12 has a version CPython gives no other code
+object, and for 3.11, which numbers none and can put all a code object
+points to where it kept that of the one before, its name and its file too,
+in six more reads; for V8, all of the `SharedFunctionInfo`; and for
+JavaScriptCore, which numbers no code, the `CodeBlock`'s executable and
+what that keeps its name and its script's URL in, so code whose executable
+and those are all where the ones before were is still taken for the code
+before. The other runtimes' code at an address keeps what uhr read of it
+first. uhr takes the samples out of the programs' buffer every 20 ms, so it
+reads the code a sample ran up to that long after, by when the runtime can
+have put other code there. uhr takes that to have happened half way between
+its last two reads there, and code that is gone by then to have been there
+still for the sample: of six Python functions, each freed after 50 ms and
+the next made in its place, the last five had between 11% and 19% of the
+time, for 16% each. Each time native code called into the interpreter, that
+call ran a group of the frames, which go into the native stack just above
+the call's run of eval-loop frames. An interpreter can keep the frame that
+starts each call in the call's native frame. Then, on x86-64, the programs
+walk the
 frame pointers themselves, rather than with the kernel's walk, keeping where
 each frame ends on the stack, as uhr's unwinding of the stack copy does too,
 and each group goes just above the native frame its call started in, the
@@ -796,8 +817,13 @@ UUID. Mach-O symbols say nothing of where they end, so each ends where the
 next function, as `LC_FUNCTION_STARTS` lists them, or symbol starts. A
 runtime keeps the kernel's id of each thread, as CPython keeps its native
 id, which on macOS is the id the sampler polls the thread by. The code each
-frame ran is read once the thread runs again. The stack a thread waits at is
-walked alike, so time off CPU has the runtime's frames too. Between a
+frame ran is read once the thread runs again, and with it what tells that
+code from other code at its address, within microseconds of the sample.
+With 60 functions on the stack, a sample then took uhr's thread about 120
+microseconds, up from 55, in CPython, 130, up from 70, in Node, and 135, up
+from 50, in Bun, and held the target's thread no longer. The stack a thread
+waits at is walked alike, so time off CPU has the runtime's frames too.
+Between a
 process's exec and the next program's hello, the program's memory is gone,
 and walks that fail then count as none. Checked with Homebrew's CPython
 3.13, a framework build whose library is named `Python`, and Node 24 from

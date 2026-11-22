@@ -2,6 +2,7 @@
 //! its memory and files; what a runtime keeps where is the runtime's.
 
 use std::collections::HashMap;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io;
 use std::ops::Range;
 
@@ -492,6 +493,14 @@ pub(super) fn u64_at(memory: &dyn Memory, what: &'static str, address: u64) -> R
 
 pub(super) fn u32_at(memory: &dyn Memory, what: &'static str, address: u64) -> Result<u32, Error> {
     read(memory, what, address).map(u32::from_ne_bytes)
+}
+
+/// A number for what tells code from other code a runtime keeps at its
+/// address, as `Interpreter::identity` gives one.
+pub(super) fn identity_of(what: impl Hash) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    what.hash(&mut hasher);
+    hasher.finish()
 }
 
 pub(super) fn bytes_at(

@@ -7,11 +7,11 @@
 //! follows its fixed fields, which is that of the headers of V8 11, 12 and
 //! 13, as Node 20, 22 and 24 run them.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::ops::Range;
 
-use super::super::process::{bytes_at, symbols, u32_at, u64_at};
+use super::super::process::{bytes_at, identity_of, symbols, u32_at, u64_at};
 use super::super::text;
 use super::super::{
     Awaits, Code, Copy, Error, Frames, Interpreter, Memory, PathStep, Process, Read, Runtime, Walk,
@@ -114,6 +114,8 @@ struct Layout {
     smi_shift: u32,
     map: u64,
     instance_type: u64,
+    /// Where a map keeps the size of its objects, in words, where V8 says.
+    instance_words: Option<u64>,
     function_shared: u64,
     function_context: u64,
     shared_name: u64,
@@ -192,6 +194,7 @@ impl Layout {
             smi_shift: (int("SmiShiftSize")? + int("SmiValueShift")?) as u32,
             map: offset("class_HeapObject__map")?,
             instance_type: offset("class_Map__instance_type")?,
+            instance_words: offset("class_Map__instance_size_in_words").ok(),
             function_shared: offset("class_JSFunction__shared")?,
             function_context: offset("class_JSFunction__context")?,
             shared_name: offset("class_SharedFunctionInfo__name_or_scope_info")?,
@@ -295,9 +298,12 @@ struct V8 {
     scopes: Scopes,
     walk: Walk,
     eval_loop: Vec<Range<u64>>,
-    /// The lines of each script, by its address, `None` for one whose
-    /// lines could not be read.
-    lines: RefCell<HashMap<u64, Option<Lines>>>,
+    /// The lines of each script, by its address and that of its source,
+    /// as V8 can free a script and put another at its address. `None` for
+    /// one whose lines could not be read.
+    lines: RefCell<HashMap<(u64, u64), Option<Lines>>>,
+    /// The size of a `SharedFunctionInfo`, once read from its map.
+    shared_bytes: Cell<Option<usize>>,
 }
 
 /// Where each line of a script ends, as far as uhr read its source.
@@ -383,6 +389,7 @@ impl V8 {
             walk,
             eval_loop,
             lines: RefCell::new(HashMap::new()),
+            shared_bytes: Cell::new(None),
         })
     }
 
@@ -595,9 +602,10 @@ impl V8 {
     /// The line and column of `position` in the script `script` points to,
     /// from 1.
     fn place(&self, memory: &dyn Memory, script: u64, position: u64) -> Option<(u32, u32)> {
+        let source = self.field(memory, script, self.layout.script_source).ok()?;
         let mut lines = self.lines.borrow_mut();
         let lines = lines
-            .entry(script)
+            .entry((script, source))
             .or_insert_with(|| self.lines(memory, script).ok())
             .as_ref()?;
         if position >= lines.read {
@@ -751,6 +759,41 @@ impl Interpreter for V8 {
             first_column: start.map(|(_, column)| column),
             lines: Vec::new(),
         })
+    }
+
+    /// All of the `SharedFunctionInfo`: what it points to, and the numbers
+    /// V8 gives it. V8 changes some as the function runs, as when it
+    /// compiles it, after which uhr reads the same code again.
+    fn identity(&self, memory: &dyn Memory, shared: u64) -> Result<Option<u64>, Error> {
+        let Some(bytes) = self.shared_bytes(memory, shared)? else {
+            return Ok(None);
+        };
+        let object = bytes_at(memory, "a V8 function", self.start(shared), bytes)?;
+        Ok(Some(identity_of(object)))
+    }
+}
+
+impl V8 {
+    /// The size of a `SharedFunctionInfo`, from the map of the one `shared`
+    /// points to, which all share. `None` where V8 does not say where a
+    /// map keeps it, or `shared` points to none.
+    fn shared_bytes(&self, memory: &dyn Memory, shared: u64) -> Result<Option<usize>, Error> {
+        if let Some(bytes) = self.shared_bytes.get() {
+            return Ok(Some(bytes));
+        }
+        let layout = &self.layout;
+        let Some(instance_words) = layout.instance_words else {
+            return Ok(None);
+        };
+        if self.type_of(memory, shared)? != Some(layout.shared_type) {
+            return Ok(None);
+        }
+        let map = self.field(memory, shared, layout.map)?;
+        let at = self.start(map) + instance_words;
+        let words = bytes_at(memory, "a V8 map's instance size", at, 1)?[0];
+        let bytes = usize::from(words) * 8;
+        self.shared_bytes.set(Some(bytes));
+        Ok(Some(bytes))
     }
 }
 

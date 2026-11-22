@@ -79,6 +79,14 @@ pub trait Interpreter: Send {
     }
     /// The code at `address`, read from the process's memory.
     fn code(&self, memory: &dyn Memory, address: u64) -> Result<Code, Error>;
+    /// What tells the code at `address` from other code the runtime keeps
+    /// there once it freed this, in few reads, as uhr reads it at each
+    /// sample of a frame that runs the code. `None` for a runtime uhr
+    /// can't tell that of, whose code at an address keeps what uhr read of
+    /// it first.
+    fn identity(&self, _memory: &dyn Memory, _address: u64) -> Result<Option<u64>, Error> {
+        Ok(None)
+    }
 }
 
 /// How uhr's sampler finds and copies an interpreter's frames, in numbers:

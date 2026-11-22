@@ -603,6 +603,43 @@ fn reads_the_frames_of_bun() {
     read_the_frames(&recording, "bun", 0.01);
 }
 
+/// That each of the `count` functions of reuse.py or reuse.js, which
+/// `runtime` made one at a time and freed before the next, has its share of
+/// their time: its code can be where that of one before was.
+fn names_each_function_made_in_turn(runtime: &Path, name: &str, program: &str, count: usize) {
+    let dir = scratch(&format!("macos_{name}_reuse"));
+    let recording = dir.join("rec");
+    let program = format!("{PROGRAMS}/{program}");
+    record(&recording, &[runtime.to_str().unwrap(), &program]);
+    let result = functions(recording.to_str().unwrap());
+    let shares: Vec<f64> = (0..count)
+        .map(|i| {
+            runtime_function(&result, name, &format!("gen_{i}"))["total_share"]
+                .as_f64()
+                .unwrap()
+        })
+        .collect();
+    let all: f64 = shares.iter().sum();
+    assert!(all > 0.5, "{shares:?}");
+    let even = all / count as f64;
+    for share in &shares {
+        assert!((0.6 * even..1.6 * even).contains(share), "{shares:?}");
+    }
+}
+
+#[test]
+fn names_code_put_where_a_runtime_kept_other_code() {
+    if let Some(python) = python() {
+        names_each_function_made_in_turn(&python, "python", "reuse.py", 6);
+    }
+    if let Some(node) = node() {
+        names_each_function_made_in_turn(&node, "node", "reuse.js", 8);
+    }
+    if let Some(bun) = bun() {
+        names_each_function_made_in_turn(&bun, "bun", "reuse.js", 8);
+    }
+}
+
 /// That the functions of await.js that waited for inner() have the time it
 /// worked for, once resumed, with none of them on the stack.
 fn has_the_functions_that_waited(runtime: &Path, name: &str) {

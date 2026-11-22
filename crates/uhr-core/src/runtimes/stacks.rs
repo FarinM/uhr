@@ -7,8 +7,10 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::hash::Hash;
 
+use tracing::debug;
+
 use super::walker::Status;
-use super::{Code, Frames, Interpreter, WalkedFrame};
+use super::{Code, Frames, Interpreter, Memory, WalkedFrame};
 use crate::recording::{Frame, Interpreted, InterpretedCode, InterpreterCoverage, Origin};
 
 /// A program a process ran: its pid, and how many times it had exec'd.
@@ -47,8 +49,9 @@ pub struct Walk<'a> {
 pub struct Interpreters {
     /// The recording's `interpreted_code`.
     pub code: Vec<InterpretedCode>,
-    /// Rows of `code`, by program and address.
-    rows: HashMap<(Program, u64), u32>,
+    /// Rows of `code`, by program and address: one for each code read
+    /// there, as a process can free code and put other code at its address.
+    rows: HashMap<(Program, u64), Vec<u32>>,
     walks: BTreeMap<(&'static str, String), Walks>,
 }
 
@@ -251,8 +254,8 @@ impl Interpreters {
         walks.unmatched += counts.unmatched;
     }
 
-    /// The row of `code` for the code at `address` in `program`, named if
-    /// it was read.
+    /// The row of `code` for the code `read` at `address` in `program`,
+    /// or for code that could not be read there.
     fn row(
         &mut self,
         program: Program,
@@ -261,18 +264,31 @@ impl Interpreters {
         read: Option<&Code>,
     ) -> u32 {
         let table = &mut self.code;
-        *self.rows.entry((program, address)).or_insert_with(|| {
-            table.push(InterpretedCode {
-                pid: program.0,
-                runtime: interpreter.runtime().to_owned(),
-                address,
-                name: read.map(|code| code.name.clone()),
-                file: read.map(|code| code.file.clone()),
-                first_line: read.map(|code| code.first_line),
-                first_column: read.and_then(|code| code.first_column),
-            });
-            table.len() as u32 - 1
-        })
+        let rows = self.rows.entry((program, address)).or_default();
+        let is_read = |row: &InterpretedCode| match read {
+            Some(code) => {
+                row.name.as_deref() == Some(code.name.as_str())
+                    && row.file.as_deref() == Some(code.file.as_str())
+                    && row.first_line == Some(code.first_line)
+                    && row.first_column == code.first_column
+            }
+            None => row.name.is_none(),
+        };
+        if let Some(row) = rows.iter().find(|row| is_read(&table[**row as usize])) {
+            return *row;
+        }
+        table.push(InterpretedCode {
+            pid: program.0,
+            runtime: interpreter.runtime().to_owned(),
+            address,
+            name: read.map(|code| code.name.clone()),
+            file: read.map(|code| code.file.clone()),
+            first_line: read.map(|code| code.first_line),
+            first_column: read.and_then(|code| code.first_column),
+        });
+        let row = table.len() as u32 - 1;
+        rows.push(row);
+        row
     }
 
     /// Counts `samples` of `program` taken before uhr found its interpreter,
@@ -313,17 +329,17 @@ impl Interpreters {
     }
 }
 
-/// The code each frame a walk found runs, of `interpreter`, from its
-/// records of `record_bytes`, the last `awaited` of functions that waited:
-/// what to read while the process still has it.
+/// The code the frames a walk found run, each once, of `interpreter`, from
+/// its records of `record_bytes`, the last `awaited` of functions that
+/// waited: what to read while the process still has it.
 pub fn code_addresses(
     interpreter: &dyn Interpreter,
     records: &[u8],
     record_bytes: usize,
     awaited: usize,
-) -> impl Iterator<Item = u64> {
+) -> Vec<u64> {
     let on_stack = (records.len() / record_bytes.max(1)).saturating_sub(awaited);
-    records
+    let mut addresses: Vec<u64> = records
         .chunks_exact(record_bytes.max(1))
         .enumerate()
         .filter_map(move |(at, record)| {
@@ -334,6 +350,56 @@ pub fn code_addresses(
                 _ => None,
             }
         })
+        .collect();
+    // A function that calls itself has its code in many frames.
+    addresses.sort_unstable();
+    addresses.dedup();
+    addresses
+}
+
+/// What uhr read of the code at an address.
+#[derive(Debug)]
+pub struct ReadCode {
+    /// What told it from other code the runtime keeps there later. `None`
+    /// where the runtime does not say, or it could not be read.
+    identity: Option<u64>,
+    /// `None` for code that could not be read.
+    pub code: Option<Code>,
+}
+
+impl ReadCode {
+    /// Reads the code at `address` in the process `pid`, unless it is
+    /// still what uhr read there `before`: a runtime frees code and puts
+    /// other code at its address. `None` if it is.
+    pub fn again(
+        interpreter: &dyn Interpreter,
+        memory: &dyn Memory,
+        pid: u32,
+        address: u64,
+        before: Option<&ReadCode>,
+    ) -> Option<Self> {
+        let identity = match interpreter.identity(memory, address) {
+            Ok(identity) => identity,
+            Err(error) => {
+                debug!(pid, address, %error, "reading interpreted code");
+                let gone =
+                    before.is_some_and(|read| read.identity.is_none() && read.code.is_none());
+                return (!gone).then_some(Self {
+                    identity: None,
+                    code: None,
+                });
+            }
+        };
+        if before.is_some_and(|read| read.identity == identity) {
+            return None;
+        }
+        let code = interpreter.code(memory, address);
+        if let Err(error) = &code {
+            debug!(pid, address, %error, "reading interpreted code");
+        }
+        let code = code.ok();
+        Some(Self { identity, code })
+    }
 }
 
 fn intern<T: Clone + Eq + Hash>(items: &mut Vec<T>, ids: &mut HashMap<T, u32>, item: T) -> u32 {
