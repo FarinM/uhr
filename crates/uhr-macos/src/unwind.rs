@@ -156,11 +156,17 @@ impl Unwinding {
         let mut ends = Vec::new();
         let end = loop {
             let frame = *frames.last().expect("never empty");
+            #[cfg(target_arch = "aarch64")]
+            let before = regs;
             let caller =
                 self.unwinder
                     .unwind_frame(frame, &mut regs, &mut self.cache, &mut read_stack);
             match caller {
                 Ok(Some(address)) => {
+                    #[cfg(target_arch = "aarch64")]
+                    if frames.len() == 1 && regs == before {
+                        leave_own_frame(&mut regs, address, &mut read_stack);
+                    }
                     ends.push(Some(regs.sp()));
                     let Some(caller) = FrameAddress::from_return_address(address) else {
                         break End::Failed;
@@ -176,6 +182,40 @@ impl Unwinding {
         };
         ends.resize(frames.len(), None);
         Walk { frames, ends, end }
+    }
+}
+
+/// Leaves the frame the innermost function set up, where framehop took its
+/// caller, `caller`, from the link register and moved no register: it takes
+/// a function without unwind tables, as libm's `sin`, written in assembly,
+/// for one without a frame. The frame record `fp` points to is then the
+/// function's own, and the walk would find `caller` in it a second time.
+///
+/// A record that holds the link register's address is the function's own:
+/// its caller's would hold where that one returns to, which is the same
+/// address only where one call instruction made both calls.
+#[cfg(target_arch = "aarch64")]
+fn leave_own_frame(
+    regs: &mut UnwindRegsAarch64,
+    caller: u64,
+    read_stack: &mut impl FnMut(u64) -> Result<u64, ()>,
+) {
+    let fp = regs.fp();
+    let (Some(returns_at), Some(callers_sp)) = (fp.checked_add(8), fp.checked_add(16)) else {
+        return;
+    };
+    if fp < regs.sp() {
+        return;
+    }
+    let Ok(returns_to) = read_stack(returns_at) else {
+        return;
+    };
+    if regs.lr_mask().strip_ptr_auth(returns_to) != caller {
+        return;
+    }
+    if let Ok(callers_fp) = read_stack(fp) {
+        regs.set_fp(callers_fp);
+        regs.set_sp(callers_sp);
     }
 }
 

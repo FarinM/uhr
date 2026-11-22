@@ -457,7 +457,12 @@ them 999 times a second by default (`-F`), at fixed deadlines.
 - To walk a stack, uhr holds the thread still with `thread_suspend`, reads
   its registers, and walks with `framehop`, from each image's unwind tables
   as loaded in the process: Apple's compact unwind info, then DWARF CFI,
-  then frame pointers for code with neither, as JIT code. Each image's
+  then frame pointers for code with neither, as JIT code. framehop takes
+  the caller of an innermost function without tables from the link
+  register, as if it had set up no frame. One that did, as libm's `sin`,
+  written in assembly, has pushed that address in its frame record, where
+  the walk would find its caller a second time, so uhr leaves a record that
+  holds the link register's address before it walks on. Each image's
   `__TEXT` is mapped from the target with one copy-on-write `mach_vm_read`,
   which covers the images of the dyld shared cache, which have no file of
   their own. On arm64 the pointer authentication bits of return addresses

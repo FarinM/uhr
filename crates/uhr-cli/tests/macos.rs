@@ -106,6 +106,25 @@ fn finds_the_hot_function_with_its_share() {
 }
 
 #[test]
+#[cfg(target_arch = "aarch64")]
+fn a_function_with_a_frame_but_no_unwind_tables_has_its_caller_once() {
+    let dir = scratch("macos_asm_frame");
+    let program = dir.join("asm_frame");
+    compile("asm_frame", &program, "-O2");
+    let recording = dir.join("rec");
+    record(&recording, &[program.to_str().unwrap()]);
+    let path = recording.to_str().unwrap();
+
+    let paths = json(&["call-paths", path, "--function", "spin", "--depth", "3"]);
+    assert!(paths["total_share"].as_f64().unwrap() > 0.9, "{paths:#}");
+    let callers: Vec<&str> =
+        std::iter::successors(paths["callers"].get(0), |node| node["children"].get(0))
+            .map(|node| node["function"].as_str().unwrap())
+            .collect();
+    assert_eq!(callers, ["caller", "main", "start"], "{paths:#}");
+}
+
+#[test]
 fn a_blocked_threads_time_off_cpu_is_under_its_wait() {
     let dir = scratch("macos_a_blocked_thread");
     let program = dir.join("nap_and_join");
